@@ -170,6 +170,28 @@ def init_db() -> None:
         """)
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_regime(
+            calculated_at TIMESTAMPTZ NOT NULL,
+            ts_close TIMESTAMPTZ NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            market_state TEXT NOT NULL,
+            scenario TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            oi_delta_pct DOUBLE PRECISION,
+            price_delta_pct DOUBLE PRECISION,
+            volume_delta_pct DOUBLE PRECISION,
+            range_width_pct DOUBLE PRECISION,
+            continuation_score DOUBLE PRECISION,
+            exhaustion_score DOUBLE PRECISION,
+            compression_score DOUBLE PRECISION,
+            invalid_reason TEXT
+        )
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS request_failure_report(
             calculated_at TIMESTAMPTZ NOT NULL,
             exchange TEXT NOT NULL,
@@ -188,6 +210,8 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_coverage_report_main ON coverage_report(metric, exchange, symbol, coverage_pct)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_gap_report_main ON gap_report(metric, exchange, symbol, gap_start)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_active_symbol_universe_main ON active_symbol_universe(exchange, symbol)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_regime_main ON market_regime(exchange, symbol, timeframe, ts_close)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_regime_scenario ON market_regime(scenario, confidence, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
 
 
@@ -361,6 +385,34 @@ def active_universe_sql(alias: str = "") -> str:
     )
 
 
+
+
+def replace_market_regime(rows: list[tuple]) -> None:
+    execute("TRUNCATE TABLE market_regime")
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO market_regime(
+            calculated_at,
+            ts_close,
+            exchange,
+            symbol,
+            timeframe,
+            market_state,
+            scenario,
+            confidence,
+            reason,
+            oi_delta_pct,
+            price_delta_pct,
+            volume_delta_pct,
+            range_width_pct,
+            continuation_score,
+            exhaustion_score,
+            compression_score,
+            invalid_reason
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
 
 def replace_request_failures(rows: list[tuple]) -> None:
     execute("TRUNCATE TABLE request_failure_report")

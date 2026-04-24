@@ -28,6 +28,7 @@ from exchange_clients import (
 from aggregation_engine import rebuild_bot_aggregates
 from audit_engine import rebuild_all
 from research_engine import rebuild_market_research
+from market_regime_engine import rebuild_market_regime
 from export_engine import rebuild_exports
 from telegram_bot import start_polling, send_message
 
@@ -87,6 +88,7 @@ def background(bybit_symbols, binance_symbols):
             agg_count = rebuild_bot_aggregates()
             audit_count = rebuild_all()
             research_count = rebuild_market_research()
+            regime_count = rebuild_market_regime()
 
             cleanup_old(ДНЕЙ_ХРАНЕНИЯ)
 
@@ -97,7 +99,7 @@ def background(bybit_symbols, binance_symbols):
                 last_export = now
                 log(f"quick export rebuilt: {bundle}")
 
-            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count}")
+            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} regime={regime_count}")
 
         except Exception as exc:
             log(f"canonical validation cycle error: {type(exc).__name__}: {exc}")

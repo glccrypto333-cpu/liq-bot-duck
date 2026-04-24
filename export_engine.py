@@ -172,6 +172,30 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY exchange, symbol, timeframe, state_count DESC
     """, (since,))
 
+    market_regime = _safe_fetch("""
+        SELECT *
+        FROM market_regime
+        WHERE ts_close >= %s
+        ORDER BY exchange, symbol, timeframe, ts_close
+    """, (since,))
+
+    regime_states = _safe_fetch("""
+        SELECT
+            exchange,
+            symbol,
+            timeframe,
+            scenario,
+            confidence,
+            COUNT(*) AS scenario_count,
+            AVG(continuation_score) AS avg_continuation_score,
+            AVG(exhaustion_score) AS avg_exhaustion_score,
+            AVG(compression_score) AS avg_compression_score
+        FROM market_regime
+        WHERE ts_close >= %s
+        GROUP BY exchange, symbol, timeframe, scenario, confidence
+        ORDER BY exchange, symbol, timeframe, scenario_count DESC
+    """, (since,))
+
     storage_summary = _safe_fetch(f"""
         SELECT metric, MIN(ts_open) AS oldest_ts, MAX(ts_open) AS newest_ts, COUNT(*) AS rows_count
         FROM (
@@ -212,6 +236,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
     audit_path = ПАПКА_ДАННЫХ / "validation_audit.csv"
     market_research_path = ПАПКА_ДАННЫХ / "market_research.csv"
     market_states_path = ПАПКА_ДАННЫХ / "market_states.csv"
+    market_regime_path = ПАПКА_ДАННЫХ / "market_regime.csv"
+    regime_states_path = ПАПКА_ДАННЫХ / "regime_states.csv"
     coverage_path = ПАПКА_ДАННЫХ / "coverage_report.csv"
     gap_path = ПАПКА_ДАННЫХ / "gap_report.csv"
     manifest_path = ПАПКА_ДАННЫХ / "storage_manifest.txt"
@@ -283,6 +309,18 @@ def rebuild_exports(mode: str = "quick") -> Path:
         [[r["exchange"], r["symbol"], r["timeframe"], r["market_state"], r["state_count"], r["avg_continuation_score"], r["avg_exhaustion_score"], r["avg_compression_score"]] for r in market_states],
     )
 
+    _write_csv(
+        market_regime_path,
+        ["calculated_at", "ts_close", "exchange", "symbol", "timeframe", "market_state", "scenario", "confidence", "reason", "oi_delta_pct", "price_delta_pct", "volume_delta_pct", "range_width_pct", "continuation_score", "exhaustion_score", "compression_score", "invalid_reason"],
+        [[r["calculated_at"], r["ts_close"], r["exchange"], r["symbol"], r["timeframe"], r["market_state"], r["scenario"], r["confidence"], r["reason"], r["oi_delta_pct"], r["price_delta_pct"], r["volume_delta_pct"], r["range_width_pct"], r["continuation_score"], r["exhaustion_score"], r["compression_score"], r["invalid_reason"]] for r in market_regime],
+    )
+
+    _write_csv(
+        regime_states_path,
+        ["exchange", "symbol", "timeframe", "scenario", "confidence", "scenario_count", "avg_continuation_score", "avg_exhaustion_score", "avg_compression_score"],
+        [[r["exchange"], r["symbol"], r["timeframe"], r["scenario"], r["confidence"], r["scenario_count"], r["avg_continuation_score"], r["avg_exhaustion_score"], r["avg_compression_score"]] for r in regime_states],
+    )
+
     invalid = [r for r in audit if r["validation_status"] != "валидно"]
     critical_coverage = [r for r in coverage if r["quality_status"] == "critical"]
     warning_coverage = [r for r in coverage if r["quality_status"] == "warning"]
@@ -318,6 +356,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"request_failure_rows: {len(request_failures)}",
         f"market_research_rows: {len(market_research)}",
         f"market_states_rows: {len(market_states)}",
+        f"market_regime_rows: {len(market_regime)}",
+        f"regime_states_rows: {len(regime_states)}",
         f"invalid_data_state_rows: {len(invalid_data_states)}",
         f"request_failure_rows: {len(request_failures)}",
         "",
@@ -355,6 +395,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
         "",
         f"market_research_rows: {len(market_research)}",
         f"market_states_rows: {len(market_states)}",
+        f"market_regime_rows: {len(market_regime)}",
+        f"regime_states_rows: {len(regime_states)}",
         f"invalid_data_state_rows: {len(invalid_data_states)}",
         f"request_failure_rows: {len(request_failures)}",
         "",
@@ -436,7 +478,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt\n"
             "timestamp_migration=active\n"
             "canonical_close=active\n"
             "contiguous_window_validation=active\n"
@@ -456,6 +498,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
         audit_path,
         market_research_path,
         market_states_path,
+        market_regime_path,
+        regime_states_path,
         coverage_path,
         gap_path,
         active_universe_path,
