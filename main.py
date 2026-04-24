@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 import threading
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -15,7 +16,7 @@ from config import (
     ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК,
 )
 from logger import log
-from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old, migrate_canonical_ts_close, replace_active_universe
+from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old, migrate_canonical_ts_close, replace_active_universe, replace_request_failures, load_quarantine_symbols
 from exchange_clients import (
     fetch_bybit_symbols,
     fetch_binance_symbols,
@@ -33,38 +34,47 @@ from telegram_bot import start_polling, send_message
 
 def collect(symbols_bybit, symbols_binance):
     oi_rows, price_rows, volume_rows = [], [], []
+    failures = []
+    now = datetime.now(timezone.utc)
+
+    def record_failure(exchange: str, symbol: str, data_type: str, exc: Exception) -> None:
+        failures.append((now, exchange, symbol, data_type, type(exc).__name__, str(exc)[:500]))
 
     for s in symbols_bybit[:ЛИМИТ_СИМВОЛОВ_BYBIT]:
         try:
             oi_rows.extend(fetch_bybit_oi_5m(s, 200))
-        except Exception:
-            pass
+        except Exception as exc:
+            record_failure("BYBIT", s, "OI", exc)
 
         try:
             p, v = fetch_bybit_kline_5m(s, 200)
             price_rows.extend(p)
             volume_rows.extend(v)
-        except Exception:
-            pass
+        except Exception as exc:
+            record_failure("BYBIT", s, "PRICE_VOLUME", exc)
 
     for s in symbols_binance[:ЛИМИТ_СИМВОЛОВ_BINANCE]:
         try:
             oi_rows.extend(fetch_binance_oi_5m(s, 200))
-        except Exception:
-            pass
+        except Exception as exc:
+            record_failure("BINANCE", s, "OI", exc)
 
         try:
             p, v = fetch_binance_kline_5m(s, 200)
             price_rows.extend(p)
             volume_rows.extend(v)
-        except Exception:
-            pass
+        except Exception as exc:
+            record_failure("BINANCE", s, "PRICE_VOLUME", exc)
 
     upsert_oi(oi_rows)
     upsert_price(price_rows)
     upsert_volume(volume_rows)
+    replace_request_failures(failures)
 
-    log(f"collect ok: oi={len(oi_rows)} price={len(price_rows)} volume={len(volume_rows)}")
+    log(
+        f"collect ok: oi={len(oi_rows)} price={len(price_rows)} volume={len(volume_rows)} "
+        f"request_failures={len(failures)}"
+    )
 
 
 def background(bybit_symbols, binance_symbols):
@@ -116,12 +126,21 @@ def main():
     bybit_symbols_all = fetch_bybit_symbols()
     binance_symbols_all = fetch_binance_symbols()
 
-    bybit_symbols = bybit_symbols_all[:ЛИМИТ_СИМВОЛОВ_BYBIT]
-    binance_symbols = binance_symbols_all[:ЛИМИТ_СИМВОЛОВ_BINANCE]
+    bad_symbols = load_quarantine_symbols(95.0)
+
+    bybit_symbols = [
+        s for s in bybit_symbols_all
+        if ("BYBIT", s) not in bad_symbols
+    ][:ЛИМИТ_СИМВОЛОВ_BYBIT]
+
+    binance_symbols = [
+        s for s in binance_symbols_all
+        if ("BINANCE", s) not in bad_symbols
+    ][:ЛИМИТ_СИМВОЛОВ_BINANCE]
 
     active_universe = (
-        [("BYBIT", s, "runtime_limit") for s in bybit_symbols] +
-        [("BINANCE", s, "runtime_limit") for s in binance_symbols]
+        [("BYBIT", s, "runtime_limit_quarantine_filtered") for s in bybit_symbols] +
+        [("BINANCE", s, "runtime_limit_quarantine_filtered") for s in binance_symbols]
     )
     replace_active_universe(active_universe)
 
@@ -129,6 +148,7 @@ def main():
     log(f"Binance symbols: {len(binance_symbols_all)}")
     log(f"Limits: bybit={ЛИМИТ_СИМВОЛОВ_BYBIT}, binance={ЛИМИТ_СИМВОЛОВ_BINANCE}")
     log(f"Active universe: bybit={len(bybit_symbols)} binance={len(binance_symbols)} total={len(active_universe)}")
+    log(f"Quarantine symbols excluded: {len(bad_symbols)}")
 
     threading.Thread(target=background, args=(bybit_symbols, binance_symbols), daemon=True).start()
 

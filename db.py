@@ -169,6 +169,17 @@ def init_db() -> None:
         )
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS request_failure_report(
+            calculated_at TIMESTAMPTZ NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            data_type TEXT NOT NULL,
+            error_type TEXT NOT NULL,
+            error_message TEXT NOT NULL
+        )
+        """)
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_agg_main ON bot_aggregates(metric, timeframe, exchange, symbol, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
@@ -177,6 +188,8 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_coverage_report_main ON coverage_report(metric, exchange, symbol, coverage_pct)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_gap_report_main ON gap_report(metric, exchange, symbol, gap_start)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_active_symbol_universe_main ON active_symbol_universe(exchange, symbol)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
+
 
     log("Postgres: canonical schema + derived tables готовы")
 
@@ -347,6 +360,38 @@ def active_universe_sql(alias: str = "") -> str:
         ")"
     )
 
+
+
+def replace_request_failures(rows: list[tuple]) -> None:
+    execute("TRUNCATE TABLE request_failure_report")
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO request_failure_report(
+            calculated_at,
+            exchange,
+            symbol,
+            data_type,
+            error_type,
+            error_message
+        ) VALUES (%s,%s,%s,%s,%s,%s)
+        """, rows)
+
+
+def load_quarantine_symbols(min_coverage_pct: float = 95.0) -> set[tuple[str, str]]:
+    if not DATABASE_URL:
+        return set()
+
+    rows = fetch("""
+        SELECT exchange, symbol
+        FROM coverage_report
+        WHERE coverage_pct < %s
+           OR invalid_timestamps > 0
+        GROUP BY exchange, symbol
+    """, (min_coverage_pct,))
+
+    return {(r["exchange"], r["symbol"]) for r in rows}
 
 def cleanup_old(days: int) -> None:
     for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:

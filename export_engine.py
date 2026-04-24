@@ -192,6 +192,21 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY exchange, symbol
     """)
 
+    request_failures = _safe_fetch("""
+        SELECT calculated_at, exchange, symbol, data_type, error_type, error_message
+        FROM request_failure_report
+        ORDER BY exchange, symbol, data_type
+    """)
+
+    invalid_reasons = _safe_fetch("""
+        SELECT invalid_reason, COUNT(*) AS total
+        FROM market_research
+        WHERE ts_close >= %s
+          AND market_state = 'invalid_data'
+        GROUP BY invalid_reason
+        ORDER BY total DESC
+    """, (since,))
+
     raw_path = ПАПКА_ДАННЫХ / "raw_market_5m.csv"
     aggregates_path = ПАПКА_ДАННЫХ / "bot_aggregates.csv"
     audit_path = ПАПКА_ДАННЫХ / "validation_audit.csv"
@@ -205,6 +220,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
     storage_health_path = ПАПКА_ДАННЫХ / "storage_health_report.txt"
     runtime_health_path = ПАПКА_ДАННЫХ / "runtime_health_report.txt"
     active_universe_path = ПАПКА_ДАННЫХ / "active_universe_report.csv"
+    request_failures_path = ПАПКА_ДАННЫХ / "request_failure_report.csv"
+    invalid_reasons_path = ПАПКА_ДАННЫХ / "invalid_reason_report.csv"
 
     _write_csv(
         raw_path,
@@ -243,9 +260,21 @@ def rebuild_exports(mode: str = "quick") -> Path:
     )
 
     _write_csv(
+        request_failures_path,
+        ["calculated_at", "exchange", "symbol", "data_type", "error_type", "error_message"],
+        [[r["calculated_at"], r["exchange"], r["symbol"], r["data_type"], r["error_type"], r["error_message"]] for r in request_failures],
+    )
+
+    _write_csv(
+        invalid_reasons_path,
+        ["invalid_reason", "total"],
+        [[r["invalid_reason"], r["total"]] for r in invalid_reasons],
+    )
+
+    _write_csv(
         market_research_path,
-        ["calculated_at", "ts_close", "exchange", "symbol", "timeframe", "oi_delta_pct", "price_delta_pct", "volume_delta_pct", "oi_velocity", "oi_acceleration", "range_width_pct", "continuation_score", "exhaustion_score", "compression_score", "market_state"],
-        [[r["calculated_at"], r["ts_close"], r["exchange"], r["symbol"], r["timeframe"], r["oi_delta_pct"], r["price_delta_pct"], r["volume_delta_pct"], r["oi_velocity"], r["oi_acceleration"], r["range_width_pct"], r["continuation_score"], r["exhaustion_score"], r["compression_score"], r["market_state"]] for r in market_research],
+        ["calculated_at", "ts_close", "exchange", "symbol", "timeframe", "oi_delta_pct", "price_delta_pct", "volume_delta_pct", "oi_velocity", "oi_acceleration", "range_width_pct", "continuation_score", "exhaustion_score", "compression_score", "market_state", "invalid_reason"],
+        [[r["calculated_at"], r["ts_close"], r["exchange"], r["symbol"], r["timeframe"], r["oi_delta_pct"], r["price_delta_pct"], r["volume_delta_pct"], r["oi_velocity"], r["oi_acceleration"], r["range_width_pct"], r["continuation_score"], r["exhaustion_score"], r["compression_score"], r["market_state"], r.get("invalid_reason")] for r in market_research],
     )
 
     _write_csv(
@@ -282,18 +311,26 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"coverage_rows: {len(coverage)}",
         f"gap_rows: {len(gaps)}",
         f"active_universe_rows: {len(active_universe)}",
+        f"request_failure_rows: {len(request_failures)}",
         f"coverage_critical_rows: {len(critical_coverage)}",
         f"coverage_warning_rows: {len(warning_coverage)}",
         f"active_universe_rows: {len(active_universe)}",
+        f"request_failure_rows: {len(request_failures)}",
         f"market_research_rows: {len(market_research)}",
         f"market_states_rows: {len(market_states)}",
         f"invalid_data_state_rows: {len(invalid_data_states)}",
+        f"request_failure_rows: {len(request_failures)}",
         "",
         "Top invalid audit:",
     ]
 
     for r in invalid[:100]:
         audit_lines.append(f'{r["metric"]} {r["symbol"]} {r["exchange"]} {r["timeframe"]} drift={r["drift"]} status={r["validation_status"]}')
+
+    audit_lines.append("")
+    audit_lines.append("Invalid data reasons:")
+    for r in invalid_reasons:
+        audit_lines.append(f"{r['invalid_reason']}: {r['total']}")
 
     audit_lines.append("")
     audit_lines.append("Worst coverage:")
@@ -319,6 +356,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"market_research_rows: {len(market_research)}",
         f"market_states_rows: {len(market_states)}",
         f"invalid_data_state_rows: {len(invalid_data_states)}",
+        f"request_failure_rows: {len(request_failures)}",
         "",
         "Состояния:",
     ]

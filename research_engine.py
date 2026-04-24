@@ -48,10 +48,12 @@ def init_research_schema() -> None:
             exhaustion_score DOUBLE PRECISION,
             compression_score DOUBLE PRECISION,
 
-            market_state TEXT NOT NULL
+            market_state TEXT NOT NULL,
+            invalid_reason TEXT
         )
         """
     )
+    execute("ALTER TABLE market_research ADD COLUMN IF NOT EXISTS invalid_reason TEXT")
     execute("CREATE INDEX IF NOT EXISTS idx_market_research_main ON market_research(exchange, symbol, timeframe, ts_close)")
     execute("CREATE INDEX IF NOT EXISTS idx_market_research_state ON market_research(market_state, timeframe, ts_close)")
 
@@ -117,24 +119,36 @@ def _coverage_map() -> dict[tuple[str, str, str], dict]:
     return {(r["metric"], r["exchange"], r["symbol"]): r for r in rows}
 
 
-def _is_invalid_data(exchange: str, symbol: str, coverage: dict[tuple[str, str, str], dict]) -> bool:
-    required_metrics = ("OI", "PRICE", "VOLUME")
+def _invalid_reason(
+    exchange: str,
+    symbol: str,
+    coverage: dict[tuple[str, str, str], dict],
+    oi: dict | None,
+    price: dict | None,
+    volume: dict | None,
+) -> str | None:
+    if not oi:
+        return "missing_oi"
+    if not price:
+        return "missing_price"
+    if not volume:
+        return "missing_volume"
 
-    for metric in required_metrics:
+    for metric in ("OI", "PRICE", "VOLUME"):
         row = coverage.get((metric, exchange, symbol))
         if not row:
-            return True
+            return f"missing_coverage_{metric.lower()}"
 
         coverage_pct = _safe_float(row.get("coverage_pct"))
         invalid_timestamps = int(row.get("invalid_timestamps") or 0)
 
         if invalid_timestamps > 0:
-            return True
+            return f"invalid_timestamps_{metric.lower()}"
 
         if coverage_pct < MIN_RESEARCH_COVERAGE_PCT:
-            return True
+            return f"low_coverage_{metric.lower()}"
 
-    return False
+    return None
 
 
 def rebuild_market_research() -> int:
@@ -211,9 +225,9 @@ def rebuild_market_research() -> int:
         price = metric_map.get(base + ("PRICE",))
         volume = metric_map.get(base + ("VOLUME",))
 
-        data_is_invalid = _is_invalid_data(exchange, symbol, coverage) or not oi or not price or not volume
+        invalid_reason = _invalid_reason(exchange, symbol, coverage, oi, price, volume)
 
-        if data_is_invalid:
+        if invalid_reason:
             invalid_data_rows += 1
             out.append(
                 (
@@ -232,6 +246,7 @@ def rebuild_market_research() -> int:
                     0.0,
                     0.0,
                     "invalid_data",
+                    invalid_reason,
                 )
             )
             continue
@@ -300,6 +315,7 @@ def rebuild_market_research() -> int:
                 exhaustion_score,
                 compression_score,
                 market_state,
+                None,
             )
         )
 
@@ -326,9 +342,10 @@ def rebuild_market_research() -> int:
                     continuation_score,
                     exhaustion_score,
                     compression_score,
-                    market_state
+                    market_state,
+                    invalid_reason
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 out,
             )
