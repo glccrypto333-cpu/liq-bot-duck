@@ -4,6 +4,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import csv
 import zipfile
+import os
+import resource
 
 from config import ПАПКА_ДАННЫХ, APP_VERSION, QUICK_EXPORT_CANDLES, RESEARCH_EXPORT_DAYS, RESEARCH_30D_EXPORT_DAYS
 from db import fetch
@@ -35,6 +37,24 @@ def _safe_fetch(sql: str, params: tuple = ()) -> list[dict]:
         return fetch(sql, params)
     except Exception:
         return []
+
+
+def _runtime_memory_mb() -> float:
+    try:
+        # macOS returns bytes, Linux returns KB. Railway/Linux will be KB.
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if usage > 10_000_000:
+            return usage / 1024 / 1024
+        return usage / 1024
+    except Exception:
+        return 0.0
+
+
+def _fmt_pct(value) -> str:
+    try:
+        return f"{float(value):.4f}%"
+    except Exception:
+        return "n/a"
 
 
 def rebuild_exports(mode: str = "quick") -> Path:
@@ -78,11 +98,22 @@ def rebuild_exports(mode: str = "quick") -> Path:
     keys = sorted(set(oi_map.keys()) | set(price_map.keys()) | set(volume_map.keys()), key=lambda x: (x[0], x[1], x[2]))
 
     raw_rows = []
+    missing_price = 0
+    missing_volume = 0
+    missing_oi = 0
+
     for exchange, symbol, ts_open in keys:
         oi_row = oi_map.get((exchange, symbol, ts_open))
         price_row = price_map.get((exchange, symbol, ts_open))
         volume_row = volume_map.get((exchange, symbol, ts_open))
         close_norm = ts_open + timedelta(minutes=5)
+
+        if not oi_row:
+            missing_oi += 1
+        if not price_row:
+            missing_price += 1
+        if not volume_row:
+            missing_volume += 1
 
         raw_rows.append([
             ts_open, close_norm, close_norm, exchange, symbol,
@@ -112,6 +143,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
     """, (since,))
 
     integrity = _safe_fetch("SELECT * FROM raw_integrity_report ORDER BY metric, exchange, symbol")
+    coverage = _safe_fetch("SELECT * FROM coverage_report ORDER BY metric, exchange, symbol")
+    gaps = _safe_fetch("SELECT * FROM gap_report ORDER BY metric, exchange, symbol, gap_start")
 
     market_research = _safe_fetch("""
         SELECT *
@@ -136,14 +169,31 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY exchange, symbol, timeframe, state_count DESC
     """, (since,))
 
+    storage_summary = _safe_fetch("""
+        SELECT metric, MIN(ts_open) AS oldest_ts, MAX(ts_open) AS newest_ts, COUNT(*) AS rows_count
+        FROM (
+            SELECT 'OI' AS metric, ts_open FROM oi_5m_сырые
+            UNION ALL
+            SELECT 'PRICE' AS metric, ts_open FROM price_5m_сырые
+            UNION ALL
+            SELECT 'VOLUME' AS metric, ts_open FROM volume_5m_сырые
+        ) x
+        GROUP BY metric
+        ORDER BY metric
+    """)
+
     raw_path = ПАПКА_ДАННЫХ / "raw_market_5m.csv"
     aggregates_path = ПАПКА_ДАННЫХ / "bot_aggregates.csv"
     audit_path = ПАПКА_ДАННЫХ / "validation_audit.csv"
     market_research_path = ПАПКА_ДАННЫХ / "market_research.csv"
     market_states_path = ПАПКА_ДАННЫХ / "market_states.csv"
+    coverage_path = ПАПКА_ДАННЫХ / "coverage_report.csv"
+    gap_path = ПАПКА_ДАННЫХ / "gap_report.csv"
     manifest_path = ПАПКА_ДАННЫХ / "storage_manifest.txt"
     audit_report_path = ПАПКА_ДАННЫХ / "audit_report.txt"
     research_report_path = ПАПКА_ДАННЫХ / "research_report.txt"
+    storage_health_path = ПАПКА_ДАННЫХ / "storage_health_report.txt"
+    runtime_health_path = ПАПКА_ДАННЫХ / "runtime_health_report.txt"
 
     _write_csv(
         raw_path,
@@ -164,6 +214,18 @@ def rebuild_exports(mode: str = "quick") -> Path:
     )
 
     _write_csv(
+        coverage_path,
+        ["calculated_at", "metric", "exchange", "symbol", "first_ts_open", "last_ts_open", "expected_candles", "actual_candles", "missing_candles", "coverage_pct", "missing_pct", "invalid_timestamps", "quality_status"],
+        [[r["calculated_at"], r["metric"], r["exchange"], r["symbol"], r["first_ts_open"], r["last_ts_open"], r["expected_candles"], r["actual_candles"], r["missing_candles"], r["coverage_pct"], r["missing_pct"], r["invalid_timestamps"], r["quality_status"]] for r in coverage],
+    )
+
+    _write_csv(
+        gap_path,
+        ["calculated_at", "metric", "exchange", "symbol", "gap_start", "gap_end", "missing_candles", "gap_minutes"],
+        [[r["calculated_at"], r["metric"], r["exchange"], r["symbol"], r["gap_start"], r["gap_end"], r["missing_candles"], r["gap_minutes"]] for r in gaps],
+    )
+
+    _write_csv(
         market_research_path,
         ["calculated_at", "ts_close", "exchange", "symbol", "timeframe", "oi_delta_pct", "price_delta_pct", "volume_delta_pct", "oi_velocity", "oi_acceleration", "range_width_pct", "continuation_score", "exhaustion_score", "compression_score", "market_state"],
         [[r["calculated_at"], r["ts_close"], r["exchange"], r["symbol"], r["timeframe"], r["oi_delta_pct"], r["price_delta_pct"], r["volume_delta_pct"], r["oi_velocity"], r["oi_acceleration"], r["range_width_pct"], r["continuation_score"], r["exhaustion_score"], r["compression_score"], r["market_state"]] for r in market_research],
@@ -176,29 +238,52 @@ def rebuild_exports(mode: str = "quick") -> Path:
     )
 
     invalid = [r for r in audit if r["validation_status"] != "валидно"]
+    critical_coverage = [r for r in coverage if r["quality_status"] == "critical"]
+    warning_coverage = [r for r in coverage if r["quality_status"] == "warning"]
+    invalid_data_states = [r for r in market_states if r["market_state"] == "invalid_data"]
 
     audit_lines = [
         f"Mighty Duck {APP_VERSION}",
         f"generated_at: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"mode: {mode}",
         "",
+        "v3.5.4 data quality foundation: active",
         "canonical_close: active",
-        "timestamp_migration: active",
-        "export_compression: active",
+        "contiguous_window_validation: active",
+        "coverage_report: active",
+        "gap_report: active",
+        "invalid_data_protection: active",
         "",
         f"raw_rows: {len(raw_rows)}",
+        f"raw_missing_oi_rows: {missing_oi}",
+        f"raw_missing_price_rows: {missing_price}",
+        f"raw_missing_volume_rows: {missing_volume}",
         f"bot_aggregates_rows: {len(aggregates)}",
         f"validation_audit_rows: {len(audit)}",
         f"invalid_rows: {len(invalid)}",
         f"integrity_rows: {len(integrity)}",
+        f"coverage_rows: {len(coverage)}",
+        f"gap_rows: {len(gaps)}",
+        f"coverage_critical_rows: {len(critical_coverage)}",
+        f"coverage_warning_rows: {len(warning_coverage)}",
         f"market_research_rows: {len(market_research)}",
         f"market_states_rows: {len(market_states)}",
+        f"invalid_data_state_rows: {len(invalid_data_states)}",
         "",
-        "Top invalid:",
+        "Top invalid audit:",
     ]
 
     for r in invalid[:100]:
         audit_lines.append(f'{r["metric"]} {r["symbol"]} {r["exchange"]} {r["timeframe"]} drift={r["drift"]} status={r["validation_status"]}')
+
+    audit_lines.append("")
+    audit_lines.append("Worst coverage:")
+    for r in sorted(coverage, key=lambda x: (float(x["coverage_pct"] or 0), x["metric"], x["exchange"], x["symbol"]))[:100]:
+        audit_lines.append(
+            f'{r["metric"]} {r["exchange"]} {r["symbol"]} '
+            f'coverage={_fmt_pct(r["coverage_pct"])} missing={r["missing_candles"]} '
+            f'invalid_ts={r["invalid_timestamps"]} status={r["quality_status"]}'
+        )
 
     _write_text(audit_report_path, "\n".join(audit_lines))
 
@@ -208,11 +293,13 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"mode: {mode}",
         "",
         "Исследовательский слой структуры рынка",
-        "Источник: реальные bot_aggregates",
+        "Источник: реальные bot_aggregates + coverage_report",
         "Fake rows: нет",
+        "invalid_data protection: active",
         "",
         f"market_research_rows: {len(market_research)}",
         f"market_states_rows: {len(market_states)}",
+        f"invalid_data_state_rows: {len(invalid_data_states)}",
         "",
         "Состояния:",
     ]
@@ -228,22 +315,96 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
     _write_text(research_report_path, "\n".join(research_lines))
 
+    storage_lines = [
+        f"Mighty Duck {APP_VERSION}",
+        f"generated_at: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        "",
+        "Storage health report",
+        "",
+        f"coverage_rows: {len(coverage)}",
+        f"gap_rows: {len(gaps)}",
+        f"coverage_critical_rows: {len(critical_coverage)}",
+        f"coverage_warning_rows: {len(warning_coverage)}",
+        "",
+        "Storage summary:",
+    ]
+
+    for r in storage_summary:
+        oldest = r["oldest_ts"]
+        newest = r["newest_ts"]
+        days = 0.0
+        if oldest and newest:
+            try:
+                days = (newest - oldest).total_seconds() / 86400.0
+            except Exception:
+                days = 0.0
+        storage_lines.append(
+            f'{r["metric"]}: rows={r["rows_count"]} oldest={oldest} newest={newest} estimated_days={days:.2f}'
+        )
+
+    storage_lines.append("")
+    storage_lines.append("Worst coverage:")
+    for r in sorted(coverage, key=lambda x: (float(x["coverage_pct"] or 0), x["metric"], x["exchange"], x["symbol"]))[:200]:
+        storage_lines.append(
+            f'{r["metric"]} {r["exchange"]} {r["symbol"]}: '
+            f'coverage={_fmt_pct(r["coverage_pct"])} missing_pct={_fmt_pct(r["missing_pct"])} '
+            f'missing={r["missing_candles"]} invalid_ts={r["invalid_timestamps"]} status={r["quality_status"]}'
+        )
+
+    _write_text(storage_health_path, "\n".join(storage_lines))
+
+    runtime_lines = [
+        f"Mighty Duck {APP_VERSION}",
+        f"generated_at: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        "",
+        "Runtime health report",
+        "",
+        f"process_id: {os.getpid()}",
+        f"memory_max_rss_mb: {_runtime_memory_mb():.2f}",
+        f"export_mode: {mode}",
+        f"raw_rows_exported: {len(raw_rows)}",
+        f"bot_aggregates_rows_exported: {len(aggregates)}",
+        f"validation_audit_rows_exported: {len(audit)}",
+        f"market_research_rows_exported: {len(market_research)}",
+        "",
+        "Runtime note:",
+        "This report is generated during export rebuild. It does not restart the bot.",
+    ]
+
+    _write_text(runtime_health_path, "\n".join(runtime_lines))
+
     _write_text(
         manifest_path,
         (
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, storage_manifest.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, coverage_report.csv, gap_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt\n"
             "timestamp_migration=active\n"
-            "research_source=real_bot_aggregates\n"
+            "canonical_close=active\n"
+            "contiguous_window_validation=active\n"
+            "coverage_report=active\n"
+            "gap_report=active\n"
+            "invalid_data_protection=active\n"
+            "research_source=real_bot_aggregates_plus_coverage_report\n"
         ),
     )
 
     bundle_path = ПАПКА_ДАННЫХ / "market_research_bundle.zip"
     mode_bundle_path = ПАПКА_ДАННЫХ / f"market_research_bundle_{suffix}.zip"
 
-    bundle_files = [raw_path, aggregates_path, audit_path, market_research_path, market_states_path, manifest_path]
+    bundle_files = [
+        raw_path,
+        aggregates_path,
+        audit_path,
+        market_research_path,
+        market_states_path,
+        coverage_path,
+        gap_path,
+        manifest_path,
+        storage_health_path,
+        runtime_health_path,
+    ]
 
     _zip(bundle_path, bundle_files)
     _zip(mode_bundle_path, bundle_files + [audit_report_path, research_report_path])
