@@ -129,11 +129,11 @@ def init_db() -> None:
         )
         """)
 
-        cur.execute("CREATE INDEX idx_bot_agg_main ON bot_aggregates(metric, timeframe, exchange, symbol, ts_close)")
-        cur.execute("CREATE INDEX idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
-        cur.execute("CREATE INDEX idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
-        cur.execute("CREATE INDEX idx_raw_price_main ON price_5m_сырые(exchange, symbol, ts_open)")
-        cur.execute("CREATE INDEX idx_raw_volume_main ON volume_5m_сырые(exchange, symbol, ts_open)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_agg_main ON bot_aggregates(metric, timeframe, exchange, symbol, ts_close)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_price_main ON price_5m_сырые(exchange, symbol, ts_open)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_volume_main ON volume_5m_сырые(exchange, symbol, ts_open)")
 
     log("Postgres: canonical schema + derived tables готовы")
 

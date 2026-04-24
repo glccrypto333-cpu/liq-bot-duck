@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-APP_VERSION = "v3.4.5"
+APP_VERSION = "v3.4.5.1"
 
 ИНТЕРВАЛ_ЦИКЛА_СЕК = int(os.getenv("COLLECT_INTERVAL_SECONDS", "180"))
 ДНЕЙ_ХРАНЕНИЯ = int(os.getenv("RETENTION_DAYS", "30"))
