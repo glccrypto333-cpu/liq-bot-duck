@@ -9,6 +9,7 @@ from logger import log
 
 WINDOWS = {"15м": 3, "30м": 6, "1ч": 12, "4ч": 48}
 WINDOW_MINUTES = {"15м": 15, "30м": 30, "1ч": 60, "4ч": 240}
+FIVE_MINUTES = timedelta(minutes=5)
 
 
 def _groups(rows):
@@ -26,8 +27,32 @@ def _window_close(ts_open, timeframe: str):
     return ts_open + timedelta(minutes=WINDOW_MINUTES[timeframe])
 
 
+def _is_contiguous_5m(chunk) -> bool:
+    """
+    v3.5.4 data-quality rule.
+
+    Биржа отдаёт native 5m candles. Мы НЕ реконструируем 5m из 1m.
+
+    Но если в базе есть дырка:
+        10:00, 10:05, 10:15
+    такое окно нельзя считать валидным 15m окном.
+
+    Aggregate создаётся только если каждая следующая свеча идёт
+    строго через 5 минут после предыдущей.
+    """
+    if not chunk:
+        return False
+
+    for prev, current in zip(chunk, chunk[1:]):
+        if current["ts_open"] - prev["ts_open"] != FIVE_MINUTES:
+            return False
+
+    return True
+
+
 def rebuild_bot_aggregates() -> int:
     rows_out = []
+    skipped_non_contiguous = 0
 
     oi_rows = fetch("""
         SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close
@@ -42,6 +67,9 @@ def rebuild_bot_aggregates() -> int:
                 continue
             for i in range(need - 1, len(items)):
                 chunk = items[i - need + 1:i + 1]
+                if not _is_contiguous_5m(chunk):
+                    skipped_non_contiguous += 1
+                    continue
                 rows_out.append((
                     "OI", timeframe,
                     chunk[0]["ts_open"], _window_close(chunk[0]["ts_open"], timeframe),
@@ -68,6 +96,9 @@ def rebuild_bot_aggregates() -> int:
                 continue
             for i in range(need - 1, len(items)):
                 chunk = items[i - need + 1:i + 1]
+                if not _is_contiguous_5m(chunk):
+                    skipped_non_contiguous += 1
+                    continue
                 rows_out.append((
                     "PRICE", timeframe,
                     chunk[0]["ts_open"], _window_close(chunk[0]["ts_open"], timeframe),
@@ -94,6 +125,9 @@ def rebuild_bot_aggregates() -> int:
                 continue
             for i in range(need - 1, len(items)):
                 chunk = items[i - need + 1:i + 1]
+                if not _is_contiguous_5m(chunk):
+                    skipped_non_contiguous += 1
+                    continue
                 values = [x["volume"] for x in chunk]
                 rows_out.append((
                     "VOLUME", timeframe,
@@ -113,6 +147,7 @@ def rebuild_bot_aggregates() -> int:
     log(
         f"aggregates rebuilt: raw_oi={len(oi_rows)} "
         f"raw_price={len(price_rows)} raw_volume={len(volume_rows)} "
-        f"aggregates={len(rows_out)}"
+        f"aggregates={len(rows_out)} "
+        f"skipped_non_contiguous={skipped_non_contiguous}"
     )
     return len(rows_out)

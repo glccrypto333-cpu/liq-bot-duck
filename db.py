@@ -128,12 +128,44 @@ def init_db() -> None:
             integrity_score DOUBLE PRECISION NOT NULL
         )
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS coverage_report(
+            calculated_at TIMESTAMPTZ NOT NULL,
+            metric TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            first_ts_open TIMESTAMPTZ,
+            last_ts_open TIMESTAMPTZ,
+            expected_candles INTEGER NOT NULL,
+            actual_candles INTEGER NOT NULL,
+            missing_candles INTEGER NOT NULL,
+            coverage_pct DOUBLE PRECISION NOT NULL,
+            missing_pct DOUBLE PRECISION NOT NULL,
+            invalid_timestamps INTEGER NOT NULL,
+            quality_status TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS gap_report(
+            calculated_at TIMESTAMPTZ NOT NULL,
+            metric TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            gap_start TIMESTAMPTZ NOT NULL,
+            gap_end TIMESTAMPTZ NOT NULL,
+            missing_candles INTEGER NOT NULL,
+            gap_minutes DOUBLE PRECISION NOT NULL
+        )
+        """)
 
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_agg_main ON bot_aggregates(metric, timeframe, exchange, symbol, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_price_main ON price_5m_сырые(exchange, symbol, ts_open)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_volume_main ON volume_5m_сырые(exchange, symbol, ts_open)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_coverage_report_main ON coverage_report(metric, exchange, symbol, coverage_pct)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_gap_report_main ON gap_report(metric, exchange, symbol, gap_start)")
 
     log("Postgres: canonical schema + derived tables готовы")
 
@@ -237,6 +269,49 @@ def replace_integrity(rows: list[tuple]) -> None:
             unique_candles, missing_candles, invalid_timestamps, integrity_score
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
+
+def replace_coverage(rows: list[tuple]) -> None:
+    execute("TRUNCATE TABLE coverage_report")
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO coverage_report(
+            calculated_at,
+            metric,
+            exchange,
+            symbol,
+            first_ts_open,
+            last_ts_open,
+            expected_candles,
+            actual_candles,
+            missing_candles,
+            coverage_pct,
+            missing_pct,
+            invalid_timestamps,
+            quality_status
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
+
+
+def replace_gaps(rows: list[tuple]) -> None:
+    execute("TRUNCATE TABLE gap_report")
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO gap_report(
+            calculated_at,
+            metric,
+            exchange,
+            symbol,
+            gap_start,
+            gap_end,
+            missing_candles,
+            gap_minutes
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
+
 
 def cleanup_old(days: int) -> None:
     for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
