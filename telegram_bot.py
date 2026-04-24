@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 import requests
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ПАПКА_ДАННЫХ
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ПАПКА_ДАННЫХ, APP_VERSION
 from export_engine import rebuild_exports
 from logger import log
 
@@ -48,32 +48,52 @@ def send_document(path: Path, caption: str | None = None) -> None:
         log(f"telegram send document error: {exc}")
 
 
+def _ensure_quick_exports() -> None:
+    rebuild_exports("quick")
+
+
 def _handle(text: str) -> None:
     if text == "/ping":
         send_message("pong")
+
     elif text == "/status":
+        _ensure_quick_exports()
         files = sorted(path.name for path in ПАПКА_ДАННЫХ.glob("*") if path.is_file())
         send_message(
-            "🥇 Mighty Duck v3.5.2\n\n"
+            f"🥇 Mighty Duck / {APP_VERSION}\n\n"
+            "Файлы обновлены.\n\n"
             "Основные файлы:\n"
             "1. market_research_bundle.zip\n"
             "2. audit_report.txt\n"
-            "3. research_report.txt\n\n"
+            "3. research_report.txt\n"
+            "4. storage_manifest.txt\n\n"
             f"Всего файлов в runtime: {len(files)}"
         )
+
     elif text == "/manifest":
-        send_document(ПАПКА_ДАННЫХ / "storage_manifest.txt")
+        _ensure_quick_exports()
+        send_document(ПАПКА_ДАННЫХ / "storage_manifest.txt", "manifest")
+
     elif text == "/bundle":
-        send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "основной research bundle")
+        _ensure_quick_exports()
+        send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "quick bundle")
+
     elif text == "/audit_report":
-        send_document(ПАПКА_ДАННЫХ / "audit_report.txt")
+        _ensure_quick_exports()
+        send_document(ПАПКА_ДАННЫХ / "audit_report.txt", "audit report")
+
     elif text == "/research_report":
-        send_document(ПАПКА_ДАННЫХ / "research_report.txt")
+        _ensure_quick_exports()
+        send_document(ПАПКА_ДАННЫХ / "research_report.txt", "research report")
+
     elif text == "/export_quick":
+        send_message("Готовлю quick bundle...")
         send_document(rebuild_exports("quick"), "quick bundle")
+
     elif text == "/export_research_7d":
         send_message("Готовлю research 7d bundle...")
         send_document(rebuild_exports("research_7d"), "research 7d bundle")
+
     elif text == "/export_research_30d":
         send_message("Готовлю research 30d bundle...")
         send_document(rebuild_exports("research_30d"), "research 30d bundle")
