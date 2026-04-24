@@ -8,6 +8,9 @@ from db import fetch, execute
 from logger import log
 
 
+MIN_RESEARCH_COVERAGE_PCT = 97.0
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -94,12 +97,56 @@ def _classify_state(
     return "нейтрально"
 
 
+def _coverage_map() -> dict[tuple[str, str, str], dict]:
+    """
+    v3.5.4 protection layer.
+
+    coverage_report считается на raw 5m data.
+    Research не должен строить состояния рынка, если по exchange/symbol
+    плохая полнота OI / PRICE / VOLUME.
+
+    Key:
+        (metric, exchange, symbol)
+    """
+    rows = fetch(
+        """
+        SELECT metric, exchange, symbol, coverage_pct, missing_pct, invalid_timestamps, quality_status
+        FROM coverage_report
+        """
+    )
+    return {(r["metric"], r["exchange"], r["symbol"]): r for r in rows}
+
+
+def _is_invalid_data(exchange: str, symbol: str, coverage: dict[tuple[str, str, str], dict]) -> bool:
+    required_metrics = ("OI", "PRICE", "VOLUME")
+
+    for metric in required_metrics:
+        row = coverage.get((metric, exchange, symbol))
+        if not row:
+            return True
+
+        coverage_pct = _safe_float(row.get("coverage_pct"))
+        invalid_timestamps = int(row.get("invalid_timestamps") or 0)
+
+        if invalid_timestamps > 0:
+            return True
+
+        if coverage_pct < MIN_RESEARCH_COVERAGE_PCT:
+            return True
+
+    return False
+
+
 def rebuild_market_research() -> int:
     """
     Исследовательский слой.
-    Источник истины: bot_aggregates.
+    Источник истины: bot_aggregates + coverage_report.
     Fake rows: нет.
     Сигналы: нет.
+
+    v3.5.4:
+    Если данных недостаточно или coverage плохой:
+        market_state = invalid_data
     """
     init_research_schema()
 
@@ -124,6 +171,8 @@ def rebuild_market_research() -> int:
         ORDER BY exchange, symbol, timeframe, ts_close
         """
     )
+
+    coverage = _coverage_map()
 
     metric_map: dict[tuple, dict] = {}
     keys = set()
@@ -152,6 +201,7 @@ def rebuild_market_research() -> int:
 
     calculated_at = datetime.now(timezone.utc)
     out = []
+    invalid_data_rows = 0
 
     for exchange, symbol, timeframe, ts_close in sorted_keys:
         base = (exchange, symbol, timeframe, ts_close)
@@ -161,7 +211,29 @@ def rebuild_market_research() -> int:
         price = metric_map.get(base + ("PRICE",))
         volume = metric_map.get(base + ("VOLUME",))
 
-        if not oi or not price or not volume:
+        data_is_invalid = _is_invalid_data(exchange, symbol, coverage) or not oi or not price or not volume
+
+        if data_is_invalid:
+            invalid_data_rows += 1
+            out.append(
+                (
+                    calculated_at,
+                    ts_close,
+                    exchange,
+                    symbol,
+                    timeframe,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0.0,
+                    0.0,
+                    0.0,
+                    "invalid_data",
+                )
+            )
             continue
 
         oi_delta = _safe_float(oi.get("delta_pct"))
@@ -261,5 +333,5 @@ def rebuild_market_research() -> int:
                 out,
             )
 
-    log(f"market research rebuilt: rows={len(out)}")
+    log(f"market research rebuilt: rows={len(out)} invalid_data={invalid_data_rows}")
     return len(out)
