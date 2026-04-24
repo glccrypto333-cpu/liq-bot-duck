@@ -7,6 +7,7 @@ import zipfile
 from config import ПАПКА_ДАННЫХ, APP_VERSION, QUICK_EXPORT_CANDLES, RESEARCH_EXPORT_DAYS, RESEARCH_30D_EXPORT_DAYS
 from db import fetch
 
+
 def _write_csv(path: Path, header: list[str], rows: list[list]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -14,14 +15,17 @@ def _write_csv(path: Path, header: list[str], rows: list[list]) -> None:
         w.writerow(header)
         w.writerows(rows)
 
+
 def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
+
 
 def _zip(zip_path: Path, files: list[Path]) -> None:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for f in files:
             if f.exists():
                 z.write(f, arcname=f.name)
+
 
 def rebuild_exports(mode: str = "quick") -> Path:
     now = datetime.now(timezone.utc)
@@ -36,81 +40,134 @@ def rebuild_exports(mode: str = "quick") -> Path:
         since = now - timedelta(minutes=QUICK_EXPORT_CANDLES * 5)
         suffix = "quick"
 
-    oi = fetch("""
+    oi = fetch(
+        """
         SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close
         FROM oi_5m_сырые
         WHERE ts_open >= %s
         ORDER BY exchange, symbol, ts_open
-    """, (since,))
+        """,
+        (since,),
+    )
 
-    pr = fetch("""
+    pr = fetch(
+        """
         SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close
         FROM price_5m_сырые
         WHERE ts_open >= %s
         ORDER BY exchange, symbol, ts_open
-    """, (since,))
+        """,
+        (since,),
+    )
 
-    vo = fetch("""
+    vo = fetch(
+        """
         SELECT ts_open, ts_close, exchange, symbol, volume
         FROM volume_5m_сырые
         WHERE ts_open >= %s
         ORDER BY exchange, symbol, ts_open
-    """, (since,))
+        """,
+        (since,),
+    )
 
     oi_map = {(r["exchange"], r["symbol"], r["ts_open"]): r for r in oi}
     price_map = {(r["exchange"], r["symbol"], r["ts_open"]): r for r in pr}
     volume_map = {(r["exchange"], r["symbol"], r["ts_open"]): r for r in vo}
 
-    keys = sorted(set(oi_map.keys()) | set(price_map.keys()) | set(volume_map.keys()), key=lambda x: (x[0], x[1], x[2]))
+    keys = sorted(
+        set(oi_map.keys()) | set(price_map.keys()) | set(volume_map.keys()),
+        key=lambda x: (x[0], x[1], x[2]),
+    )
 
     raw_rows = []
+
     for key in keys:
         exchange, symbol, ts_open = key
         o = oi_map.get(key)
         p = price_map.get(key)
         v = volume_map.get(key)
 
-        # canonical normalized close для всех бирж одинаковый:
         candle_close_norm = ts_open + timedelta(minutes=5)
 
-        raw_rows.append([
-            ts_open,
-            candle_close_norm,
-            candle_close_norm,
-            exchange,
-            symbol,
-            o["oi_open"] if o else None,
-            o["oi_high"] if o else None,
-            o["oi_low"] if o else None,
-            o["oi_close"] if o else None,
-            p["price_open"] if p else None,
-            p["price_high"] if p else None,
-            p["price_low"] if p else None,
-            p["price_close"] if p else None,
-            v["volume"] if v else None,
-        ])
+        raw_rows.append(
+            [
+                ts_open,
+                candle_close_norm,
+                candle_close_norm,
+                exchange,
+                symbol,
+                o["oi_open"] if o else None,
+                o["oi_high"] if o else None,
+                o["oi_low"] if o else None,
+                o["oi_close"] if o else None,
+                p["price_open"] if p else None,
+                p["price_high"] if p else None,
+                p["price_low"] if p else None,
+                p["price_close"] if p else None,
+                v["volume"] if v else None,
+            ]
+        )
 
-    ag = fetch("""
+    ag = fetch(
+        """
         SELECT *
         FROM bot_aggregates
-        WHERE ts_open >= %s
+        WHERE ts_close >= %s
         ORDER BY metric, exchange, symbol, timeframe, ts_close
-    """, (since,))
+        """,
+        (since,),
+    )
 
-    au = fetch("""
+    au = fetch(
+        """
         SELECT *
         FROM validation_audit
         WHERE ts_close >= %s
         ORDER BY metric, exchange, symbol, timeframe, ts_close
-    """, (since,))
+        """,
+        (since,),
+    )
 
     integ = fetch("SELECT * FROM raw_integrity_report ORDER BY metric, exchange, symbol")
+
+    market_research = fetch(
+        """
+        SELECT *
+        FROM market_research
+        WHERE ts_close >= %s
+        ORDER BY exchange, symbol, timeframe, ts_close
+        """,
+        (since,),
+    )
+
+    market_states = fetch(
+        """
+        SELECT
+            exchange,
+            symbol,
+            timeframe,
+            market_state,
+            COUNT(*) AS state_count,
+            AVG(continuation_score) AS avg_continuation_score,
+            AVG(exhaustion_score) AS avg_exhaustion_score,
+            AVG(compression_score) AS avg_compression_score
+        FROM market_research
+        WHERE ts_close >= %s
+        GROUP BY exchange, symbol, timeframe, market_state
+        ORDER BY exchange, symbol, timeframe, state_count DESC
+        """,
+        (since,),
+    )
 
     raw_path = ПАПКА_ДАННЫХ / "raw_market_5m.csv"
     ag_path = ПАПКА_ДАННЫХ / "bot_aggregates.csv"
     audit_path = ПАПКА_ДАННЫХ / "validation_audit.csv"
     report_path = ПАПКА_ДАННЫХ / "audit_report.txt"
     manifest_path = ПАПКА_ДАННЫХ / "storage_manifest.txt"
+
+    market_research_path = ПАПКА_ДАННЫХ / "market_research.csv"
+    market_states_path = ПАПКА_ДАННЫХ / "market_states.csv"
+    research_report_path = ПАПКА_ДАННЫХ / "research_report.txt"
 
     _write_csv(
         raw_path,
@@ -221,6 +278,74 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ],
     )
 
+    _write_csv(
+        market_research_path,
+        [
+            "calculated_at",
+            "ts_close",
+            "exchange",
+            "symbol",
+            "timeframe",
+            "oi_delta_pct",
+            "price_delta_pct",
+            "volume_delta_pct",
+            "oi_velocity",
+            "oi_acceleration",
+            "range_width_pct",
+            "continuation_score",
+            "exhaustion_score",
+            "compression_score",
+            "market_state",
+        ],
+        [
+            [
+                r["calculated_at"],
+                r["ts_close"],
+                r["exchange"],
+                r["symbol"],
+                r["timeframe"],
+                r["oi_delta_pct"],
+                r["price_delta_pct"],
+                r["volume_delta_pct"],
+                r["oi_velocity"],
+                r["oi_acceleration"],
+                r["range_width_pct"],
+                r["continuation_score"],
+                r["exhaustion_score"],
+                r["compression_score"],
+                r["market_state"],
+            ]
+            for r in market_research
+        ],
+    )
+
+    _write_csv(
+        market_states_path,
+        [
+            "exchange",
+            "symbol",
+            "timeframe",
+            "market_state",
+            "state_count",
+            "avg_continuation_score",
+            "avg_exhaustion_score",
+            "avg_compression_score",
+        ],
+        [
+            [
+                r["exchange"],
+                r["symbol"],
+                r["timeframe"],
+                r["market_state"],
+                r["state_count"],
+                r["avg_continuation_score"],
+                r["avg_exhaustion_score"],
+                r["avg_compression_score"],
+            ]
+            for r in market_states
+        ],
+    )
+
     bad = [r for r in au if r["validation_status"] != "валидно"]
 
     lines = [
@@ -230,20 +355,65 @@ def rebuild_exports(mode: str = "quick") -> Path:
         "",
         "timestamp_normalization: active",
         "canonical_close: ts_open + 5m",
+        "research_layer: active",
+        "research_source: real bot_aggregates",
         "",
         f"raw_rows: {len(raw_rows)}",
         f"bot_aggregates_rows: {len(ag)}",
         f"validation_audit_rows: {len(au)}",
         f"invalid_rows: {len(bad)}",
         f"integrity_rows: {len(integ)}",
+        f"market_research_rows: {len(market_research)}",
+        f"market_states_rows: {len(market_states)}",
         "",
         "Top invalid:",
     ]
 
     for r in bad[:100]:
-        lines.append(f'{r["metric"]} {r["symbol"]} {r["exchange"]} {r["timeframe"]} drift={r["drift"]} status={r["validation_status"]}')
+        lines.append(
+            f'{r["metric"]} {r["symbol"]} {r["exchange"]} {r["timeframe"]} '
+            f'drift={r["drift"]} status={r["validation_status"]}'
+        )
+
+    lines.append("")
+    lines.append("Research states:")
+
+    for r in market_states[:100]:
+        lines.append(
+            f'{r["exchange"]} {r["symbol"]} {r["timeframe"]} {r["market_state"]} '
+            f'count={r["state_count"]} '
+            f'continuation={r["avg_continuation_score"]} '
+            f'exhaustion={r["avg_exhaustion_score"]} '
+            f'compression={r["avg_compression_score"]}'
+        )
 
     _write_text(report_path, "\n".join(lines))
+
+    research_lines = [
+        f"Mighty Duck {APP_VERSION}",
+        f"generated_at: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"mode: {mode}",
+        "",
+        "Исследовательский слой структуры рынка",
+        "Источник: реальные bot_aggregates",
+        "Fake rows: нет",
+        "",
+        f"market_research_rows: {len(market_research)}",
+        f"market_states_rows: {len(market_states)}",
+        "",
+        "Состояния:",
+    ]
+
+    for r in market_states[:200]:
+        research_lines.append(
+            f'{r["exchange"]} {r["symbol"]} {r["timeframe"]} {r["market_state"]} '
+            f'count={r["state_count"]} '
+            f'continuation={r["avg_continuation_score"]} '
+            f'exhaustion={r["avg_exhaustion_score"]} '
+            f'compression={r["avg_compression_score"]}'
+        )
+
+    _write_text(research_report_path, "\n".join(research_lines))
 
     _write_text(
         manifest_path,
@@ -252,10 +422,25 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"mode={mode}\n"
             "timestamp_normalization=active\n"
             "canonical_close=ts_open_plus_5m\n"
-            "files=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, audit_report.txt\n"
+            "research_layer=active\n"
+            "research_source=real_bot_aggregates\n"
+            "files=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, audit_report.txt, market_research.csv, market_states.csv, research_report.txt\n"
         ),
     )
 
     zip_path = ПАПКА_ДАННЫХ / f"market_research_bundle_{suffix}.zip"
-    _zip(zip_path, [raw_path, ag_path, audit_path, report_path, manifest_path])
+    _zip(
+        zip_path,
+        [
+            raw_path,
+            ag_path,
+            audit_path,
+            report_path,
+            manifest_path,
+            market_research_path,
+            market_states_path,
+            research_report_path,
+        ],
+    )
+
     return zip_path
