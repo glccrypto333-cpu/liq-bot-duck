@@ -15,7 +15,7 @@ from config import (
     ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК,
 )
 from logger import log
-from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old
+from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old, migrate_canonical_ts_close
 from exchange_clients import (
     fetch_bybit_symbols,
     fetch_binance_symbols,
@@ -99,6 +99,7 @@ def main():
     log(f"Новая чистая база {APP_VERSION} запущена")
 
     init_db()
+    migrate_canonical_ts_close()
 
     start_polling()
     log("Telegram polling стартовал")

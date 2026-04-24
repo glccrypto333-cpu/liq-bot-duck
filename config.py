@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-APP_VERSION = "v3.5.0"
+APP_VERSION = "v3.5.2"
 
 ИНТЕРВАЛ_ЦИКЛА_СЕК = int(os.getenv("COLLECT_INTERVAL_SECONDS", "180"))
 ДНЕЙ_ХРАНЕНИЯ = int(os.getenv("RETENTION_DAYS", "30"))
@@ -29,27 +29,21 @@ BINANCE_BASE = "https://fapi.binance.com"
     "/ping\n"
     "/status\n"
     "/manifest\n"
-    "/raw_market_5m\n"
-    "/bot_aggregates\n"
-    "/validation_audit\n"
+    "/bundle\n"
     "/audit_report\n"
+    "/research_report\n"
     "/export_quick\n"
     "/export_research_7d\n"
-    "/export_research_30d\n"
-    "/market_research\n"
-    "/market_states\n"
-    "/research_report"
+    "/export_research_30d"
 )
 
 СТАРТОВОЕ_СООБЩЕНИЕ = (
     "🥇 Mighty Duck / {version}\n\n"
-    "🚀 research market structure layer\n"
-    "🟢 Canonical raw: active\n"
-    "🟢 Aggregates: canonical close aligned\n"
-    "🟢 Audit: exact normalized ts_close matching\n"
-    "🟢 Exports: 4 files + zip bundles\n"
-    "🧠 Исследовательский слой структуры рынка: активен\n"
-    "🟢 Источник исследования: реальные bot_aggregates\n\n"
+    "🚀 v3.5.2 isolated production patch\n"
+    "🟢 Canonical ts_close migration: active\n"
+    "🟢 Export compression: 3 files\n"
+    "🟢 Research source: real bot_aggregates only\n"
+    "🧠 Состояния рынка: диапазон / продолжение / выдох / сжатие / нейтрально\n\n"
     "🗄 Хранение истории: {retention} дней\n\n"
     "Команды:\n{commands}"
 )

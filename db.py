@@ -241,3 +241,26 @@ def replace_integrity(rows: list[tuple]) -> None:
 def cleanup_old(days: int) -> None:
     for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
         execute(f"DELETE FROM {table} WHERE ts_open < NOW() - (%s || ' days')::interval", (days,))
+
+def migrate_canonical_ts_close() -> None:
+    """
+    v3.5.1 migration:
+    Приводит старые raw-свечи к canonical close:
+    ts_close = ts_open + interval '5 minutes'
+
+    Это убирает старые Binance close time вида xx:04:59.999.
+    """
+    if not DATABASE_URL:
+        return
+
+    with _conn() as conn, conn.cursor() as cur:
+        for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
+            cur.execute(
+                f"""
+                UPDATE {table}
+                SET ts_close = ts_open + interval '5 minutes'
+                WHERE ts_close IS DISTINCT FROM ts_open + interval '5 minutes'
+                """
+            )
+
+    log("Postgres: canonical ts_close migration completed")
