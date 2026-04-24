@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from db import fetch, replace_validation, replace_integrity
 from metrics import изменение_в_процентах, abs_diff, rel_diff_pct
+from logger import log
 
 WINDOWS = {"15м": 3, "30м": 6, "1ч": 12, "4ч": 48}
 
@@ -30,14 +31,16 @@ def _groups(rows):
 def _bot_map():
     return {(r["metric"], r["timeframe"], r["exchange"], r["symbol"], r["ts_close"]): r for r in fetch("SELECT * FROM bot_aggregates")}
 
-def rebuild_validation_audit() -> None:
+def rebuild_validation_audit() -> int:
     now = datetime.now(timezone.utc)
     bot = _bot_map()
     out = []
 
-    oi_rows = fetch("SELECT * FROM oi_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
+    oi_rows = fetch("SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close FROM oi_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
     for (exchange, symbol), items in _groups(oi_rows).items():
         for tf, n in WINDOWS.items():
+            if len(items) < n:
+                continue
             for i in range(n - 1, len(items)):
                 b = items[i-n+1:i+1]
                 ts_close = b[-1]["ts_close"]
@@ -49,9 +52,11 @@ def rebuild_validation_audit() -> None:
                 drift = abs_diff(bot_delta, audit_delta)
                 out.append((now, "OI", tf, ts_close, exchange, symbol, bot_r["open_value"] if bot_r else None, audit_open, bot_r["close_value"] if bot_r else None, audit_close, bot_delta, audit_delta, None, None, None, None, drift, len(b), _status("OI", len(b), n, drift)))
 
-    price_rows = fetch("SELECT * FROM price_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
+    price_rows = fetch("SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close FROM price_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
     for (exchange, symbol), items in _groups(price_rows).items():
         for tf, n in WINDOWS.items():
+            if len(items) < n:
+                continue
             for i in range(n - 1, len(items)):
                 b = items[i-n+1:i+1]
                 ts_close = b[-1]["ts_close"]
@@ -63,9 +68,11 @@ def rebuild_validation_audit() -> None:
                 drift = abs_diff(bot_delta, audit_delta)
                 out.append((now, "PRICE", tf, ts_close, exchange, symbol, bot_r["open_value"] if bot_r else None, audit_open, bot_r["close_value"] if bot_r else None, audit_close, bot_delta, audit_delta, None, None, None, None, drift, len(b), _status("PRICE", len(b), n, drift)))
 
-    vol_rows = fetch("SELECT * FROM volume_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
+    vol_rows = fetch("SELECT ts_open, ts_close, exchange, symbol, volume FROM volume_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
     for (exchange, symbol), items in _groups(vol_rows).items():
         for tf, n in WINDOWS.items():
+            if len(items) < n:
+                continue
             for i in range(n - 1, len(items)):
                 b = items[i-n+1:i+1]
                 ts_close = b[-1]["ts_close"]
@@ -79,8 +86,10 @@ def rebuild_validation_audit() -> None:
                 out.append((now, "VOLUME", tf, ts_close, exchange, symbol, None, None, None, None, None, None, bot_sum, audit_sum, bot_avg, audit_avg, drift, len(b), _status("VOLUME", len(b), n, drift)))
 
     replace_validation(out)
+    log(f"validation audit rebuilt: bot_map={len(bot)} audit_rows={len(out)}")
+    return len(out)
 
-def rebuild_integrity() -> None:
+def rebuild_integrity() -> int:
     now = datetime.now(timezone.utc)
     out = []
     for metric, table in [("OI", "oi_5m_сырые"), ("PRICE", "price_5m_сырые"), ("VOLUME", "volume_5m_сырые")]:
@@ -100,7 +109,9 @@ def rebuild_integrity() -> None:
             score = max(0.0, min(100.0, 100 - missing * 0.5 - invalid * 10))
             out.append((now, metric, exchange, symbol, len(items), missing, invalid, score))
     replace_integrity(out)
+    log(f"integrity rebuilt: rows={len(out)}")
+    return len(out)
 
-def rebuild_all() -> None:
+def rebuild_all() -> int:
     rebuild_integrity()
-    rebuild_validation_audit()
+    return rebuild_validation_audit()

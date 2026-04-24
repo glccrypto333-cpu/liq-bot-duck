@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-APP_VERSION = "v3.4.3"
+APP_VERSION = "v3.4.4"
 
 ИНТЕРВАЛ_ЦИКЛА_СЕК = int(os.getenv("COLLECT_INTERVAL_SECONDS", "180"))
 ДНЕЙ_ХРАНЕНИЯ = int(os.getenv("RETENTION_DAYS", "30"))
@@ -40,11 +40,11 @@ BINANCE_BASE = "https://fapi.binance.com"
 
 СТАРТОВОЕ_СООБЩЕНИЕ = (
     "🥇 Mighty Duck / {version}\n\n"
-    "🚀 canonical candle storage fix\n"
-    "🟢 UPSERT raw candles: active\n"
-    "🟢 Unique key: exchange + symbol + ts_open\n"
-    "🟢 Closed 5m candles only\n"
-    "🟢 Export modes: quick / research 7d / research 30d\n\n"
+    "🚀 aggregation repair + audit activation\n"
+    "🟢 Canonical raw: active\n"
+    "🟢 Aggregates: rebuild table mode\n"
+    "🟢 Audit: exact ts_close matching\n"
+    "🟢 Exports: 4 files + zip bundles\n\n"
     "🗄 Хранение истории: {retention} дней\n\n"
     "Команды:\n{commands}"
 )

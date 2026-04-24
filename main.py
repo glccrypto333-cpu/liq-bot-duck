@@ -32,23 +32,24 @@ def collect(symbols_bybit, symbols_binance):
     upsert_oi(oi_rows)
     upsert_price(price_rows)
     upsert_volume(volume_rows)
+    log(f"collect ok: oi={len(oi_rows)} price={len(price_rows)} volume={len(volume_rows)}")
 
 def background(bybit_symbols, binance_symbols):
     last_export = 0.0
     while True:
         try:
             collect(bybit_symbols, binance_symbols)
-            rebuild_bot_aggregates()
-            rebuild_all()
+            agg_count = rebuild_bot_aggregates()
+            audit_count = rebuild_all()
             cleanup_old(ДНЕЙ_ХРАНЕНИЯ)
             now = time.time()
             if now - last_export >= ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК:
-                rebuild_exports("quick")
+                bundle = rebuild_exports("quick")
                 last_export = now
-                log("quick export rebuilt")
-            log("canonical validation cycle ok")
+                log(f"quick export rebuilt: {bundle}")
+            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count}")
         except Exception as exc:
-            log(f"canonical validation cycle error: {exc}")
+            log(f"canonical validation cycle error: {type(exc).__name__}: {exc}")
         time.sleep(ИНТЕРВАЛ_ЦИКЛА_СЕК)
 
 def main():
