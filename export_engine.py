@@ -2,96 +2,103 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import csv
-from config import ПАПКА_ДАННЫХ, APP_VERSION, ДНЕЙ_ХРАНЕНИЯ, ДНЕЙ_ЭКСПОРТА, ЛИМИТ_СЫРЫХ_5М, ЛИМИТ_АГРЕГАТОВ, ЛИМИТ_СВЕРКИ, ЛИМИТ_АУДИТА
-from db import fetch_rows
+import zipfile
 
-def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def _write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+from config import ПАПКА_ДАННЫХ, APP_VERSION, QUICK_EXPORT_CANDLES, RESEARCH_EXPORT_DAYS, RESEARCH_30D_EXPORT_DAYS
+from db import fetch
 
 def _write_csv(path: Path, header: list[str], rows: list[list]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
 
-def rebuild_exports() -> None:
-    ts = _now()
-    since = datetime.now(timezone.utc) - timedelta(days=ДНЕЙ_ЭКСПОРТА)
+def _write_text(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
 
-    oi_raw = fetch_rows(f"SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close FROM oi_5m_сырые WHERE ts_open >= %s ORDER BY ts_open DESC LIMIT {ЛИМИТ_СЫРЫХ_5М}", (since,))
-    price_raw = fetch_rows(f"SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close FROM price_5m_сырые WHERE ts_open >= %s ORDER BY ts_open DESC LIMIT {ЛИМИТ_СЫРЫХ_5М}", (since,))
-    volume_raw = fetch_rows(f"SELECT ts_open, ts_close, exchange, symbol, volume FROM volume_5m_сырые WHERE ts_open >= %s ORDER BY ts_open DESC LIMIT {ЛИМИТ_СЫРЫХ_5М}", (since,))
-    oi_aggs = fetch_rows(f"SELECT окно, ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close, oi_изменение_pct FROM oi_агрегаты WHERE ts_open >= %s ORDER BY ts_open DESC LIMIT {ЛИМИТ_АГРЕГАТОВ}", (since,))
-    consistency = fetch_rows(f"SELECT * FROM oi_сверка ORDER BY оценка_качества DESC NULLS LAST, symbol LIMIT {ЛИМИТ_СВЕРКИ}")
-    raw_integrity = fetch_rows(f"SELECT * FROM raw_integrity_report ORDER BY integrity_score ASC, metric, symbol LIMIT {ЛИМИТ_АУДИТА}")
-    audit_oi = fetch_rows(f"SELECT * FROM аудит_ои ORDER BY drift_oi_delta_pct DESC NULLS LAST, symbol LIMIT {ЛИМИТ_АУДИТА}")
-    audit_price = fetch_rows(f"SELECT * FROM аудит_цены ORDER BY drift_price_delta_pct DESC NULLS LAST, symbol LIMIT {ЛИМИТ_АУДИТА}")
-    audit_volume = fetch_rows(f"SELECT * FROM аудит_объёма ORDER BY drift_volume_pct DESC NULLS LAST, symbol LIMIT {ЛИМИТ_АУДИТА}")
+def _zip(zip_path: Path, files: list[Path]) -> None:
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            if f.exists():
+                z.write(f, arcname=f.name)
 
-    _write_text(
-        ПАПКА_ДАННЫХ / "storage_manifest.txt",
-        (
-            f"Mighty Duck {APP_VERSION}\n\n"
-            f"generated_at: {ts}\n"
-            f"retention_days: {ДНЕЙ_ХРАНЕНИЯ}\n"
-            f"export_days: {ДНЕЙ_ЭКСПОРТА}\n\n"
-            "available files:\n"
-            "- сырые_5м_ои.csv\n"
-            "- сырые_5м_цены.csv\n"
-            "- сырые_5м_объёмы.csv\n"
-            "- агрегаты_ои.csv\n"
-            "- сверка_ои.csv\n"
-            "- raw_integrity_report.csv\n"
-            "- аудит_ои.csv\n"
-            "- аудит_цены.csv\n"
-            "- аудит_объёма.csv\n"
-            "- отчет_по_аудиту.txt\n"
-            "- debug_audit.txt\n"
-            "- calculation_debug.txt\n"
-        )
-    )
+def rebuild_exports(mode: str = "quick") -> Path:
+    now = datetime.now(timezone.utc)
+    if mode == "research_30d":
+        since = now - timedelta(days=RESEARCH_30D_EXPORT_DAYS)
+        suffix = "research_30d"
+    elif mode == "research_7d":
+        since = now - timedelta(days=RESEARCH_EXPORT_DAYS)
+        suffix = "research_7d"
+    else:
+        since = now - timedelta(minutes=QUICK_EXPORT_CANDLES * 5)
+        suffix = "quick"
 
-    _write_csv(ПАПКА_ДАННЫХ / "сырые_5м_ои.csv", ["ts_open","ts_close","биржа","монета","oi_open","oi_high","oi_low","oi_close"], [[r["ts_open"], r["ts_close"], r["exchange"], r["symbol"], r["oi_open"], r["oi_high"], r["oi_low"], r["oi_close"]] for r in oi_raw])
-    _write_csv(ПАПКА_ДАННЫХ / "сырые_5м_цены.csv", ["ts_open","ts_close","биржа","монета","price_open","price_high","price_low","price_close"], [[r["ts_open"], r["ts_close"], r["exchange"], r["symbol"], r["price_open"], r["price_high"], r["price_low"], r["price_close"]] for r in price_raw])
-    _write_csv(ПАПКА_ДАННЫХ / "сырые_5м_объёмы.csv", ["ts_open","ts_close","биржа","монета","volume"], [[r["ts_open"], r["ts_close"], r["exchange"], r["symbol"], r["volume"]] for r in volume_raw])
-    _write_csv(ПАПКА_ДАННЫХ / "агрегаты_ои.csv", ["окно","ts_open","ts_close","биржа","монета","oi_open","oi_high","oi_low","oi_close","oi_изменение_pct"], [[r["окно"], r["ts_open"], r["ts_close"], r["exchange"], r["symbol"], r["oi_open"], r["oi_high"], r["oi_low"], r["oi_close"], r["oi_изменение_pct"]] for r in oi_aggs])
+    raw_rows = []
+    oi = fetch("SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close FROM oi_5m_сырые WHERE ts_open >= %s ORDER BY exchange, symbol, ts_open", (since,))
+    pr = fetch("SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close FROM price_5m_сырые WHERE ts_open >= %s ORDER BY exchange, symbol, ts_open", (since,))
+    vo = fetch("SELECT ts_open, ts_close, exchange, symbol, volume FROM volume_5m_сырые WHERE ts_open >= %s ORDER BY exchange, symbol, ts_open", (since,))
 
-    _write_csv(
-        ПАПКА_ДАННЫХ / "сверка_ои.csv",
-        ["монета","биржа","источник_основной","источник_подтверждения","тип_состояния","наклон_15м","наклон_30м","наклон_1ч","наклон_4ч","согласованность_15м_к_4ч","согласованность_30м_к_4ч","согласованность_1ч_к_4ч","расхождение_bybit_binance_15м","расхождение_bybit_binance_30м","расхождение_bybit_binance_1ч","расхождение_bybit_binance_4ч","шум_api","потери_точек","оценка_качества","класс_надёжности","причина_оценки"],
-        [[r["symbol"], r["exchange"], r["источник_основной"], r["источник_подтверждения"], r["тип_состояния"], r["наклон_15м"], r["наклон_30м"], r["наклон_1ч"], r["наклон_4ч"], r["согласованность_15м_к_4ч"], r["согласованность_30м_к_4ч"], r["согласованность_1ч_к_4ч"], r["расхождение_bybit_binance_15м"], r["расхождение_bybit_binance_30м"], r["расхождение_bybit_binance_1ч"], r["расхождение_bybit_binance_4ч"], r["шум_api"], r["потери_точек"], r["оценка_качества"], r["класс_надёжности"], r["причина_оценки"]] for r in consistency]
-    )
+    price_map = {(r["exchange"], r["symbol"], r["ts_open"]): r for r in pr}
+    volume_map = {(r["exchange"], r["symbol"], r["ts_open"]): r for r in vo}
+    keys = sorted(set([(r["exchange"], r["symbol"], r["ts_open"]) for r in oi]) | set(price_map.keys()) | set(volume_map.keys()), key=lambda x: (x[0], x[1], x[2]))
+    oi_map = {(r["exchange"], r["symbol"], r["ts_open"]): r for r in oi}
+    for key in keys:
+        exchange, symbol, ts_open = key
+        o = oi_map.get(key)
+        p = price_map.get(key)
+        v = volume_map.get(key)
+        raw_rows.append([
+            ts_open,
+            (o or p or v)["ts_close"],
+            exchange,
+            symbol,
+            o["oi_open"] if o else None,
+            o["oi_high"] if o else None,
+            o["oi_low"] if o else None,
+            o["oi_close"] if o else None,
+            p["price_open"] if p else None,
+            p["price_high"] if p else None,
+            p["price_low"] if p else None,
+            p["price_close"] if p else None,
+            v["volume"] if v else None,
+        ])
 
-    _write_csv(ПАПКА_ДАННЫХ / "raw_integrity_report.csv", ["metric","exchange","symbol","duplicates_found","missing_candles","invalid_timestamps","empty_rows","integrity_score"], [[r["metric"], r["exchange"], r["symbol"], r["duplicates_found"], r["missing_candles"], r["invalid_timestamps"], r["empty_rows"], r["integrity_score"]] for r in raw_integrity])
-    _write_csv(ПАПКА_ДАННЫХ / "аудит_ои.csv", ["symbol","exchange","timeframe","bot_oi_open","audit_oi_open","bot_oi_close","audit_oi_close","bot_oi_delta_pct","audit_oi_delta_pct","drift_oi_delta_pct","unique_candles","validation_status"], [[r["symbol"], r["exchange"], r["timeframe"], r["bot_oi_open"], r["audit_oi_open"], r["bot_oi_close"], r["audit_oi_close"], r["bot_oi_delta_pct"], r["audit_oi_delta_pct"], r["drift_oi_delta_pct"], r["unique_candles"], r["validation_status"]] for r in audit_oi])
-    _write_csv(ПАПКА_ДАННЫХ / "аудит_цены.csv", ["symbol","exchange","timeframe","bot_price_open","audit_price_open","bot_price_close","audit_price_close","bot_price_delta_pct","audit_price_delta_pct","drift_price_delta_pct","unique_candles","validation_status"], [[r["symbol"], r["exchange"], r["timeframe"], r["bot_price_open"], r["audit_price_open"], r["bot_price_close"], r["audit_price_close"], r["bot_price_delta_pct"], r["audit_price_delta_pct"], r["drift_price_delta_pct"], r["unique_candles"], r["validation_status"]] for r in audit_price])
-    _write_csv(ПАПКА_ДАННЫХ / "аудит_объёма.csv", ["symbol","exchange","timeframe","bot_volume_sum","audit_volume_sum","bot_volume_avg","audit_volume_avg","drift_volume_pct","unique_candles","validation_status"], [[r["symbol"], r["exchange"], r["timeframe"], r["bot_volume_sum"], r["audit_volume_sum"], r["bot_volume_avg"], r["audit_volume_avg"], r["drift_volume_pct"], r["unique_candles"], r["validation_status"]] for r in audit_volume])
+    ag = fetch("SELECT * FROM bot_aggregates WHERE ts_open >= %s ORDER BY metric, exchange, symbol, timeframe, ts_close", (since,))
+    au = fetch("SELECT * FROM validation_audit WHERE ts_close >= %s ORDER BY metric, exchange, symbol, timeframe, ts_close", (since,))
+    integ = fetch("SELECT * FROM raw_integrity_report ORDER BY metric, exchange, symbol")
 
-    report_lines = [f"Mighty Duck {APP_VERSION}", f"generated_at: {ts}", "", "OI:"]
-    report_lines.extend([f'{r["symbol"]} [{r["exchange"]}] {r["timeframe"]} drift={r["drift_oi_delta_pct"]} status={r["validation_status"]}' for r in audit_oi[:50]])
-    report_lines.append("")
-    report_lines.append("PRICE:")
-    report_lines.extend([f'{r["symbol"]} [{r["exchange"]}] {r["timeframe"]} drift={r["drift_price_delta_pct"]} status={r["validation_status"]}' for r in audit_price[:50]])
-    report_lines.append("")
-    report_lines.append("VOLUME:")
-    report_lines.extend([f'{r["symbol"]} [{r["exchange"]}] {r["timeframe"]} drift={r["drift_volume_pct"]} status={r["validation_status"]}' for r in audit_volume[:50]])
-    _write_text(ПАПКА_ДАННЫХ / "отчет_по_аудиту.txt", "\n".join(report_lines))
+    raw_path = ПАПКА_ДАННЫХ / "raw_market_5m.csv"
+    ag_path = ПАПКА_ДАННЫХ / "bot_aggregates.csv"
+    audit_path = ПАПКА_ДАННЫХ / "validation_audit.csv"
+    report_path = ПАПКА_ДАННЫХ / "audit_report.txt"
 
-    def _stat(lines, name, rows, key):
-        vals = [r[key] for r in rows if r[key] is not None]
-        lines.append(f"{name}: count={len(rows)} metric_count={len(vals)} max={max(vals) if vals else 'NA'} avg={sum(vals)/len(vals) if vals else 'NA'}")
+    _write_csv(raw_path, ["ts_open","ts_close","exchange","symbol","oi_open","oi_high","oi_low","oi_close","price_open","price_high","price_low","price_close","volume"], raw_rows)
+    _write_csv(ag_path, ["metric","timeframe","ts_open","ts_close","exchange","symbol","open_value","high_value","low_value","close_value","sum_value","avg_value","delta_pct","unique_candles"], [[r["metric"],r["timeframe"],r["ts_open"],r["ts_close"],r["exchange"],r["symbol"],r["open_value"],r["high_value"],r["low_value"],r["close_value"],r["sum_value"],r["avg_value"],r["delta_pct"],r["unique_candles"]] for r in ag])
+    _write_csv(audit_path, ["calculated_at","metric","timeframe","ts_close","exchange","symbol","bot_open","audit_open","bot_close","audit_close","bot_delta_pct","audit_delta_pct","bot_sum","audit_sum","bot_avg","audit_avg","drift","unique_candles","validation_status"], [[r["calculated_at"],r["metric"],r["timeframe"],r["ts_close"],r["exchange"],r["symbol"],r["bot_open"],r["audit_open"],r["bot_close"],r["audit_close"],r["bot_delta_pct"],r["audit_delta_pct"],r["bot_sum"],r["audit_sum"],r["bot_avg"],r["audit_avg"],r["drift"],r["unique_candles"],r["validation_status"]] for r in au])
 
-    debug = [f"Mighty Duck {APP_VERSION}", f"generated_at: {ts}", "", "debug_audit:"]
-    _stat(debug, "OI", audit_oi, "drift_oi_delta_pct")
-    _stat(debug, "PRICE", audit_price, "drift_price_delta_pct")
-    _stat(debug, "VOLUME", audit_volume, "drift_volume_pct")
-    debug.append(f"raw_integrity_rows={len(raw_integrity)}")
-    _write_text(ПАПКА_ДАННЫХ / "debug_audit.txt", "\n".join(debug))
+    bad = [r for r in au if r["validation_status"] != "валидно"]
+    lines = [
+        f"Mighty Duck {APP_VERSION}",
+        f"generated_at: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"mode: {mode}",
+        "",
+        f"raw_rows: {len(raw_rows)}",
+        f"bot_aggregates_rows: {len(ag)}",
+        f"validation_audit_rows: {len(au)}",
+        f"invalid_rows: {len(bad)}",
+        f"integrity_rows: {len(integ)}",
+        "",
+        "Top invalid:",
+    ]
+    for r in bad[:100]:
+        lines.append(f'{r["metric"]} {r["symbol"]} {r["exchange"]} {r["timeframe"]} drift={r["drift"]} status={r["validation_status"]}')
+    _write_text(report_path, "\n".join(lines))
 
-    calc_debug = [f"Mighty Duck {APP_VERSION}", f"generated_at: {ts}", "", "calculation debug:", "источник истины = native 5m OI / price / volume", "бот не является источником истины", "аудит сравнивает данные бота с независимым пересчётом"]
-    _write_text(ПАПКА_ДАННЫХ / "calculation_debug.txt", "\n".join(calc_debug))
+    manifest = ПАПКА_ДАННЫХ / "storage_manifest.txt"
+    _write_text(manifest, f"Mighty Duck {APP_VERSION}\nmode={mode}\nfiles=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, audit_report.txt\n")
+
+    zip_path = ПАПКА_ДАННЫХ / f"market_research_bundle_{suffix}.zip"
+    _zip(zip_path, [raw_path, ag_path, audit_path, report_path, manifest])
+    return zip_path

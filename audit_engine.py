@@ -1,149 +1,106 @@
 from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
-from db import fetch_rows, replace_table
-from metrics import изменение_в_процентах, абсолютное_расхождение, относительное_расхождение_pct
+from db import fetch, replace_validation, replace_integrity
+from metrics import изменение_в_процентах, abs_diff, rel_diff_pct
 
-МНОЖИТЕЛИ = {"15м": 3, "30м": 6, "1ч": 12, "4ч": 48}
+WINDOWS = {"15м": 3, "30м": 6, "1ч": 12, "4ч": 48}
 
-def _integrity_from_rows(metric: str, rows: list[dict]) -> list[tuple]:
-    now = datetime.now(timezone.utc)
-    grouped = defaultdict(list)
-    for r in rows:
-        grouped[(r["exchange"], r["symbol"])].append(r)
-    out = []
-    for (exchange, symbol), items in grouped.items():
-        items = sorted(items, key=lambda x: x["ts_open"])
-        total = len(items)
-        unique_count = len({x["ts_open"] for x in items})
-        duplicates_found = max(0, total - unique_count)
-        invalid_timestamps = 0
-        missing_candles = 0
-        empty_rows = 0
-        prev = None
-        for x in items:
-            if prev is not None:
-                diff = (x["ts_open"] - prev).total_seconds()
-                if diff <= 0:
-                    invalid_timestamps += 1
-                elif diff > 300:
-                    missing_candles += int(diff // 300) - 1
-            prev = x["ts_open"]
-            for key, value in x.items():
-                if key not in ("ts_open", "ts_close", "exchange", "symbol") and value is None:
-                    empty_rows += 1
-        integrity_score = max(0.0, min(100.0, 100.0 - duplicates_found * 3.0 - invalid_timestamps * 10.0 - missing_candles * 2.0 - empty_rows * 5.0))
-        out.append((now, metric, exchange, symbol, duplicates_found, missing_candles, invalid_timestamps, empty_rows, integrity_score))
-    return out
-
-def rebuild_raw_integrity_report() -> None:
-    oi_rows = fetch_rows("SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close FROM oi_5m_сырые WHERE ts_open >= NOW() - interval '2 days' ORDER BY exchange, symbol, ts_open")
-    price_rows = fetch_rows("SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close FROM price_5m_сырые WHERE ts_open >= NOW() - interval '2 days' ORDER BY exchange, symbol, ts_open")
-    volume_rows = fetch_rows("SELECT ts_open, ts_close, exchange, symbol, volume FROM volume_5m_сырые WHERE ts_open >= NOW() - interval '2 days' ORDER BY exchange, symbol, ts_open")
-    out = _integrity_from_rows("OI", oi_rows) + _integrity_from_rows("PRICE", price_rows) + _integrity_from_rows("VOLUME", volume_rows)
-    replace_table("raw_integrity_report", out)
-
-def _dedupe(rows: list[dict]) -> dict:
-    grouped = defaultdict(dict)
-    for r in rows:
-        grouped[(r["exchange"], r["symbol"])][r["ts_open"]] = r
-    return grouped
-
-def _status_from_unique(unique_candles: int, needed: int, drift: float | None, metric: str) -> str:
-    if unique_candles < needed:
+def _status(metric: str, candles: int, needed: int, drift: float | None) -> str:
+    if candles < needed:
         return "недостаточно_данных"
     if drift is None:
         return "ошибка_агрегации_бота"
-    if metric == "OI":
-        if drift >= 0.50:
-            return "расхождение_выше_допуска"
-        return "валидно"
-    if metric == "PRICE":
-        if drift >= 0.05:
-            return "расхождение_выше_допуска"
-        return "валидно"
-    if metric == "VOLUME":
-        if drift >= 3.0:
-            return "расхождение_выше_допуска"
-        return "валидно"
+    if metric == "OI" and drift >= 0.50:
+        return "расхождение_выше_допуска"
+    if metric == "PRICE" and drift >= 0.05:
+        return "расхождение_выше_допуска"
+    if metric == "VOLUME" and drift >= 3.0:
+        return "расхождение_выше_допуска"
     return "валидно"
 
-def rebuild_audit_oi() -> None:
-    now = datetime.now(timezone.utc)
-    raw_rows = fetch_rows("SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close FROM oi_5m_сырые WHERE ts_open >= NOW() - interval '2 days' ORDER BY exchange, symbol, ts_open")
-    bot_rows = fetch_rows("SELECT окно, ts_open, exchange, symbol, oi_open, oi_close, oi_изменение_pct FROM oi_агрегаты WHERE ts_open >= NOW() - interval '2 days' ORDER BY exchange, symbol, окно, ts_open")
-    raw_group = _dedupe(raw_rows)
-    bot_map = {(r["exchange"], r["symbol"], r["окно"]): r for r in bot_rows}
-    out = []
-    for (exchange, symbol), mp in raw_group.items():
-        items = [mp[k] for k in sorted(mp.keys())]
-        for окно, needed in МНОЖИТЕЛИ.items():
-            bucket = items[-needed:] if len(items) >= needed else items[:]
-            unique_candles = len(bucket)
-            audit_open = audit_close = audit_delta = None
-            if unique_candles >= needed:
-                audit_open = bucket[0]["oi_open"]
-                audit_close = bucket[-1]["oi_close"]
-                audit_delta = изменение_в_процентах(audit_open, audit_close)
-            bot = bot_map.get((exchange, symbol, окно))
-            bot_open = bot["oi_open"] if bot else None
-            bot_close = bot["oi_close"] if bot else None
-            bot_delta = bot["oi_изменение_pct"] if bot else None
-            drift = абсолютное_расхождение(bot_delta, audit_delta)
-            out.append((now, symbol, exchange, окно, bot_open, audit_open, bot_close, audit_close, bot_delta, audit_delta, drift, unique_candles, _status_from_unique(unique_candles, needed, drift, "OI")))
-    replace_table("аудит_ои", out)
+def _groups(rows):
+    g = defaultdict(list)
+    for r in rows:
+        g[(r["exchange"], r["symbol"])].append(r)
+    for k in g:
+        g[k].sort(key=lambda x: x["ts_open"])
+    return g
 
-def rebuild_audit_price() -> None:
-    now = datetime.now(timezone.utc)
-    raw_rows = fetch_rows("SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close FROM price_5m_сырые WHERE ts_open >= NOW() - interval '2 days' ORDER BY exchange, symbol, ts_open")
-    bot_rows = fetch_rows("SELECT окно, ts_open, exchange, symbol, price_open, price_close, price_изменение_pct FROM price_агрегаты WHERE ts_open >= NOW() - interval '2 days' ORDER BY exchange, symbol, окно, ts_open")
-    raw_group = _dedupe(raw_rows)
-    bot_map = {(r["exchange"], r["symbol"], r["окно"]): r for r in bot_rows}
-    out = []
-    for (exchange, symbol), mp in raw_group.items():
-        items = [mp[k] for k in sorted(mp.keys())]
-        for окно, needed in МНОЖИТЕЛИ.items():
-            bucket = items[-needed:] if len(items) >= needed else items[:]
-            unique_candles = len(bucket)
-            audit_open = audit_close = audit_delta = None
-            if unique_candles >= needed:
-                audit_open = bucket[0]["price_open"]
-                audit_close = bucket[-1]["price_close"]
-                audit_delta = изменение_в_процентах(audit_open, audit_close)
-            bot = bot_map.get((exchange, symbol, окно))
-            bot_open = bot["price_open"] if bot else None
-            bot_close = bot["price_close"] if bot else None
-            bot_delta = bot["price_изменение_pct"] if bot else None
-            drift = абсолютное_расхождение(bot_delta, audit_delta)
-            out.append((now, symbol, exchange, окно, bot_open, audit_open, bot_close, audit_close, bot_delta, audit_delta, drift, unique_candles, _status_from_unique(unique_candles, needed, drift, "PRICE")))
-    replace_table("аудит_цены", out)
+def _bot_map():
+    return {(r["metric"], r["timeframe"], r["exchange"], r["symbol"], r["ts_close"]): r for r in fetch("SELECT * FROM bot_aggregates")}
 
-def rebuild_audit_volume() -> None:
+def rebuild_validation_audit() -> None:
     now = datetime.now(timezone.utc)
-    raw_rows = fetch_rows("SELECT ts_open, ts_close, exchange, symbol, volume FROM volume_5m_сырые WHERE ts_open >= NOW() - interval '2 days' ORDER BY exchange, symbol, ts_open")
-    bot_rows = fetch_rows("SELECT окно, ts_open, exchange, symbol, volume_sum, volume_avg FROM volume_агрегаты WHERE ts_open >= NOW() - interval '2 days' ORDER BY exchange, symbol, окно, ts_open")
-    raw_group = _dedupe(raw_rows)
-    bot_map = {(r["exchange"], r["symbol"], r["окно"]): r for r in bot_rows}
+    bot = _bot_map()
     out = []
-    for (exchange, symbol), mp in raw_group.items():
-        items = [mp[k] for k in sorted(mp.keys())]
-        for окно, needed in МНОЖИТЕЛИ.items():
-            bucket = items[-needed:] if len(items) >= needed else items[:]
-            unique_candles = len(bucket)
-            audit_sum = audit_avg = None
-            if unique_candles >= needed:
-                vals = [x["volume"] for x in bucket]
+
+    oi_rows = fetch("SELECT * FROM oi_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
+    for (exchange, symbol), items in _groups(oi_rows).items():
+        for tf, n in WINDOWS.items():
+            for i in range(n - 1, len(items)):
+                b = items[i-n+1:i+1]
+                ts_close = b[-1]["ts_close"]
+                audit_open = b[0]["oi_open"]
+                audit_close = b[-1]["oi_close"]
+                audit_delta = изменение_в_процентах(audit_open, audit_close)
+                bot_r = bot.get(("OI", tf, exchange, symbol, ts_close))
+                bot_delta = bot_r["delta_pct"] if bot_r else None
+                drift = abs_diff(bot_delta, audit_delta)
+                out.append((now, "OI", tf, ts_close, exchange, symbol, bot_r["open_value"] if bot_r else None, audit_open, bot_r["close_value"] if bot_r else None, audit_close, bot_delta, audit_delta, None, None, None, None, drift, len(b), _status("OI", len(b), n, drift)))
+
+    price_rows = fetch("SELECT * FROM price_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
+    for (exchange, symbol), items in _groups(price_rows).items():
+        for tf, n in WINDOWS.items():
+            for i in range(n - 1, len(items)):
+                b = items[i-n+1:i+1]
+                ts_close = b[-1]["ts_close"]
+                audit_open = b[0]["price_open"]
+                audit_close = b[-1]["price_close"]
+                audit_delta = изменение_в_процентах(audit_open, audit_close)
+                bot_r = bot.get(("PRICE", tf, exchange, symbol, ts_close))
+                bot_delta = bot_r["delta_pct"] if bot_r else None
+                drift = abs_diff(bot_delta, audit_delta)
+                out.append((now, "PRICE", tf, ts_close, exchange, symbol, bot_r["open_value"] if bot_r else None, audit_open, bot_r["close_value"] if bot_r else None, audit_close, bot_delta, audit_delta, None, None, None, None, drift, len(b), _status("PRICE", len(b), n, drift)))
+
+    vol_rows = fetch("SELECT * FROM volume_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
+    for (exchange, symbol), items in _groups(vol_rows).items():
+        for tf, n in WINDOWS.items():
+            for i in range(n - 1, len(items)):
+                b = items[i-n+1:i+1]
+                ts_close = b[-1]["ts_close"]
+                vals = [x["volume"] for x in b]
                 audit_sum = sum(vals)
-                audit_avg = sum(vals) / len(vals)
-            bot = bot_map.get((exchange, symbol, окно))
-            bot_sum = bot["volume_sum"] if bot else None
-            bot_avg = bot["volume_avg"] if bot else None
-            drift = относительное_расхождение_pct(bot_sum, audit_sum)
-            out.append((now, symbol, exchange, окно, bot_sum, audit_sum, bot_avg, audit_avg, drift, unique_candles, _status_from_unique(unique_candles, needed, drift, "VOLUME")))
-    replace_table("аудит_объёма", out)
+                audit_avg = audit_sum / len(vals)
+                bot_r = bot.get(("VOLUME", tf, exchange, symbol, ts_close))
+                bot_sum = bot_r["sum_value"] if bot_r else None
+                bot_avg = bot_r["avg_value"] if bot_r else None
+                drift = rel_diff_pct(bot_sum, audit_sum)
+                out.append((now, "VOLUME", tf, ts_close, exchange, symbol, None, None, None, None, None, None, bot_sum, audit_sum, bot_avg, audit_avg, drift, len(b), _status("VOLUME", len(b), n, drift)))
 
-def rebuild_all_audits() -> None:
-    rebuild_raw_integrity_report()
-    rebuild_audit_oi()
-    rebuild_audit_price()
-    rebuild_audit_volume()
+    replace_validation(out)
+
+def rebuild_integrity() -> None:
+    now = datetime.now(timezone.utc)
+    out = []
+    for metric, table in [("OI", "oi_5m_сырые"), ("PRICE", "price_5m_сырые"), ("VOLUME", "volume_5m_сырые")]:
+        rows = fetch(f"SELECT ts_open, ts_close, exchange, symbol FROM {table} ORDER BY exchange, symbol, ts_open")
+        for (exchange, symbol), items in _groups(rows).items():
+            missing = 0
+            invalid = 0
+            prev = None
+            for x in items:
+                if prev is not None:
+                    diff = (x["ts_open"] - prev).total_seconds()
+                    if diff <= 0:
+                        invalid += 1
+                    elif diff > 300:
+                        missing += int(diff // 300) - 1
+                prev = x["ts_open"]
+            score = max(0.0, min(100.0, 100 - missing * 0.5 - invalid * 10))
+            out.append((now, metric, exchange, symbol, len(items), missing, invalid, score))
+    replace_integrity(out)
+
+def rebuild_all() -> None:
+    rebuild_integrity()
+    rebuild_validation_audit()
