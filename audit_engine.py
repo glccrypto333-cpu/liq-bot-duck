@@ -1,7 +1,7 @@
 from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from db import fetch, replace_validation, replace_integrity, replace_coverage, replace_gaps
+from db import fetch, replace_validation, replace_integrity, replace_coverage, replace_gaps, active_universe_sql
 from metrics import изменение_в_процентах, abs_diff, rel_diff_pct
 from logger import log
 
@@ -34,7 +34,7 @@ def _groups(rows):
 
 
 def _bot_map():
-    return {(r["metric"], r["timeframe"], r["exchange"], r["symbol"], r["ts_close"]): r for r in fetch("SELECT * FROM bot_aggregates")}
+    return {(r["metric"], r["timeframe"], r["exchange"], r["symbol"], r["ts_close"]): r for r in fetch(f"SELECT * FROM bot_aggregates x WHERE {active_universe_sql('x')}")}
 
 
 def _is_contiguous_5m(chunk) -> bool:
@@ -64,7 +64,7 @@ def rebuild_validation_audit() -> int:
     out = []
     skipped_non_contiguous = 0
 
-    oi_rows = fetch("SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close FROM oi_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
+    oi_rows = fetch(f"SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close FROM oi_5m_сырые x WHERE ts_close <= NOW() - interval '30 seconds' AND {active_universe_sql('x')} ORDER BY exchange, symbol, ts_open")
     for (exchange, symbol), items in _groups(oi_rows).items():
         for tf, n in WINDOWS.items():
             if len(items) < n:
@@ -83,7 +83,7 @@ def rebuild_validation_audit() -> int:
                 drift = abs_diff(bot_delta, audit_delta)
                 out.append((now, "OI", tf, ts_close, exchange, symbol, bot_r["open_value"] if bot_r else None, audit_open, bot_r["close_value"] if bot_r else None, audit_close, bot_delta, audit_delta, None, None, None, None, drift, len(b), _status("OI", len(b), n, drift)))
 
-    price_rows = fetch("SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close FROM price_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
+    price_rows = fetch(f"SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close FROM price_5m_сырые x WHERE ts_close <= NOW() - interval '30 seconds' AND {active_universe_sql('x')} ORDER BY exchange, symbol, ts_open")
     for (exchange, symbol), items in _groups(price_rows).items():
         for tf, n in WINDOWS.items():
             if len(items) < n:
@@ -102,7 +102,7 @@ def rebuild_validation_audit() -> int:
                 drift = abs_diff(bot_delta, audit_delta)
                 out.append((now, "PRICE", tf, ts_close, exchange, symbol, bot_r["open_value"] if bot_r else None, audit_open, bot_r["close_value"] if bot_r else None, audit_close, bot_delta, audit_delta, None, None, None, None, drift, len(b), _status("PRICE", len(b), n, drift)))
 
-    vol_rows = fetch("SELECT ts_open, ts_close, exchange, symbol, volume FROM volume_5m_сырые WHERE ts_close <= NOW() - interval '30 seconds' ORDER BY exchange, symbol, ts_open")
+    vol_rows = fetch(f"SELECT ts_open, ts_close, exchange, symbol, volume FROM volume_5m_сырые x WHERE ts_close <= NOW() - interval '30 seconds' AND {active_universe_sql('x')} ORDER BY exchange, symbol, ts_open")
     for (exchange, symbol), items in _groups(vol_rows).items():
         for tf, n in WINDOWS.items():
             if len(items) < n:
@@ -134,7 +134,7 @@ def rebuild_integrity() -> int:
     now = datetime.now(timezone.utc)
     out = []
     for metric, table in [("OI", "oi_5m_сырые"), ("PRICE", "price_5m_сырые"), ("VOLUME", "volume_5m_сырые")]:
-        rows = fetch(f"SELECT ts_open, ts_close, exchange, symbol FROM {table} ORDER BY exchange, symbol, ts_open")
+        rows = fetch(f"SELECT ts_open, ts_close, exchange, symbol FROM {table} x WHERE {active_universe_sql('x')} ORDER BY exchange, symbol, ts_open")
         for (exchange, symbol), items in _groups(rows).items():
             missing = 0
             invalid = 0
@@ -162,7 +162,7 @@ def rebuild_coverage_and_gaps() -> tuple[int, int]:
     gap_rows = []
 
     for metric, table in [("OI", "oi_5m_сырые"), ("PRICE", "price_5m_сырые"), ("VOLUME", "volume_5m_сырые")]:
-        rows = fetch(f"SELECT ts_open, ts_close, exchange, symbol FROM {table} ORDER BY exchange, symbol, ts_open")
+        rows = fetch(f"SELECT ts_open, ts_close, exchange, symbol FROM {table} x WHERE {active_universe_sql('x')} ORDER BY exchange, symbol, ts_open")
 
         for (exchange, symbol), items in _groups(rows).items():
             actual = len(items)

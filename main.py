@@ -15,7 +15,7 @@ from config import (
     ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК,
 )
 from logger import log
-from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old, migrate_canonical_ts_close
+from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old, migrate_canonical_ts_close, replace_active_universe
 from exchange_clients import (
     fetch_bybit_symbols,
     fetch_binance_symbols,
@@ -113,12 +113,22 @@ def main():
     )
     log("Telegram OK")
 
-    bybit_symbols = fetch_bybit_symbols()
-    binance_symbols = fetch_binance_symbols()
+    bybit_symbols_all = fetch_bybit_symbols()
+    binance_symbols_all = fetch_binance_symbols()
 
-    log(f"Bybit symbols: {len(bybit_symbols)}")
-    log(f"Binance symbols: {len(binance_symbols)}")
+    bybit_symbols = bybit_symbols_all[:ЛИМИТ_СИМВОЛОВ_BYBIT]
+    binance_symbols = binance_symbols_all[:ЛИМИТ_СИМВОЛОВ_BINANCE]
+
+    active_universe = (
+        [("BYBIT", s, "runtime_limit") for s in bybit_symbols] +
+        [("BINANCE", s, "runtime_limit") for s in binance_symbols]
+    )
+    replace_active_universe(active_universe)
+
+    log(f"Bybit symbols: {len(bybit_symbols_all)}")
+    log(f"Binance symbols: {len(binance_symbols_all)}")
     log(f"Limits: bybit={ЛИМИТ_СИМВОЛОВ_BYBIT}, binance={ЛИМИТ_СИМВОЛОВ_BINANCE}")
+    log(f"Active universe: bybit={len(bybit_symbols)} binance={len(binance_symbols)} total={len(active_universe)}")
 
     threading.Thread(target=background, args=(bybit_symbols, binance_symbols), daemon=True).start()
 

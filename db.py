@@ -159,6 +159,16 @@ def init_db() -> None:
         )
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS active_symbol_universe(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            activated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            source TEXT NOT NULL DEFAULT 'runtime_limit',
+            PRIMARY KEY(exchange, symbol)
+        )
+        """)
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_agg_main ON bot_aggregates(metric, timeframe, exchange, symbol, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
@@ -166,6 +176,7 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_volume_main ON volume_5m_сырые(exchange, symbol, ts_open)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_coverage_report_main ON coverage_report(metric, exchange, symbol, coverage_pct)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_gap_report_main ON gap_report(metric, exchange, symbol, gap_start)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_active_symbol_universe_main ON active_symbol_universe(exchange, symbol)")
 
     log("Postgres: canonical schema + derived tables готовы")
 
@@ -311,6 +322,30 @@ def replace_gaps(rows: list[tuple]) -> None:
             gap_minutes
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
+
+
+def replace_active_universe(rows: list[tuple]) -> None:
+    execute("TRUNCATE TABLE active_symbol_universe")
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO active_symbol_universe(exchange, symbol, source, activated_at)
+        VALUES (%s,%s,%s,NOW())
+        ON CONFLICT (exchange, symbol)
+        DO UPDATE SET source=EXCLUDED.source, activated_at=NOW()
+        """, rows)
+
+
+def active_universe_sql(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        "EXISTS ("
+        "SELECT 1 FROM active_symbol_universe au "
+        f"WHERE au.exchange = {prefix}exchange "
+        f"AND au.symbol = {prefix}symbol"
+        ")"
+    )
 
 
 def cleanup_old(days: int) -> None:

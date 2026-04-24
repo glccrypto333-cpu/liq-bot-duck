@@ -39,10 +39,10 @@ BINANCE_BASE = "https://fapi.binance.com"
 
 СТАРТОВОЕ_СООБЩЕНИЕ = (
     "🥇 Mighty Duck / {version}\n\n"
-    "🚀 v3.5.4 data quality foundation patch\n"
+    "🚀 v3.5.4 active universe + data quality patch\n"
     "🟢 Canonical ts_close migration: active\n"
     "🟢 Export compression: 3 files\n"
-    "🟢 Research source: real bot_aggregates only\n"
+    "🟢 Research source: active universe + real bot_aggregates only\n"
     "🧠 Состояния рынка: диапазон / продолжение / выдох / сжатие / нейтрально\n\n"
     "🗄 Хранение истории: {retention} дней\n\n"
     "Команды:\n{commands}"

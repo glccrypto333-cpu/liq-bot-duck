@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import timedelta
 
-from db import fetch, replace_bot_aggregates
+from db import fetch, replace_bot_aggregates, active_universe_sql
 from metrics import изменение_в_процентах
 from logger import log
 
@@ -54,10 +54,11 @@ def rebuild_bot_aggregates() -> int:
     rows_out = []
     skipped_non_contiguous = 0
 
-    oi_rows = fetch("""
+    oi_rows = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close
-        FROM oi_5m_сырые
+        FROM oi_5m_сырые x
         WHERE ts_close <= NOW() - interval '30 seconds'
+          AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
     """)
 
@@ -83,10 +84,11 @@ def rebuild_bot_aggregates() -> int:
                     len(chunk),
                 ))
 
-    price_rows = fetch("""
+    price_rows = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close
-        FROM price_5m_сырые
+        FROM price_5m_сырые x
         WHERE ts_close <= NOW() - interval '30 seconds'
+          AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
     """)
 
@@ -112,10 +114,11 @@ def rebuild_bot_aggregates() -> int:
                     len(chunk),
                 ))
 
-    volume_rows = fetch("""
+    volume_rows = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, volume
-        FROM volume_5m_сырые
+        FROM volume_5m_сырые x
         WHERE ts_close <= NOW() - interval '30 seconds'
+          AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
     """)
 

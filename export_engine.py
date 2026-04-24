@@ -8,7 +8,7 @@ import os
 import resource
 
 from config import ПАПКА_ДАННЫХ, APP_VERSION, QUICK_EXPORT_CANDLES, RESEARCH_EXPORT_DAYS, RESEARCH_30D_EXPORT_DAYS
-from db import fetch
+from db import fetch, active_universe_sql
 
 
 def _write_csv(path: Path, header: list[str], rows: list[list]) -> None:
@@ -70,24 +70,27 @@ def rebuild_exports(mode: str = "quick") -> Path:
         since = now - timedelta(minutes=QUICK_EXPORT_CANDLES * 5)
         suffix = "quick"
 
-    oi = fetch("""
+    oi = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close
-        FROM oi_5m_сырые
+        FROM oi_5m_сырые x
         WHERE ts_open >= %s
+          AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
     """, (since,))
 
-    price = fetch("""
+    price = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close
-        FROM price_5m_сырые
+        FROM price_5m_сырые x
         WHERE ts_open >= %s
+          AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
     """, (since,))
 
-    volume = fetch("""
+    volume = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, volume
-        FROM volume_5m_сырые
+        FROM volume_5m_сырые x
         WHERE ts_open >= %s
+          AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
     """, (since,))
 
@@ -169,17 +172,24 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY exchange, symbol, timeframe, state_count DESC
     """, (since,))
 
-    storage_summary = _safe_fetch("""
+    storage_summary = _safe_fetch(f"""
         SELECT metric, MIN(ts_open) AS oldest_ts, MAX(ts_open) AS newest_ts, COUNT(*) AS rows_count
         FROM (
-            SELECT 'OI' AS metric, ts_open FROM oi_5m_сырые
+            SELECT 'OI' AS metric, ts_open, exchange, symbol FROM oi_5m_сырые
             UNION ALL
-            SELECT 'PRICE' AS metric, ts_open FROM price_5m_сырые
+            SELECT 'PRICE' AS metric, ts_open, exchange, symbol FROM price_5m_сырые
             UNION ALL
-            SELECT 'VOLUME' AS metric, ts_open FROM volume_5m_сырые
+            SELECT 'VOLUME' AS metric, ts_open, exchange, symbol FROM volume_5m_сырые
         ) x
+        WHERE {active_universe_sql("x")}
         GROUP BY metric
         ORDER BY metric
+    """)
+
+    active_universe = _safe_fetch("""
+        SELECT exchange, symbol, activated_at, source
+        FROM active_symbol_universe
+        ORDER BY exchange, symbol
     """)
 
     raw_path = ПАПКА_ДАННЫХ / "raw_market_5m.csv"
@@ -194,6 +204,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
     research_report_path = ПАПКА_ДАННЫХ / "research_report.txt"
     storage_health_path = ПАПКА_ДАННЫХ / "storage_health_report.txt"
     runtime_health_path = ПАПКА_ДАННЫХ / "runtime_health_report.txt"
+    active_universe_path = ПАПКА_ДАННЫХ / "active_universe_report.csv"
 
     _write_csv(
         raw_path,
@@ -223,6 +234,12 @@ def rebuild_exports(mode: str = "quick") -> Path:
         gap_path,
         ["calculated_at", "metric", "exchange", "symbol", "gap_start", "gap_end", "missing_candles", "gap_minutes"],
         [[r["calculated_at"], r["metric"], r["exchange"], r["symbol"], r["gap_start"], r["gap_end"], r["missing_candles"], r["gap_minutes"]] for r in gaps],
+    )
+
+    _write_csv(
+        active_universe_path,
+        ["exchange", "symbol", "activated_at", "source"],
+        [[r["exchange"], r["symbol"], r["activated_at"], r["source"]] for r in active_universe],
     )
 
     _write_csv(
@@ -264,8 +281,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"integrity_rows: {len(integrity)}",
         f"coverage_rows: {len(coverage)}",
         f"gap_rows: {len(gaps)}",
+        f"active_universe_rows: {len(active_universe)}",
         f"coverage_critical_rows: {len(critical_coverage)}",
         f"coverage_warning_rows: {len(warning_coverage)}",
+        f"active_universe_rows: {len(active_universe)}",
         f"market_research_rows: {len(market_research)}",
         f"market_states_rows: {len(market_states)}",
         f"invalid_data_state_rows: {len(invalid_data_states)}",
