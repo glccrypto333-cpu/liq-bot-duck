@@ -66,7 +66,6 @@ def rebuild_oi_slope() -> int:
          AND s.symbol = r.symbol
          AND s.timeframe = r.timeframe
          AND s.ts_close = r.ts_close
-        WHERE r.timeframe IN ('15m','30m','1h','4h')
         ORDER BY r.exchange, r.symbol, r.timeframe, r.ts_close
     """)
 
