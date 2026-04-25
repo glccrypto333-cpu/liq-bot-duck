@@ -172,6 +172,22 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY exchange, symbol, timeframe, state_count DESC
     """, (since,))
 
+    market_oi_slope = _safe_fetch("""
+        SELECT *
+        FROM market_oi_slope
+        WHERE ts_close >= %s
+        ORDER BY stage DESC, strength DESC, exchange, symbol, timeframe, ts_close
+    """, (since,))
+
+    oi_slope_top = _safe_fetch("""
+        SELECT *
+        FROM market_oi_slope
+        WHERE stage >= 1
+          AND timeframe IN ('30m','1h','4h')
+        ORDER BY stage DESC, strength DESC
+        LIMIT 300
+    """)
+
     market_silence = _safe_fetch("""
         SELECT *
         FROM market_silence
@@ -252,6 +268,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
     market_research_path = ПАПКА_ДАННЫХ / "market_research.csv"
     market_states_path = ПАПКА_ДАННЫХ / "market_states.csv"
     market_silence_path = ПАПКА_ДАННЫХ / "market_silence.csv"
+    market_oi_slope_path = ПАПКА_ДАННЫХ / "market_oi_slope.csv"
+    oi_slope_top_path = ПАПКА_ДАННЫХ / "oi_slope_top.csv"
     silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
     market_regime_path = ПАПКА_ДАННЫХ / "market_regime.csv"
     regime_states_path = ПАПКА_ДАННЫХ / "regime_states.csv"
@@ -324,6 +342,18 @@ def rebuild_exports(mode: str = "quick") -> Path:
         market_states_path,
         ["exchange", "symbol", "timeframe", "market_state", "state_count", "avg_continuation_score", "avg_exhaustion_score", "avg_compression_score"],
         [[r["exchange"], r["symbol"], r["timeframe"], r["market_state"], r["state_count"], r["avg_continuation_score"], r["avg_exhaustion_score"], r["avg_compression_score"]] for r in market_states],
+    )
+
+    _write_csv(
+        market_oi_slope_path,
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","reason","oi_delta_pct","oi_acceleration","oi_prev_avg","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage","silence_stage_name"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["oi_prev_avg"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage"],r["silence_stage_name"]] for r in market_oi_slope],
+    )
+
+    _write_csv(
+        oi_slope_top_path,
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in oi_slope_top],
     )
 
     _write_csv(

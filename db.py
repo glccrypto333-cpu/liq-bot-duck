@@ -189,6 +189,29 @@ def init_db() -> None:
         )
         """)
 
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_oi_slope(
+            calculated_at TIMESTAMPTZ NOT NULL,
+            ts_close TIMESTAMPTZ NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            stage INTEGER NOT NULL,
+            stage_name TEXT NOT NULL,
+            strength DOUBLE PRECISION NOT NULL,
+            reason TEXT NOT NULL,
+            oi_delta_pct DOUBLE PRECISION,
+            oi_acceleration DOUBLE PRECISION,
+            oi_prev_avg DOUBLE PRECISION,
+            price_delta_pct DOUBLE PRECISION,
+            volume_delta_pct DOUBLE PRECISION,
+            range_width_pct DOUBLE PRECISION,
+            silence_stage INTEGER,
+            silence_stage_name TEXT
+        )
+        """)
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS market_regime(
             calculated_at TIMESTAMPTZ NOT NULL,
@@ -232,6 +255,8 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_active_symbol_universe_main ON active_symbol_universe(exchange, symbol)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_silence_main ON market_silence(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_silence_stage ON market_silence(stage, timeframe)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_main ON market_oi_slope(exchange, symbol, timeframe, ts_close)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_stage ON market_oi_slope(stage, timeframe, strength)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_regime_main ON market_regime(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_regime_scenario ON market_regime(scenario, confidence, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
@@ -461,6 +486,35 @@ def replace_market_regime(rows: list[tuple]) -> None:
             invalid_reason
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
+
+
+def replace_oi_slope(rows: list[tuple]) -> None:
+    execute("TRUNCATE TABLE market_oi_slope")
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO market_oi_slope(
+            calculated_at,
+            ts_close,
+            exchange,
+            symbol,
+            timeframe,
+            stage,
+            stage_name,
+            strength,
+            reason,
+            oi_delta_pct,
+            oi_acceleration,
+            oi_prev_avg,
+            price_delta_pct,
+            volume_delta_pct,
+            range_width_pct,
+            silence_stage,
+            silence_stage_name
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
+
 
 def replace_request_failures(rows: list[tuple]) -> None:
     execute("TRUNCATE TABLE request_failure_report")
