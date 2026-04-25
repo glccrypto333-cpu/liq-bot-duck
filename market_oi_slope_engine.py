@@ -31,7 +31,7 @@ def _quality_from_shape(oi_delta, acceleration, price_delta, volume_delta, range
     return "нет наклона"
 
 
-def _stage_from_slope(silence_stage, oi_delta, price_delta, volume_delta, acceleration):
+def _stage_from_slope(silence_stage, oi_delta, price_delta, volume_delta, acceleration, *_):
     """
     ОИ — основа.
     Объем — подтверждающий фактор, но не главный.
