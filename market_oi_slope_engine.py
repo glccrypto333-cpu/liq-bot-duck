@@ -41,15 +41,15 @@ def _stage_from_slope(silence_stage, oi_delta, price_delta, volume_delta, accele
     clean_volume = min(max(volume_delta, 0.0), 80.0)
 
     if silence_stage in (0, 1) and oi_delta >= 0.6 and acceleration > 0 and abs(price_delta) <= 7:
-        return 1, "наблюдение", "ранний рост ОИ из спокойного рынка"
+        return 1, "наблюдение", "ранний рост ОИ из спокойного рынка", "ранний наклон"
 
     if oi_delta >= 1.5 and acceleration > 0 and clean_volume >= 12 and price_delta > -4:
-        return 2, "возня", "наклон ОИ усиливается, объем подтверждает активность"
+        return 2, "возня", "наклон ОИ усиливается, объем подтверждает активность", "рабочий наклон"
 
     if oi_delta >= 3.0 and acceleration > 0 and clean_volume >= 25 and price_delta > 0.8:
-        return 3, "подтверждение", "ОИ, объем и цена подтверждают расширение"
+        return 3, "подтверждение", "ОИ, объем и цена подтверждают расширение", "сильный наклон"
 
-    return 0, "нет сигнала", "условия наклона ОИ не собраны"
+    return 0, "нет сигнала", "условия наклона ОИ не собраны", "нет качества"
 
 
 def rebuild_oi_slope() -> int:
