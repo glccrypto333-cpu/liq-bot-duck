@@ -172,6 +172,21 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY exchange, symbol, timeframe, state_count DESC
     """, (since,))
 
+    market_silence = _safe_fetch("""
+        SELECT *
+        FROM market_silence
+        WHERE ts_close >= %s
+        ORDER BY exchange, symbol, timeframe, ts_close
+    """, (since,))
+
+    silence_states = _safe_fetch("""
+        SELECT exchange, symbol, timeframe, stage, stage_name, COUNT(*) AS stage_count, AVG(score) AS avg_score
+        FROM market_silence
+        WHERE ts_close >= %s
+        GROUP BY exchange, symbol, timeframe, stage, stage_name
+        ORDER BY exchange, symbol, timeframe, stage
+    """, (since,))
+
     market_regime = _safe_fetch("""
         SELECT *
         FROM market_regime
@@ -236,6 +251,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
     audit_path = ПАПКА_ДАННЫХ / "validation_audit.csv"
     market_research_path = ПАПКА_ДАННЫХ / "market_research.csv"
     market_states_path = ПАПКА_ДАННЫХ / "market_states.csv"
+    market_silence_path = ПАПКА_ДАННЫХ / "market_silence.csv"
+    silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
     market_regime_path = ПАПКА_ДАННЫХ / "market_regime.csv"
     regime_states_path = ПАПКА_ДАННЫХ / "regime_states.csv"
     coverage_path = ПАПКА_ДАННЫХ / "coverage_report.csv"
@@ -307,6 +324,18 @@ def rebuild_exports(mode: str = "quick") -> Path:
         market_states_path,
         ["exchange", "symbol", "timeframe", "market_state", "state_count", "avg_continuation_score", "avg_exhaustion_score", "avg_compression_score"],
         [[r["exchange"], r["symbol"], r["timeframe"], r["market_state"], r["state_count"], r["avg_continuation_score"], r["avg_exhaustion_score"], r["avg_compression_score"]] for r in market_states],
+    )
+
+    _write_csv(
+        market_silence_path,
+        ["calculated_at", "ts_close", "exchange", "symbol", "timeframe", "stage", "stage_name", "score", "reason", "oi_delta_pct", "price_delta_pct", "volume_delta_pct", "range_width_pct", "market_state", "invalid_reason"],
+        [[r["calculated_at"], r["ts_close"], r["exchange"], r["symbol"], r["timeframe"], r["stage"], r["stage_name"], r["score"], r["reason"], r["oi_delta_pct"], r["price_delta_pct"], r["volume_delta_pct"], r["range_width_pct"], r["market_state"], r["invalid_reason"]] for r in market_silence],
+    )
+
+    _write_csv(
+        silence_states_path,
+        ["exchange", "symbol", "timeframe", "stage", "stage_name", "stage_count", "avg_score"],
+        [[r["exchange"], r["symbol"], r["timeframe"], r["stage"], r["stage_name"], r["stage_count"], r["avg_score"]] for r in silence_states],
     )
 
     _write_csv(
