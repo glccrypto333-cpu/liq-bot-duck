@@ -183,7 +183,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
         SELECT *
         FROM market_oi_slope
         WHERE stage >= 1
-          AND timeframe IN ('30m','1h','4h')
         ORDER BY stage DESC, strength DESC
         LIMIT 300
     """)
