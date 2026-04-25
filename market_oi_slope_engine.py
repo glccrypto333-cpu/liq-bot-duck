@@ -31,19 +31,25 @@ def _quality_from_shape(oi_delta, acceleration, price_delta, volume_delta, range
     return "нет наклона"
 
 
-def _stage_from_slope(silence_stage, oi_delta, price_delta, volume_delta, acceleration, range_width):
-    quality = _quality_from_shape(oi_delta, acceleration, price_delta, volume_delta, range_width)
+def _stage_from_slope(silence_stage, oi_delta, price_delta, volume_delta, acceleration):
+    """
+    ОИ — основа.
+    Объем — подтверждающий фактор, но не главный.
+    Цена не обязана сразу расти на стадии 1, но не должна показывать явный слив для подтверждения.
+    """
 
-    if silence_stage == 0 and quality == "ранний наклон":
-        return 1, "наблюдение", quality, "рост ОИ из тишины"
+    clean_volume = min(max(volume_delta, 0.0), 80.0)
 
-    if quality == "рабочий наклон":
-        return 2, "возня", quality, "наклон ОИ усиливается, цена еще не убежала"
+    if silence_stage in (0, 1) and oi_delta >= 0.6 and acceleration > 0 and abs(price_delta) <= 7:
+        return 1, "наблюдение", "ранний рост ОИ из спокойного рынка"
 
-    if quality == "сильный наклон":
-        return 3, "подтверждение", quality, "ОИ, объем и цена подтверждают наклон"
+    if oi_delta >= 1.5 and acceleration > 0 and clean_volume >= 12 and price_delta > -4:
+        return 2, "возня", "наклон ОИ усиливается, объем подтверждает активность"
 
-    return 0, "нет сигнала", quality, "условия наклона ОИ не собраны"
+    if oi_delta >= 3.0 and acceleration > 0 and clean_volume >= 25 and price_delta > 0.8:
+        return 3, "подтверждение", "ОИ, объем и цена подтверждают расширение"
+
+    return 0, "нет сигнала", "условия наклона ОИ не собраны"
 
 
 def rebuild_oi_slope() -> int:
@@ -91,7 +97,8 @@ def rebuild_oi_slope() -> int:
             _f(r["range_width_pct"]),
         )
 
-        strength = max(0.0, min(100.0, oi_delta * 12 + acceleration * 8 + _f(r["volume_delta_pct"]) * 0.7))
+        clean_volume = min(max(_f(r["volume_delta_pct"]), 0.0), 80.0)
+        strength = max(0.0, min(100.0, oi_delta * 14 + acceleration * 10 + clean_volume * 0.25))
 
         out.append((
             calculated_at,
