@@ -135,10 +135,10 @@ def background(bybit_symbols, binance_symbols):
                 last_export = now
                 log(f"quick export rebuilt: {bundle}")
 
-            _write_runtime_timing_report(timings)
-
             timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
             log(f"cycle timing: {timing_text}")
+
+            _write_runtime_timing_report(timings)
 
             log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count} regime={regime_count}")
 
