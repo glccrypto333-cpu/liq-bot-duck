@@ -127,6 +127,8 @@ def rebuild_oi_slope() -> int:
         key = (r["exchange"], r["symbol"], r["timeframe"])
         series = history.setdefault(key, [])
         oi_delta = _f(r["oi_delta_pct"])
+        price_delta = price_delta
+        volume_delta = volume_delta
         series.append(oi_delta)
 
         prev_avg = mean(series[-4:-1]) if len(series) >= 4 else 0.0
@@ -135,13 +137,13 @@ def rebuild_oi_slope() -> int:
         stage, stage_name, quality, reason = _stage_from_slope(
             int(r["silence_stage"] or -1),
             oi_delta,
-            _f(r["price_delta_pct"]),
-            _f(r["volume_delta_pct"]),
+            price_delta,
+            volume_delta,
             acceleration,
             _f(r["range_width_pct"]),
         )
 
-        clean_volume = min(max(_f(r["volume_delta_pct"]), 0.0), 80.0)
+        clean_volume = min(max(volume_delta, 0.0), 80.0)
 
         raw_strength = (
             oi_delta * 18
@@ -170,8 +172,8 @@ def rebuild_oi_slope() -> int:
             oi_delta,
             acceleration,
             prev_avg,
-            _f(r["price_delta_pct"]),
-            _f(r["volume_delta_pct"]),
+            price_delta,
+            volume_delta,
             _f(r["range_width_pct"]),
             int(r["silence_stage"] or -1),
             r["silence_stage_name"] or "нет данных",
