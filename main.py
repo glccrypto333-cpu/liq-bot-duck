@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 import threading
+from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
@@ -35,6 +36,31 @@ from market_oi_slope_engine import rebuild_oi_slope
 from market_regime_engine import rebuild_market_regime
 from export_engine import rebuild_exports
 from telegram_bot import start_polling, send_message
+
+
+def _write_runtime_timing_report(timings: list[tuple[str, float]]) -> None:
+    runtime_dir = Path("runtime")
+    runtime_dir.mkdir(exist_ok=True)
+
+    total = sum(seconds for _, seconds in timings)
+    lines = [
+        f"generated_at={datetime.now(timezone.utc).isoformat()}",
+        f"total_seconds={round(total, 2)}",
+        "",
+        "step,seconds",
+    ]
+
+    for name, seconds in timings:
+        lines.append(f"{name},{round(seconds, 2)}")
+
+    (runtime_dir / "runtime_timing_report.txt").write_text("\n".join(lines) + "\n")
+
+
+def _timed_step(timings: list[tuple[str, float]], name: str, fn):
+    started = time.time()
+    result = fn()
+    timings.append((name, time.time() - started))
+    return result
 
 
 def collect(symbols_bybit, symbols_binance):
@@ -87,25 +113,32 @@ def background(bybit_symbols, binance_symbols):
 
     while True:
         try:
-            collect(bybit_symbols, binance_symbols)
+            timings = []
 
-            agg_count = rebuild_bot_aggregates()
-            audit_count = rebuild_all()
-            research_count = rebuild_market_research()
-            silence_count = rebuild_market_silence()
-            price_count = rebuild_price_state()
-            volume_count = rebuild_volume_state()
-            oi_slope_count = rebuild_oi_slope()
-            regime_count = rebuild_market_regime()
+            _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
 
-            cleanup_old(ДНЕЙ_ХРАНЕНИЯ)
+            agg_count = _timed_step(timings, "aggregates", rebuild_bot_aggregates)
+            audit_count = _timed_step(timings, "validation_audit", rebuild_all)
+            research_count = _timed_step(timings, "market_research", rebuild_market_research)
+            silence_count = _timed_step(timings, "market_silence", rebuild_market_silence)
+            price_count = _timed_step(timings, "price_state", rebuild_price_state)
+            volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
+            oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
+            regime_count = _timed_step(timings, "market_regime", rebuild_market_regime)
+
+            _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
 
             now = time.time()
 
             if now - last_export >= ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК:
-                bundle = rebuild_exports("quick")
+                bundle = _timed_step(timings, "quick_export", lambda: rebuild_exports("quick"))
                 last_export = now
                 log(f"quick export rebuilt: {bundle}")
+
+            _write_runtime_timing_report(timings)
+
+            timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
+            log(f"cycle timing: {timing_text}")
 
             log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count} regime={regime_count}")
 
