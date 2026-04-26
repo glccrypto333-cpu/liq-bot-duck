@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import threading
+import zipfile
 from pathlib import Path
 import requests
 
@@ -48,6 +49,26 @@ def send_document(path: Path, caption: str | None = None) -> None:
         log(f"telegram send document error: {exc}")
 
 
+def _build_runtime_reports_zip() -> Path:
+    report_path = ПАПКА_ДАННЫХ / "runtime_reports.zip"
+
+    files = [
+        ПАПКА_ДАННЫХ / "runtime_timing_report.txt",
+        ПАПКА_ДАННЫХ / "runtime_health_report.txt",
+        ПАПКА_ДАННЫХ / "request_failure_report.csv",
+        ПАПКА_ДАННЫХ / "gap_report.csv",
+        ПАПКА_ДАННЫХ / "active_universe_report.csv",
+        ПАПКА_ДАННЫХ / "storage_manifest.txt",
+    ]
+
+    with zipfile.ZipFile(report_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for path in files:
+            if path.exists():
+                z.write(path, arcname=path.name)
+
+    return report_path
+
+
 def _ensure_quick_exports() -> None:
     rebuild_exports("quick")
 
@@ -85,6 +106,10 @@ def _handle(text: str) -> None:
     elif text == "/research_report":
         _ensure_quick_exports()
         send_document(ПАПКА_ДАННЫХ / "research_report.txt", "research report")
+
+    elif text == "/reports":
+        _ensure_quick_exports()
+        send_document(_build_runtime_reports_zip(), "runtime reports bundle")
 
     elif text == "/timing":
         send_document(ПАПКА_ДАННЫХ / "runtime_timing_report.txt", "runtime timing report")
