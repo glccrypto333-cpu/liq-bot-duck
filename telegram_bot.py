@@ -89,6 +89,18 @@ def _handle(text: str) -> None:
     elif text == "/timing":
         send_document(ПАПКА_ДАННЫХ / "runtime_timing_report.txt", "runtime timing report")
 
+    elif text == "/health":
+        _ensure_quick_exports()
+        send_document(ПАПКА_ДАННЫХ / "runtime_health_report.txt", "runtime health report")
+
+    elif text == "/failures":
+        _ensure_quick_exports()
+        send_document(ПАПКА_ДАННЫХ / "request_failure_report.csv", "request failures")
+
+    elif text == "/gaps":
+        _ensure_quick_exports()
+        send_document(ПАПКА_ДАННЫХ / "gap_report.csv", "gap report")
+
     elif text == "/active_universe":
         _ensure_quick_exports()
         send_document(ПАПКА_ДАННЫХ / "active_universe_report.csv", "active universe")
