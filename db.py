@@ -191,6 +191,23 @@ def init_db() -> None:
 
 
 
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_volume_state(
+            calculated_at TIMESTAMPTZ NOT NULL,
+            ts_close TIMESTAMPTZ NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            volume_state INTEGER NOT NULL,
+            volume_state_name TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            volume_delta_pct DOUBLE PRECISION,
+            market_state TEXT,
+            invalid_reason TEXT
+        )
+        """)
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS market_price_state(
             calculated_at TIMESTAMPTZ NOT NULL,
@@ -273,6 +290,8 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_active_symbol_universe_main ON active_symbol_universe(exchange, symbol)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_silence_main ON market_silence(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_silence_stage ON market_silence(stage, timeframe)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_main ON market_volume_state(exchange, symbol, timeframe, ts_close)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_name ON market_volume_state(volume_state_name, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_main ON market_price_state(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_name ON market_price_state(price_state_name, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_main ON market_oi_slope(exchange, symbol, timeframe, ts_close)")
@@ -507,6 +526,29 @@ def replace_market_regime(rows: list[tuple]) -> None:
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
 
+
+
+
+def replace_volume_state(rows: list[tuple]) -> None:
+    execute("TRUNCATE TABLE market_volume_state")
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO market_volume_state(
+            calculated_at,
+            ts_close,
+            exchange,
+            symbol,
+            timeframe,
+            volume_state,
+            volume_state_name,
+            reason,
+            volume_delta_pct,
+            market_state,
+            invalid_reason
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
 
 
 def replace_price_state(rows: list[tuple]) -> None:
