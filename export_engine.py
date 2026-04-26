@@ -550,7 +550,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_oi_slope.csv, oi_slope_top.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt\n"
             "timestamp_migration=active\n"
             "canonical_close=active\n"
             "contiguous_window_validation=active\n"
@@ -570,6 +570,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         audit_path,
         market_research_path,
         market_states_path,
+        market_price_state_path,
         market_oi_slope_path,
         oi_slope_top_path,
         market_regime_path,
