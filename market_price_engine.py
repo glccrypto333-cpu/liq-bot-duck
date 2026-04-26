@@ -13,20 +13,42 @@ def _f(v, default=0.0):
         return default
 
 
-def _price_state(price_delta, range_width):
+def _price_state(price_delta, range_width, volume_delta):
+    """
+    Цена НЕ подтверждает ОИ.
+    Она описывает режим движения.
+
+    Задача:
+    - понять, спит рынок или расширяется
+    - есть ли импульс
+    - есть ли возврат
+    """
+
     abs_price = abs(price_delta)
 
+    # сильное сжатие
+    if range_width <= 3 and abs_price <= 1.2:
+        return 0, "сжатие", "цена сильно сжата"
+
+    # спокойный диапазон
     if range_width <= 7 and abs_price <= 3:
-        return 0, "слабый боковик", "цена сжата, направленного движения нет"
+        return 1, "спокойный боковик", "рынок в спокойном диапазоне"
 
-    if range_width <= 10 and abs_price <= 5:
-        return 1, "широкий боковик", "цена внутри диапазона, волатильность умеренная"
+    # широкий диапазон
+    if range_width <= 12 and abs_price <= 6:
+        return 2, "широкий боковик", "цена расширила диапазон"
 
-    if price_delta > 5:
-        return 2, "наклон вверх", "цена показывает направленное движение вверх"
+    # импульс вверх
+    if price_delta >= 6:
+        return 3, "импульс вверх", "цена показывает направленное расширение вверх"
 
-    if price_delta < -5:
-        return -2, "наклон вниз", "цена показывает направленное движение вниз"
+    # импульс вниз
+    if price_delta <= -6:
+        return -3, "импульс вниз", "цена показывает направленное расширение вниз"
+
+    # возврат после расширения
+    if abs_price <= 2 and range_width >= 10:
+        return 4, "возврат", "после расширения цена вернулась в диапазон"
 
     return 0, "нейтрально", "цена без явного режима"
 
@@ -40,6 +62,7 @@ def rebuild_price_state() -> int:
             symbol,
             timeframe,
             price_delta_pct,
+            volume_delta_pct,
             range_width_pct,
             market_state,
             invalid_reason
@@ -54,7 +77,13 @@ def rebuild_price_state() -> int:
         price_delta = _f(r["price_delta_pct"])
         range_width = _f(r["range_width_pct"])
 
-        state, state_name, reason = _price_state(price_delta, range_width)
+        volume_delta = _f(r.get("volume_delta_pct"))
+
+        state, state_name, reason = _price_state(
+            price_delta,
+            range_width,
+            volume_delta,
+        )
 
         out.append((
             calculated_at,
