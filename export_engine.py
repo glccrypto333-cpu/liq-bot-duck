@@ -34,9 +34,23 @@ def _zip(zip_path: Path, files: list[Path]) -> None:
 
 def _safe_fetch(sql: str, params: tuple = ()) -> list[dict]:
     try:
-        return fetch(sql, params)
+        rows = fetch(sql, params) or []
+        return [row for row in rows if row is not None]
     except Exception:
         return []
+
+
+def _v(row, key: str, default=None):
+    if row is None:
+        return default
+
+    try:
+        return row.get(key, default)
+    except AttributeError:
+        try:
+            return row[key]
+        except Exception:
+            return default
 
 
 def _runtime_memory_mb() -> float:
@@ -64,10 +78,10 @@ def _fetch_top_oi_rows(since, timeframe: str, limit: int = 100):
         WHERE timeframe = %s
     """, (timeframe,))
 
-    if not latest or not latest[0]["max_ts"]:
-        return []
+    latest_ts = _v(latest[0], "max_ts") if latest else None
 
-    latest_ts = latest[0]["max_ts"]
+    if not latest_ts:
+        return []
 
     return _safe_fetch("""
         SELECT *
