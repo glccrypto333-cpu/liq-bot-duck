@@ -605,32 +605,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
         g["unique_strength"].add(strength)
 
-    oi_slope_summary = []
-
-    for g in oi_groups.values():
-        rows_count = g["rows_count"]
-        avg_strength = g["strength_sum"] / rows_count if rows_count else 0.0
-
-        oi_slope_summary.append([
-            g["timeframe"],
-            g["stage"],
-            g["stage_name"],
-            rows_count,
-            round(g["strength_min"] or 0.0, 2),
-            round(avg_strength, 2),
-            round(g["strength_max"] or 0.0, 2),
-            round(g["raw_strength_max"] or 0.0, 2),
-            g["strength_100_count"],
-            len(g["unique_strength"]),
-        ])
-
-    oi_slope_summary.sort(key=lambda x: (x[0], -x[1], -x[6], x[2]))
-
-    _write_csv(
-        oi_slope_summary_path,
-        ["timeframe","stage","stage_name","rows_count","min_strength","avg_strength","max_strength","max_raw_strength","strength_100_count","unique_strength_count"],
-        oi_slope_summary,
-    )
 
     _write_csv(
         market_silence_path,
