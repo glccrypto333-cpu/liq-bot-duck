@@ -69,7 +69,81 @@ def _build_runtime_reports_zip() -> Path:
     return report_path
 
 
+def _read_kv_file(path: Path) -> dict:
+    data = {}
+
+    if not path.exists():
+        return data
+
+    for line in path.read_text(errors="ignore").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            data[k.strip()] = v.strip()
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            data[k.strip()] = v.strip()
+
+    return data
+
+
+def _count_csv_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+
+    lines = path.read_text(errors="ignore").splitlines()
+
+    if not lines:
+        return 0
+
+    return max(len(lines) - 1, 0)
+
+
+def _quick_export_is_fresh(max_age_seconds: int = 60) -> bool:
+    bundle_path = ПАПКА_ДАННЫХ / "market_research_bundle.zip"
+
+    if not bundle_path.exists():
+        return False
+
+    age = time.time() - bundle_path.stat().st_mtime
+    return age <= max_age_seconds
+
+
+def _build_status_text() -> str:
+    timing = _read_kv_file(ПАПКА_ДАННЫХ / "runtime_timing_report.txt")
+    health = _read_kv_file(ПАПКА_ДАННЫХ / "runtime_health_report.txt")
+
+    files_count = len([path for path in ПАПКА_ДАННЫХ.glob("*") if path.is_file()])
+    failures_count = _count_csv_rows(ПАПКА_ДАННЫХ / "request_failure_report.csv")
+    gaps_count = _count_csv_rows(ПАПКА_ДАННЫХ / "gap_report.csv")
+    active_count = _count_csv_rows(ПАПКА_ДАННЫХ / "active_universe_report.csv")
+
+    total_seconds = timing.get("total_seconds", "n/a")
+    generated_at = timing.get("generated_at", "n/a")
+    memory_mb = health.get("memory_max_rss_mb", "n/a")
+    export_mode = health.get("export_mode", "n/a")
+
+    return (
+        f"🥇 Mighty Duck / {APP_VERSION}\n\n"
+        f"Cycle: OK\n"
+        f"Last timing: {generated_at}\n"
+        f"Duration: {total_seconds}s\n"
+        f"Memory max RSS: {memory_mb} MB\n"
+        f"Export mode: {export_mode}\n\n"
+        f"Runtime reports:\n"
+        f"Failures: {failures_count}\n"
+        f"Gaps: {gaps_count}\n"
+        f"Active universe rows: {active_count}\n"
+        f"Runtime files: {files_count}\n\n"
+        f"Downloads:\n"
+        f"/bundle — research bundle\n"
+        f"/reports — runtime reports bundle"
+    )
+
+
 def _ensure_quick_exports() -> None:
+    if _quick_export_is_fresh():
+        return
+
     rebuild_exports("quick")
 
 
@@ -79,17 +153,7 @@ def _handle(text: str) -> None:
 
     elif text == "/status":
         _ensure_quick_exports()
-        files = sorted(path.name for path in ПАПКА_ДАННЫХ.glob("*") if path.is_file())
-        send_message(
-            f"🥇 Mighty Duck / {APP_VERSION}\n\n"
-            "Файлы обновлены.\n\n"
-            "Основные файлы:\n"
-            "1. market_research_bundle.zip\n"
-            "2. audit_report.txt\n"
-            "3. research_report.txt\n"
-            "4. storage_manifest.txt\n\n"
-            f"Всего файлов в runtime: {len(files)}"
-        )
+        send_message(_build_status_text())
 
     elif text == "/manifest":
         _ensure_quick_exports()
