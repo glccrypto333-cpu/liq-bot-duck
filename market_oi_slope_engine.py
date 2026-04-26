@@ -31,6 +31,50 @@ def _quality_from_shape(oi_delta, acceleration, price_delta, volume_delta, range
     return "нет наклона"
 
 
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _normalize_strength(raw_strength):
+    """
+    Убираем saturation.
+    Strength должен быть полезен для ранжирования,
+    а не постоянно упираться в 100.
+    """
+
+    if raw_strength <= 0:
+        return 0.0
+
+    # мягкое логарифмическое сглаживание
+    normalized = (raw_strength ** 0.72) * 8.5
+
+    return round(_clamp(normalized, 0.0, 100.0), 2)
+
+
+def _oi_quality(oi_delta, acceleration, price_delta):
+    """
+    Качество наклона ОИ.
+    """
+
+    if oi_delta >= 4 and acceleration >= 1:
+        if abs(price_delta) <= 2:
+            return "рост без цены"
+
+    if oi_delta >= 3 and price_delta < -3:
+        return "рост против цены"
+
+    if oi_delta >= 4 and acceleration >= 2:
+        return "агрессивный набор"
+
+    if oi_delta >= 1 and acceleration > 0:
+        return "плавный набор"
+
+    return "нет качества"
+
+
+
 def _stage_from_slope(silence_stage, oi_delta, price_delta, volume_delta, acceleration, *_):
     """
     ОИ — основа.
@@ -98,7 +142,20 @@ def rebuild_oi_slope() -> int:
         )
 
         clean_volume = min(max(_f(r["volume_delta_pct"]), 0.0), 80.0)
-        strength = max(0.0, min(100.0, oi_delta * 14 + acceleration * 10 + clean_volume * 0.25))
+
+        raw_strength = (
+            oi_delta * 18
+            + acceleration * 14
+            + clean_volume * 0.08
+        )
+
+        strength = _normalize_strength(raw_strength)
+
+        oi_quality = _oi_quality(
+            oi_delta,
+            acceleration,
+            price_delta,
+        )
 
         out.append((
             calculated_at,

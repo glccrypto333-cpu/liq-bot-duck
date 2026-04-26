@@ -598,6 +598,8 @@ def replace_oi_slope(rows: list[tuple]) -> None:
             stage,
             stage_name,
             strength,
+            raw_strength,
+            oi_quality,
             reason,
             oi_delta_pct,
             oi_acceleration,
