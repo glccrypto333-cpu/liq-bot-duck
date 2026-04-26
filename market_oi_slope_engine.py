@@ -39,16 +39,25 @@ def _clamp(v, lo, hi):
 
 def _normalize_strength(raw_strength):
     """
-    Убираем saturation.
-    Strength должен быть полезен для ранжирования,
-    а не постоянно упираться в 100.
+    Soft 0..100 ranking strength for OI pressure.
+
+    raw_strength stays diagnostic.
+    strength is only a ranking score, not a trade signal.
+
+    Goal:
+    - remove fast saturation
+    - keep early OI interest visible
+    - make 100 a rare extreme event
     """
+
+    raw_strength = float(raw_strength or 0.0)
 
     if raw_strength <= 0:
         return 0.0
 
-    # мягкое логарифмическое сглаживание
-    normalized = (raw_strength ** 0.72) * 8.5
+    # Old formula saturated around raw_strength ~= 30.7.
+    # New linear compression reaches 100 only near raw_strength ~= 220.
+    normalized = (raw_strength / 220.0) * 100.0
 
     return round(_clamp(normalized, 0.0, 100.0), 2)
 
