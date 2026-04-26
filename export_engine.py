@@ -172,6 +172,13 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY exchange, symbol, timeframe, state_count DESC
     """, (since,))
 
+    market_price_state = _safe_fetch("""
+        SELECT *
+        FROM market_price_state
+        WHERE ts_close >= %s
+        ORDER BY exchange, symbol, timeframe, ts_close
+    """, (since,))
+
     market_oi_slope = _safe_fetch("""
         SELECT *
         FROM market_oi_slope
@@ -267,6 +274,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
     market_research_path = ПАПКА_ДАННЫХ / "market_research.csv"
     market_states_path = ПАПКА_ДАННЫХ / "market_states.csv"
     market_silence_path = ПАПКА_ДАННЫХ / "market_silence.csv"
+    market_price_state_path = ПАПКА_ДАННЫХ / "market_price_state.csv"
     market_oi_slope_path = ПАПКА_ДАННЫХ / "market_oi_slope.csv"
     oi_slope_top_path = ПАПКА_ДАННЫХ / "oi_slope_top.csv"
     silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
@@ -341,6 +349,12 @@ def rebuild_exports(mode: str = "quick") -> Path:
         market_states_path,
         ["exchange", "symbol", "timeframe", "market_state", "state_count", "avg_continuation_score", "avg_exhaustion_score", "avg_compression_score"],
         [[r["exchange"], r["symbol"], r["timeframe"], r["market_state"], r["state_count"], r["avg_continuation_score"], r["avg_exhaustion_score"], r["avg_compression_score"]] for r in market_states],
+    )
+
+    _write_csv(
+        market_price_state_path,
+        ["calculated_at","ts_close","exchange","symbol","timeframe","price_state","price_state_name","reason","price_delta_pct","range_width_pct","market_state","invalid_reason"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["price_state"],r["price_state_name"],r["reason"],r["price_delta_pct"],r["range_width_pct"],r["market_state"],r["invalid_reason"]] for r in market_price_state],
     )
 
     _write_csv(
