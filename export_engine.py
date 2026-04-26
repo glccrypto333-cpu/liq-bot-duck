@@ -277,6 +277,41 @@ def rebuild_exports(mode: str = "quick") -> Path:
     top_oi_1h = _fetch_top_oi_rows(since, "1h")
     top_oi_4h = _fetch_top_oi_rows(since, "4h")
 
+
+    oi_slope_summary = _safe_fetch("""
+        SELECT
+            exchange,
+            timeframe,
+            stage_name,
+            oi_quality,
+
+            COUNT(*) AS rows_count,
+
+            MIN(strength) AS min_strength,
+            AVG(strength) AS avg_strength,
+            MAX(strength) AS max_strength,
+
+            AVG(raw_strength) AS avg_raw_strength,
+
+            SUM(CASE WHEN strength >= 95 THEN 1 ELSE 0 END) AS strength_ge_95,
+            SUM(CASE WHEN strength >= 100 THEN 1 ELSE 0 END) AS strength_eq_100
+
+        FROM market_oi_slope
+        WHERE ts_close >= %s
+
+        GROUP BY
+            exchange,
+            timeframe,
+            stage_name,
+            oi_quality
+
+        ORDER BY
+            timeframe,
+            stage_name,
+            avg_strength DESC,
+            rows_count DESC
+    """, (since,))
+
     market_silence = _safe_fetch("""
         SELECT *
         FROM market_silence
@@ -368,6 +403,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
     top_oi_30m_path = ПАПКА_ДАННЫХ / "top_oi_slope_30m.csv"
     top_oi_1h_path = ПАПКА_ДАННЫХ / "top_oi_slope_1h.csv"
     top_oi_4h_path = ПАПКА_ДАННЫХ / "top_oi_slope_4h.csv"
+
     oi_slope_summary_path = ПАПКА_ДАННЫХ / "oi_slope_summary.csv"
     silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
     market_regime_path = ПАПКА_ДАННЫХ / "market_regime.csv"
@@ -495,6 +531,39 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
     _write_csv(
         top_oi_4h_path,
+    _write_csv(
+        oi_slope_summary_path,
+        [
+            "exchange",
+            "timeframe",
+            "stage_name",
+            "oi_quality",
+            "rows_count",
+            "min_strength",
+            "avg_strength",
+            "max_strength",
+            "avg_raw_strength",
+            "strength_ge_95",
+            "strength_eq_100",
+        ],
+        [
+            [
+                r["exchange"],
+                r["timeframe"],
+                r["stage_name"],
+                r["oi_quality"],
+                r["rows_count"],
+                r["min_strength"],
+                r["avg_strength"],
+                r["max_strength"],
+                r["avg_raw_strength"],
+                r["strength_ge_95"],
+                r["strength_eq_100"],
+            ]
+            for r in oi_slope_summary
+        ],
+    )
+
         ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
         [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in top_oi_4h],
     )
