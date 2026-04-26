@@ -238,6 +238,8 @@ def init_db() -> None:
             stage INTEGER NOT NULL,
             stage_name TEXT NOT NULL,
             strength DOUBLE PRECISION NOT NULL,
+            raw_strength DOUBLE PRECISION,
+            oi_quality TEXT,
             reason TEXT NOT NULL,
             oi_delta_pct DOUBLE PRECISION,
             oi_acceleration DOUBLE PRECISION,
@@ -300,6 +302,8 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_name ON market_volume_state(volume_state_name, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_main ON market_price_state(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_name ON market_price_state(price_state_name, timeframe)")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS raw_strength DOUBLE PRECISION")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_quality TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_main ON market_oi_slope(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_stage ON market_oi_slope(stage, timeframe, strength)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_regime_main ON market_regime(exchange, symbol, timeframe, ts_close)")
