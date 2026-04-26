@@ -89,6 +89,10 @@ def _handle(text: str) -> None:
     elif text == "/timing":
         send_document(ПАПКА_ДАННЫХ / "runtime_timing_report.txt", "runtime timing report")
 
+    elif text == "/active_universe":
+        _ensure_quick_exports()
+        send_document(ПАПКА_ДАННЫХ / "active_universe_report.csv", "active universe")
+
     elif text == "/export_quick":
         send_message("Готовлю quick bundle...")
         send_document(rebuild_exports("quick"), "quick bundle")
