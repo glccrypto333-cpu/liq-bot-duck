@@ -172,6 +172,24 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY exchange, symbol, timeframe, state_count DESC
     """, (since,))
 
+    top_volume_anomalies = _safe_fetch("""
+        SELECT *
+        FROM market_volume_state
+        WHERE ts_close >= %s
+          AND (
+              volume_state_name = 'аномальный объем'
+              OR noise_state != 'не шум'
+              OR volume_percentile >= 95
+          )
+        ORDER BY
+            CASE WHEN noise_state != 'не шум' THEN 1 ELSE 0 END DESC,
+            volume_percentile DESC,
+            volume_delta_pct DESC,
+            normalized_volume DESC,
+            ts_close DESC
+        LIMIT 500
+    """, (since,))
+
     volume_state_summary = _safe_fetch("""
         SELECT
             exchange,
@@ -301,6 +319,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
     market_price_state_path = ПАПКА_ДАННЫХ / "market_price_state.csv"
     market_volume_state_path = ПАПКА_ДАННЫХ / "market_volume_state.csv"
     volume_state_summary_path = ПАПКА_ДАННЫХ / "volume_state_summary.csv"
+    top_volume_anomalies_path = ПАПКА_ДАННЫХ / "top_volume_anomalies.csv"
     market_oi_slope_path = ПАПКА_ДАННЫХ / "market_oi_slope.csv"
     oi_slope_top_path = ПАПКА_ДАННЫХ / "oi_slope_top.csv"
     silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
@@ -375,6 +394,12 @@ def rebuild_exports(mode: str = "quick") -> Path:
         market_states_path,
         ["exchange", "symbol", "timeframe", "market_state", "state_count", "avg_continuation_score", "avg_exhaustion_score", "avg_compression_score"],
         [[r["exchange"], r["symbol"], r["timeframe"], r["market_state"], r["state_count"], r["avg_continuation_score"], r["avg_exhaustion_score"], r["avg_compression_score"]] for r in market_states],
+    )
+
+    _write_csv(
+        top_volume_anomalies_path,
+        ["calculated_at","ts_close","exchange","symbol","timeframe","volume_state","volume_state_name","reason","volume_delta_pct","normalized_volume","volume_percentile","noise_state","market_state","invalid_reason"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["volume_state"],r["volume_state_name"],r["reason"],r["volume_delta_pct"],r["normalized_volume"],r["volume_percentile"],r["noise_state"],r["market_state"],r["invalid_reason"]] for r in top_volume_anomalies],
     )
 
     _write_csv(
@@ -588,7 +613,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt\n"
             "timestamp_migration=active\n"
             "canonical_close=active\n"
             "contiguous_window_validation=active\n"
@@ -610,6 +635,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         market_states_path,
         market_volume_state_path,
         volume_state_summary_path,
+        top_volume_anomalies_path,
         market_price_state_path,
         market_oi_slope_path,
         oi_slope_top_path,
