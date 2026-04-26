@@ -609,7 +609,7 @@ def replace_oi_slope(rows: list[tuple]) -> None:
             range_width_pct,
             silence_stage,
             silence_stage_name
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
 
 
