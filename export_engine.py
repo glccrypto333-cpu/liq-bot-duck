@@ -231,10 +231,11 @@ def rebuild_exports(mode: str = "quick") -> Path:
     oi_slope_top = _safe_fetch("""
         SELECT *
         FROM market_oi_slope
-        WHERE stage >= 1
-        ORDER BY stage DESC, strength DESC
+        WHERE ts_close >= %s
+          AND stage >= 1
+        ORDER BY stage DESC, strength DESC, raw_strength DESC, exchange, symbol, timeframe, ts_close
         LIMIT 300
-    """)
+    """, (since,))
 
     market_silence = _safe_fetch("""
         SELECT *
