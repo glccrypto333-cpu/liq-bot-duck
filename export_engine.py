@@ -57,6 +57,34 @@ def _fmt_pct(value) -> str:
         return "n/a"
 
 
+def _fetch_top_oi_rows(since, timeframe: str, limit: int = 100):
+    latest = _safe_fetch("""
+        SELECT MAX(ts_close) AS max_ts
+        FROM market_oi_slope
+        WHERE timeframe = %s
+    """, (timeframe,))
+
+    if not latest or not latest[0]["max_ts"]:
+        return []
+
+    latest_ts = latest[0]["max_ts"]
+
+    return _safe_fetch("""
+        SELECT *
+        FROM market_oi_slope
+        WHERE timeframe = %s
+          AND ts_close = %s
+          AND stage >= 1
+        ORDER BY
+            stage DESC,
+            strength DESC,
+            raw_strength DESC,
+            exchange,
+            symbol
+        LIMIT %s
+    """, (timeframe, latest_ts, limit))
+
+
 def rebuild_exports(mode: str = "quick") -> Path:
     now = datetime.now(timezone.utc)
 
@@ -233,9 +261,21 @@ def rebuild_exports(mode: str = "quick") -> Path:
         FROM market_oi_slope
         WHERE ts_close >= %s
           AND stage >= 1
-        ORDER BY stage DESC, strength DESC, raw_strength DESC, exchange, symbol, timeframe, ts_close
+        ORDER BY
+            stage DESC,
+            strength DESC,
+            raw_strength DESC,
+            exchange,
+            symbol,
+            timeframe,
+            ts_close
         LIMIT 300
     """, (since,))
+
+    top_oi_15m = _fetch_top_oi_rows(since, "15m")
+    top_oi_30m = _fetch_top_oi_rows(since, "30m")
+    top_oi_1h = _fetch_top_oi_rows(since, "1h")
+    top_oi_4h = _fetch_top_oi_rows(since, "4h")
 
     market_silence = _safe_fetch("""
         SELECT *
@@ -323,6 +363,11 @@ def rebuild_exports(mode: str = "quick") -> Path:
     top_volume_anomalies_path = ПАПКА_ДАННЫХ / "top_volume_anomalies.csv"
     market_oi_slope_path = ПАПКА_ДАННЫХ / "market_oi_slope.csv"
     oi_slope_top_path = ПАПКА_ДАННЫХ / "oi_slope_top.csv"
+
+    top_oi_15m_path = ПАПКА_ДАННЫХ / "top_oi_slope_15m.csv"
+    top_oi_30m_path = ПАПКА_ДАННЫХ / "top_oi_slope_30m.csv"
+    top_oi_1h_path = ПАПКА_ДАННЫХ / "top_oi_slope_1h.csv"
+    top_oi_4h_path = ПАПКА_ДАННЫХ / "top_oi_slope_4h.csv"
     oi_slope_summary_path = ПАПКА_ДАННЫХ / "oi_slope_summary.csv"
     silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
     market_regime_path = ПАПКА_ДАННЫХ / "market_regime.csv"
@@ -427,6 +472,31 @@ def rebuild_exports(mode: str = "quick") -> Path:
         market_oi_slope_path,
         ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","oi_prev_avg","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage","silence_stage_name"],
         [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["oi_prev_avg"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage"],r["silence_stage_name"]] for r in market_oi_slope],
+    )
+
+
+    _write_csv(
+        top_oi_15m_path,
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in top_oi_15m],
+    )
+
+    _write_csv(
+        top_oi_30m_path,
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in top_oi_30m],
+    )
+
+    _write_csv(
+        top_oi_1h_path,
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in top_oi_1h],
+    )
+
+    _write_csv(
+        top_oi_4h_path,
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in top_oi_4h],
     )
 
     _write_csv(
@@ -674,7 +744,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
             "timestamp_migration=active\n"
             "canonical_close=active\n"
             "contiguous_window_validation=active\n"
@@ -700,6 +770,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
         market_price_state_path,
         market_oi_slope_path,
         oi_slope_top_path,
+        top_oi_15m_path,
+        top_oi_30m_path,
+        top_oi_1h_path,
+        top_oi_4h_path,
         oi_slope_summary_path,
         market_regime_path,
         regime_states_path,
