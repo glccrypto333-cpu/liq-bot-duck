@@ -136,6 +136,9 @@ def rebuild_market_regime() -> int:
     out = []
 
     for r in rows:
+        if r is None:
+            continue
+
         scenario, confidence, reason = _classify(r)
 
         out.append(
