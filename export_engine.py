@@ -323,6 +323,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
     top_volume_anomalies_path = ПАПКА_ДАННЫХ / "top_volume_anomalies.csv"
     market_oi_slope_path = ПАПКА_ДАННЫХ / "market_oi_slope.csv"
     oi_slope_top_path = ПАПКА_ДАННЫХ / "oi_slope_top.csv"
+    oi_slope_summary_path = ПАПКА_ДАННЫХ / "oi_slope_summary.csv"
     silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
     market_regime_path = ПАПКА_ДАННЫХ / "market_regime.csv"
     regime_states_path = ПАПКА_ДАННЫХ / "regime_states.csv"
@@ -431,6 +432,64 @@ def rebuild_exports(mode: str = "quick") -> Path:
         oi_slope_top_path,
         ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
         [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in oi_slope_top],
+    )
+
+    oi_groups = {}
+
+    for r in market_oi_slope:
+        key = (r["timeframe"], r["stage"], r["stage_name"])
+        g = oi_groups.setdefault(key, {
+            "timeframe": r["timeframe"],
+            "stage": r["stage"],
+            "stage_name": r["stage_name"],
+            "rows_count": 0,
+            "strength_sum": 0.0,
+            "strength_min": None,
+            "strength_max": None,
+            "raw_strength_max": None,
+            "strength_100_count": 0,
+            "unique_strength": set(),
+        })
+
+        strength = float(r["strength"] or 0.0)
+        raw_strength = float(r["raw_strength"] or 0.0)
+
+        g["rows_count"] += 1
+        g["strength_sum"] += strength
+        g["strength_min"] = strength if g["strength_min"] is None else min(g["strength_min"], strength)
+        g["strength_max"] = strength if g["strength_max"] is None else max(g["strength_max"], strength)
+        g["raw_strength_max"] = raw_strength if g["raw_strength_max"] is None else max(g["raw_strength_max"], raw_strength)
+
+        if strength >= 100:
+            g["strength_100_count"] += 1
+
+        g["unique_strength"].add(strength)
+
+    oi_slope_summary = []
+
+    for g in oi_groups.values():
+        rows_count = g["rows_count"]
+        avg_strength = g["strength_sum"] / rows_count if rows_count else 0.0
+
+        oi_slope_summary.append([
+            g["timeframe"],
+            g["stage"],
+            g["stage_name"],
+            rows_count,
+            round(g["strength_min"] or 0.0, 2),
+            round(avg_strength, 2),
+            round(g["strength_max"] or 0.0, 2),
+            round(g["raw_strength_max"] or 0.0, 2),
+            g["strength_100_count"],
+            len(g["unique_strength"]),
+        ])
+
+    oi_slope_summary.sort(key=lambda x: (x[0], -x[1], -x[6], x[2]))
+
+    _write_csv(
+        oi_slope_summary_path,
+        ["timeframe","stage","stage_name","rows_count","min_strength","avg_strength","max_strength","max_raw_strength","strength_100_count","unique_strength_count"],
+        oi_slope_summary,
     )
 
     _write_csv(
@@ -614,7 +673,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt\n"
             "timestamp_migration=active\n"
             "canonical_close=active\n"
             "contiguous_window_validation=active\n"
@@ -640,6 +699,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         market_price_state_path,
         market_oi_slope_path,
         oi_slope_top_path,
+        oi_slope_summary_path,
         market_regime_path,
         regime_states_path,
         coverage_path,
