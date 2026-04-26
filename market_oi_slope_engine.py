@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 from statistics import mean
 
 from db import fetch, replace_oi_slope
@@ -55,9 +56,15 @@ def _normalize_strength(raw_strength):
     if raw_strength <= 0:
         return 0.0
 
-    # Old formula saturated around raw_strength ~= 30.7.
-    # New linear compression reaches 100 only near raw_strength ~= 220.
-    normalized = (raw_strength / 220.0) * 100.0
+    # Logarithmic compression:
+    # - preserves low-end spread
+    # - slows saturation
+    # - keeps 100 as a rare extreme event
+    # - raw_strength remains diagnostic
+    normalized = (
+        math.log1p(raw_strength)
+        / math.log1p(400.0)
+    ) * 100.0
 
     return round(_clamp(normalized, 0.0, 100.0), 2)
 
