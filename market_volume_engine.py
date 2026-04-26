@@ -105,6 +105,13 @@ def rebuild_volume_state() -> int:
 
     for r in rows:
         volume_delta = _f(r["volume_delta_pct"])
+        oi_delta = _f(r.get("oi_delta_pct"))
+        range_width = _f(r.get("range_width_pct"))
+
+        normalized_volume = _safe_log_volume(volume_delta)
+        percentile = _volume_percentile(volume_delta)
+        noise_state = _noise_state(range_width, volume_delta, oi_delta)
+
         state, state_name, reason = _volume_state(volume_delta)
 
         out.append((
