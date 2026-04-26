@@ -203,6 +203,9 @@ def init_db() -> None:
             volume_state_name TEXT NOT NULL,
             reason TEXT NOT NULL,
             volume_delta_pct DOUBLE PRECISION,
+            normalized_volume DOUBLE PRECISION,
+            volume_percentile INTEGER,
+            noise_state TEXT,
             market_state TEXT,
             invalid_reason TEXT
         )
@@ -290,6 +293,9 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_active_symbol_universe_main ON active_symbol_universe(exchange, symbol)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_silence_main ON market_silence(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_silence_stage ON market_silence(stage, timeframe)")
+        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS normalized_volume DOUBLE PRECISION")
+        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_percentile INTEGER")
+        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS noise_state TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_main ON market_volume_state(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_name ON market_volume_state(volume_state_name, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_main ON market_price_state(exchange, symbol, timeframe, ts_close)")
@@ -545,9 +551,12 @@ def replace_volume_state(rows: list[tuple]) -> None:
             volume_state_name,
             reason,
             volume_delta_pct,
+            normalized_volume,
+            volume_percentile,
+            noise_state,
             market_state,
             invalid_reason
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
 
 
