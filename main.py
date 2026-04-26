@@ -29,6 +29,7 @@ from aggregation_engine import rebuild_bot_aggregates
 from audit_engine import rebuild_all
 from research_engine import rebuild_market_research
 from market_silence_engine import rebuild_market_silence
+from market_price_engine import rebuild_price_state
 from market_oi_slope_engine import rebuild_oi_slope
 from market_regime_engine import rebuild_market_regime
 from export_engine import rebuild_exports
@@ -91,6 +92,7 @@ def background(bybit_symbols, binance_symbols):
             audit_count = rebuild_all()
             research_count = rebuild_market_research()
             silence_count = rebuild_market_silence()
+            price_count = rebuild_price_state()
             oi_slope_count = rebuild_oi_slope()
             regime_count = rebuild_market_regime()
 
@@ -103,7 +105,7 @@ def background(bybit_symbols, binance_symbols):
                 last_export = now
                 log(f"quick export rebuilt: {bundle}")
 
-            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} oi_slope={oi_slope_count} regime={regime_count}")
+            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} oi_slope={oi_slope_count} regime={regime_count}")
 
         except Exception as exc:
             log(f"canonical validation cycle error: {type(exc).__name__}: {exc}")
