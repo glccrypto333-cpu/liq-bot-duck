@@ -40,28 +40,21 @@ def _clamp(v, lo, hi):
 
 def _normalize_strength(raw_strength):
     """
-    Soft 0..100 ranking strength for OI pressure.
-
-    raw_strength stays diagnostic.
-    strength is only a ranking score, not a trade signal.
-
-    Goal:
-    - remove top saturation
-    - preserve candidate separation
-    - make 100 a rare extreme event
+    Soft 0..100 ranking score for OI pressure.
+    Not a signal. Only ranking.
+    Avoids top rows saturating at 100.
     """
+    import math
 
     raw_strength = float(raw_strength or 0.0)
 
     if raw_strength <= 0:
         return 0.0
 
-    normalized = (
-        math.log1p(raw_strength)
-        / math.log1p(1000.0)
-    ) * 100.0
+    # slower curve: raw=10 -> ~28, raw=30 -> ~45, raw=80 -> ~64, raw=200 -> ~79
+    score = math.log1p(raw_strength) * 15.0
 
-    return round(_clamp(normalized, 0.0, 100.0), 2)
+    return round(min(score, 99.0), 2)
 
 
 def _oi_quality(oi_delta, acceleration, price_delta):
