@@ -331,83 +331,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             rows_count DESC
     """, (since,))
 
-    metric_alignment = _safe_fetch("""
-        SELECT
-            r.exchange,
-            r.symbol,
-            r.timeframe,
-            r.ts_close,
-
-            s.stage_name AS oi_stage,
-            p.price_state_name,
-            v.volume_state_name,
-            r.market_state,
-
-            r.oi_delta_pct,
-            r.price_delta_pct,
-            r.volume_delta_pct,
-            r.range_width_pct,
-
-            CASE
-
-                -- accumulation candidate
-                WHEN s.stage_name IN ('наблюдение', 'возня')
-                 AND p.price_state_name IN ('сжатие', 'спокойный боковик')
-                 AND v.volume_state_name IN ('обычный объем', 'объем растет')
-                THEN 'silent accumulation'
-
-                -- trapped positioning / conflict
-                WHEN s.stage_name IN ('наблюдение', 'возня')
-                 AND p.price_state_name IN ('импульс вниз')
-                 AND v.volume_state_name IN ('аномальный объем', 'всплеск объема')
-                THEN 'conflicted'
-
-                -- squeeze / exhaustion
-                WHEN s.stage_name = 'нет сигнала'
-                 AND p.price_state_name IN ('импульс вверх', 'импульс вниз')
-                 AND v.volume_state_name IN ('аномальный объем', 'всплеск объема')
-                THEN 'exhausted'
-
-                -- aligned continuation
-                WHEN s.stage_name IN ('наблюдение', 'возня')
-                 AND p.price_state_name IN ('импульс вверх', 'импульс вниз')
-                 AND v.volume_state_name IN ('объем растет', 'аномальный объем')
-                THEN 'aligned'
-
-                -- noisy expansion
-                WHEN p.price_state_name IN ('широкий боковик')
-                 AND v.volume_state_name IN ('аномальный объем', 'всплеск объема')
-                THEN 'noisy expansion'
-
-                ELSE 'neutral'
-
-            END AS alignment_state
-
-        FROM market_research r
-
-        LEFT JOIN market_oi_slope s
-            ON r.exchange = s.exchange
-           AND r.symbol = s.symbol
-           AND r.timeframe = s.timeframe
-           AND r.ts_close = s.ts_close
-
-        LEFT JOIN market_price_state p
-            ON r.exchange = p.exchange
-           AND r.symbol = p.symbol
-           AND r.timeframe = p.timeframe
-           AND r.ts_close = p.ts_close
-
-        LEFT JOIN market_volume_state v
-            ON r.exchange = v.exchange
-           AND r.symbol = v.symbol
-           AND r.timeframe = v.timeframe
-           AND r.ts_close = v.ts_close
-
-        WHERE r.ts_close >= %s
-          AND r.market_state != 'invalid_data'
-
-        ORDER BY r.ts_close DESC
-    """, (since,))
+    metric_alignment = []
 
     oi_persistence = _safe_fetch("""
         WITH base AS (
@@ -904,6 +828,90 @@ def rebuild_exports(mode: str = "quick") -> Path:
             len([r for r in _rows(market_regime) if _v(r, "scenario") == "exhaustion"]),
         ],
     ]
+
+    oi_state_map = {
+        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
+        for r in _rows(market_oi_slope)
+    }
+
+    price_state_map = {
+        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
+        for r in _rows(market_price_state)
+    }
+
+    volume_state_map = {
+        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
+        for r in _rows(market_volume_state)
+    }
+
+    metric_alignment = []
+
+    for r in _rows(market_research):
+        if _v(r, "market_state") == "invalid_data":
+            continue
+
+        key = (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close"))
+
+        oi_row = oi_state_map.get(key)
+        price_row = price_state_map.get(key)
+        volume_row = volume_state_map.get(key)
+
+        oi_stage = _v(oi_row, "stage_name", "нет сигнала")
+        price_state_name = _v(price_row, "price_state_name", "")
+        volume_state_name = _v(volume_row, "volume_state_name", "")
+
+        if (
+            oi_stage in ("наблюдение", "возня")
+            and price_state_name in ("сжатие", "спокойный боковик")
+            and volume_state_name in ("обычный объем", "объем растет")
+        ):
+            alignment_state = "silent accumulation"
+
+        elif (
+            oi_stage in ("наблюдение", "возня")
+            and price_state_name == "импульс вниз"
+            and volume_state_name in ("аномальный объем", "всплеск объема")
+        ):
+            alignment_state = "conflicted"
+
+        elif (
+            oi_stage == "нет сигнала"
+            and price_state_name in ("импульс вверх", "импульс вниз")
+            and volume_state_name in ("аномальный объем", "всплеск объема")
+        ):
+            alignment_state = "exhausted"
+
+        elif (
+            oi_stage in ("наблюдение", "возня")
+            and price_state_name in ("импульс вверх", "импульс вниз")
+            and volume_state_name in ("объем растет", "аномальный объем")
+        ):
+            alignment_state = "aligned"
+
+        elif (
+            price_state_name == "широкий боковик"
+            and volume_state_name in ("аномальный объем", "всплеск объема")
+        ):
+            alignment_state = "noisy expansion"
+
+        else:
+            alignment_state = "neutral"
+
+        metric_alignment.append({
+            "exchange": _v(r, "exchange"),
+            "symbol": _v(r, "symbol"),
+            "timeframe": _v(r, "timeframe"),
+            "ts_close": _v(r, "ts_close"),
+            "oi_stage": oi_stage,
+            "price_state_name": price_state_name,
+            "volume_state_name": volume_state_name,
+            "market_state": _v(r, "market_state"),
+            "oi_delta_pct": _v(r, "oi_delta_pct", 0),
+            "price_delta_pct": _v(r, "price_delta_pct", 0),
+            "volume_delta_pct": _v(r, "volume_delta_pct", 0),
+            "range_width_pct": _v(r, "range_width_pct", 0),
+            "alignment_state": alignment_state,
+        })
 
     _write_csv(
         metric_alignment_path,
