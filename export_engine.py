@@ -1234,6 +1234,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         aggregates_path,
         audit_path,
         market_research_path,
+        market_silence_path,
         market_states_path,
         market_volume_state_path,
         volume_state_summary_path,
