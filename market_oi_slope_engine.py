@@ -56,7 +56,10 @@ def _normalize_strength(raw_strength):
     if raw_strength <= 0:
         return 0.0
 
-    normalized = 35.0 * math.log1p(raw_strength)
+    normalized = (
+        math.log1p(raw_strength)
+        / math.log1p(1000.0)
+    ) * 100.0
 
     return round(_clamp(normalized, 0.0, 100.0), 2)
 

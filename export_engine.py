@@ -91,12 +91,13 @@ def _fetch_top_oi_rows(since, timeframe: str, limit: int = 100):
         SELECT *
         FROM market_oi_slope
         WHERE timeframe = %s
-          AND ts_close = %s
+          AND ts_close >= %s - INTERVAL '60 minutes'
           AND stage >= 1
         ORDER BY
             stage DESC,
             strength DESC,
             raw_strength DESC,
+            ts_close DESC,
             exchange,
             symbol
         LIMIT %s
