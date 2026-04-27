@@ -5,3 +5,4 @@ __pycache__
 runtime/*.tmp
 exports/*.tmp
 logs/*.tmp
+runtime/
