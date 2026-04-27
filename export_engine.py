@@ -578,7 +578,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
                 r["strength_ge_95"],
                 r["strength_eq_100"],
             ]
-            for r in oi_slope_summary
+            for r in _rows(oi_slope_summary)
         ],
     )
 
