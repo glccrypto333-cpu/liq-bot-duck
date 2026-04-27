@@ -152,7 +152,6 @@ def _handle(text: str) -> None:
         send_message("pong")
 
     elif text == "/status":
-        _ensure_quick_exports()
         send_message(_build_status_text())
 
     elif text == "/manifest":
@@ -160,7 +159,6 @@ def _handle(text: str) -> None:
         send_document(ПАПКА_ДАННЫХ / "storage_manifest.txt", "manifest")
 
     elif text == "/bundle":
-        _ensure_quick_exports()
         send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "quick bundle")
 
     elif text == "/audit_report":
@@ -172,7 +170,6 @@ def _handle(text: str) -> None:
         send_document(ПАПКА_ДАННЫХ / "research_report.txt", "research report")
 
     elif text == "/reports":
-        _ensure_quick_exports()
         send_document(_build_runtime_reports_zip(), "runtime reports bundle")
 
     elif text == "/timing":
@@ -195,8 +192,7 @@ def _handle(text: str) -> None:
         send_document(ПАПКА_ДАННЫХ / "active_universe_report.csv", "active universe")
 
     elif text == "/export_quick":
-        send_message("Готовлю quick bundle...")
-        send_document(rebuild_exports("quick"), "quick bundle")
+        send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "quick bundle")
 
     elif text == "/export_research_7d":
         send_message("Готовлю research 7d bundle...")
