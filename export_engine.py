@@ -427,6 +427,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
     silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
     market_regime_path = ПАПКА_ДАННЫХ / "market_regime.csv"
     regime_states_path = ПАПКА_ДАННЫХ / "regime_states.csv"
+    engine_summary_path = ПАПКА_ДАННЫХ / "engine_summary.csv"
     coverage_path = ПАПКА_ДАННЫХ / "coverage_report.csv"
     gap_path = ПАПКА_ДАННЫХ / "gap_report.csv"
     manifest_path = ПАПКА_ДАННЫХ / "storage_manifest.txt"
@@ -642,6 +643,56 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ["calculated_at", "ts_close", "exchange", "symbol", "timeframe", "market_state", "scenario", "confidence", "reason", "oi_delta_pct", "price_delta_pct", "volume_delta_pct", "range_width_pct", "continuation_score", "exhaustion_score", "compression_score", "invalid_reason"],
         [[r["calculated_at"], r["ts_close"], r["exchange"], r["symbol"], r["timeframe"], r["market_state"], r["scenario"], r["confidence"], r["reason"], r["oi_delta_pct"], r["price_delta_pct"], r["volume_delta_pct"], r["range_width_pct"], r["continuation_score"], r["exhaustion_score"], r["compression_score"], r["invalid_reason"]] for r in market_regime],
     )
+
+    engine_summary = [
+        [
+            "market_silence",
+            len(_rows(market_silence)),
+            len([r for r in _rows(market_silence) if _v(r, "stage_name") == "тишина"]),
+            len([r for r in _rows(market_silence) if _v(r, "stage_name") == "сухой рынок"]),
+            None,
+            None,
+        ],
+        [
+            "market_price_state",
+            len(_rows(market_price_state)),
+            len([r for r in _rows(market_price_state) if _v(r, "price_state_name") == "сжатие"]),
+            len([r for r in _rows(market_price_state) if "импульс" in str(_v(r, "price_state_name", ""))]),
+            None,
+            None,
+        ],
+        [
+            "market_volume_state",
+            len(_rows(market_volume_state)),
+            len([r for r in _rows(market_volume_state) if _v(r, "noise_state") == "шум"]),
+            len([r for r in _rows(market_volume_state) if _v(r, "volume_state_name") == "аномальный объем"]),
+            round(sum(float(_v(r, "volume_percentile", 0) or 0) for r in _rows(market_volume_state)) / max(len(_rows(market_volume_state)), 1), 2),
+            None,
+        ],
+        [
+            "market_oi_slope",
+            len(_rows(market_oi_slope)),
+            len([r for r in _rows(market_oi_slope) if _v(r, "stage_name") == "наблюдение"]),
+            len([r for r in _rows(market_oi_slope) if _v(r, "stage_name") == "возня"]),
+            round(sum(float(_v(r, "strength", 0) or 0) for r in _rows(market_oi_slope)) / max(len(_rows(market_oi_slope)), 1), 2),
+            max([float(_v(r, "strength", 0) or 0) for r in _rows(market_oi_slope)] or [0]),
+        ],
+        [
+            "market_regime",
+            len(_rows(market_regime)),
+            len([r for r in _rows(market_regime) if _v(r, "scenario") == "compression"]),
+            len([r for r in _rows(market_regime) if _v(r, "scenario") == "continuation"]),
+            len([r for r in _rows(market_regime) if _v(r, "scenario") == "range"]),
+            len([r for r in _rows(market_regime) if _v(r, "scenario") == "exhaustion"]),
+        ],
+    ]
+
+    _write_csv(
+        engine_summary_path,
+        ["engine","rows","metric_a","metric_b","metric_c","metric_d"],
+        engine_summary,
+    )
+
 
     _write_csv(
         regime_states_path,
