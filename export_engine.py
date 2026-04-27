@@ -857,7 +857,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, engine_summary.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
             "timestamp_migration=active\n"
             "canonical_close=active\n"
             "contiguous_window_validation=active\n"
