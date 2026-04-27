@@ -119,7 +119,7 @@ def _continuation_score(oi, price, volume, alignment) -> float:
     oi_accel = abs(_num(oi, "oi_acceleration"))
     price_delta = abs(_num(price, "price_delta_pct"))
     volume_norm = _num(volume, "volume_normalized")
-    alignment_score = _num(alignment, "alignment_score")
+    alignment_score = _alignment_score(alignment)
 
     if oi_delta >= 5:
         score += 25
@@ -142,7 +142,7 @@ def _exhaustion_score(oi, price, volume, alignment) -> float:
     oi_accel = abs(_num(oi, "oi_acceleration"))
     price_delta = abs(_num(price, "price_delta_pct"))
     volume_norm = _num(volume, "volume_normalized")
-    alignment_score = _num(alignment, "alignment_score")
+    alignment_score = _alignment_score(alignment)
 
     if oi_delta >= 8 and price_delta < 1:
         score += 35
@@ -170,7 +170,7 @@ STAGE_ENGINE_RULES = [
     {
         "stage_engine_state": "continuation",
         "stage_engine_score": 90,
-        "min_alignment": 40,
+        "min_alignment": 25,
         "min_continuation": 70,
         "max_exhaustion": 40,
         "liquidity_event": 1,
@@ -218,7 +218,7 @@ def _stage_rule_match(rule: dict, alignment_score: float, continuation_score: fl
 
 
 def _stage_engine(oi, price, volume, alignment) -> dict:
-    alignment_score = _num(alignment, "alignment_score")
+    alignment_score = _alignment_score(alignment)
     continuation_score = _continuation_score(oi, price, volume, alignment)
     exhaustion_score = _exhaustion_score(oi, price, volume, alignment)
     liquidity_event_flag = _liquidity_event_flag(oi, price, volume, alignment)
@@ -242,6 +242,47 @@ def _stage_engine(oi, price, volume, alignment) -> dict:
         "stage_engine_score": 0,
         "stage_engine_reason": "no deterministic stage rule matched",
     }
+
+
+def _alignment_score_from_state(alignment) -> float:
+    state = str(_v(alignment, "alignment_state", "") or "").strip().lower()
+
+    scores = {
+        "strong continuation": 60,
+        "continuation": 45,
+        "bullish continuation": 45,
+        "bearish continuation": 45,
+        "noisy expansion": 45,
+        "expansion": 20,
+        "aligned": 45,
+        "silent accumulation": 15,
+        "neutral": 0,
+        "mixed": 0,
+        "range": -10,
+        "exhausted": -45,
+        "exhaustion": -45,
+        "bullish exhaustion": -45,
+        "bearish exhaustion": -45,
+        "failed continuation": -35,
+        "divergence": -35,
+    }
+
+    if state in scores:
+        return float(scores[state])
+
+    return 0.0
+
+
+def _alignment_score(alignment) -> float:
+    raw = _v(alignment, "alignment_score", None)
+
+    try:
+        if raw is not None and raw != "":
+            return float(raw)
+    except Exception:
+        pass
+
+    return _alignment_score_from_state(alignment)
 
 
 def rebuild_exports(mode: str = "quick") -> Path:
@@ -1212,7 +1253,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             _v(vr, "reason"),
 
             _v(ar, "alignment_state"),
-            _v(ar, "alignment_score"),
+            _alignment_score(ar),
             _v(ar, "reason"),
 
             _continuation_score(r, pr, vr, ar),
