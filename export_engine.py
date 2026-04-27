@@ -291,10 +291,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
         LIMIT 300
     """, (since,))
 
-    top_oi_15m = _fetch_top_oi_rows(since, "15m")
-    top_oi_30m = _fetch_top_oi_rows(since, "30m")
-    top_oi_1h = _fetch_top_oi_rows(since, "1h")
-    top_oi_4h = _fetch_top_oi_rows(since, "4h")
+    top_oi_15m = _fetch_top_oi_rows(since, "15м")
+    top_oi_30m = _fetch_top_oi_rows(since, "30м")
+    top_oi_1h = _fetch_top_oi_rows(since, "1ч")
+    top_oi_4h = _fetch_top_oi_rows(since, "4ч")
 
 
     oi_slope_summary = _safe_fetch("""
