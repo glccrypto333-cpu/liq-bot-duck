@@ -890,6 +890,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         oi_slope_summary_path,
         market_regime_path,
         regime_states_path,
+        engine_summary_path,
         coverage_path,
         gap_path,
         active_universe_path,
