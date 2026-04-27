@@ -21,28 +21,26 @@ def _safe_log_volume(v):
     return math.log1p(v)
 
 
-def _volume_percentile(volume_delta):
+def _volume_percentile(volume_delta, history):
     """
-    Грубая percentile-модель.
-    Позже заменим на real rolling percentile.
+    Настоящий исторический процентиль объема по своей монете.
+
+    Сравниваем текущий volume_delta_pct только с прошлой историей:
+    exchange + symbol + timeframe.
+
+    Если истории мало, возвращаем 30 как нейтральное значение,
+    чтобы не рисовать ложные всплески.
     """
 
-    if volume_delta >= 300:
-        return 99
+    clean_history = [float(x) for x in history if x is not None]
 
-    if volume_delta >= 150:
-        return 95
+    if len(clean_history) < 20:
+        return 30
 
-    if volume_delta >= 80:
-        return 90
+    current = float(volume_delta or 0.0)
+    less_or_equal = sum(1 for x in clean_history if x <= current)
 
-    if volume_delta >= 40:
-        return 75
-
-    if volume_delta >= 20:
-        return 60
-
-    return 30
+    return int(round((less_or_equal / len(clean_history)) * 100))
 
 
 def _noise_state(range_width, volume_delta, oi_delta):
@@ -60,13 +58,11 @@ def _noise_state(range_width, volume_delta, oi_delta):
 
 
 
-def _volume_state(volume_delta):
+def _volume_state_by_percentile(volume_delta, percentile):
     """
     Объем НЕ является сигналом.
     Он описывает участие рынка.
     """
-
-    percentile = _volume_percentile(volume_delta)
 
     if percentile >= 99:
         return 4, "аномальный объем", "экстремальный всплеск участия"
@@ -102,17 +98,20 @@ def rebuild_volume_state() -> int:
 
     out = []
     calculated_at = datetime.now(timezone.utc)
+    history_by_key = {}
 
     for r in rows:
         volume_delta = _f(r["volume_delta_pct"])
         oi_delta = _f(r.get("oi_delta_pct"))
         range_width = _f(r.get("range_width_pct"))
+        key = (r["exchange"], r["symbol"], r["timeframe"])
+        history = history_by_key.get(key, [])
 
         normalized_volume = _safe_log_volume(volume_delta)
-        percentile = _volume_percentile(volume_delta)
+        percentile = _volume_percentile(volume_delta, history)
         noise_state = _noise_state(range_width, volume_delta, oi_delta)
 
-        state, state_name, reason = _volume_state(volume_delta)
+        state, state_name, reason = _volume_state_by_percentile(volume_delta, percentile)
 
         out.append((
             calculated_at,
@@ -130,6 +129,8 @@ def rebuild_volume_state() -> int:
             r["market_state"],
             r["invalid_reason"],
         ))
+
+        history_by_key.setdefault(key, []).append(volume_delta)
 
     replace_volume_state(out)
 
