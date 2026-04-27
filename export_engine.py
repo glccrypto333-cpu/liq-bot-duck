@@ -1054,6 +1054,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             _v(r, "reason"),
 
             _v(pr, "price_delta_pct"),
+            _v(pr, "price_delta_pct"),
             _v(pr, "range_width_pct"),
             _v(pr, "price_state"),
             _v(pr, "price_state_name"),
@@ -1095,6 +1096,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             "oi_engine_reason",
 
             "price_delta_pct",
+            "price_slope_pct",
             "price_range_width_pct",
             "price_state",
             "price_state_name",
