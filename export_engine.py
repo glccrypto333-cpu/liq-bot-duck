@@ -1025,11 +1025,16 @@ def rebuild_exports(mode: str = "quick") -> Path:
         (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
         for r in _rows(market_volume_state)
     }
+    alignment_by_key = {
+        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
+        for r in _rows(metric_alignment)
+    }
 
     for r in _rows(market_oi_slope):
         key = (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close"))
         pr = price_by_key.get(key, {})
         vr = volume_by_key.get(key, {})
+        ar = alignment_by_key.get(key, {})
 
         stage_metrics_rows.append([
             _v(r, "calculated_at"),
@@ -1061,6 +1066,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
             _v(vr, "volume_state"),
             _v(vr, "volume_state_name"),
             _v(vr, "reason"),
+
+            _v(ar, "alignment_state"),
+            _v(ar, "alignment_score"),
+            _v(ar, "reason"),
 
             _v(r, "silence_stage"),
             _v(r, "silence_stage_name"),
@@ -1098,6 +1107,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
             "volume_state",
             "volume_state_name",
             "volume_reason",
+
+            "alignment_state",
+            "alignment_score",
+            "alignment_reason",
 
             "silence_stage",
             "silence_stage_name",
