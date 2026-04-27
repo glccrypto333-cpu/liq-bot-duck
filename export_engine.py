@@ -331,6 +331,119 @@ def rebuild_exports(mode: str = "quick") -> Path:
             rows_count DESC
     """, (since,))
 
+    oi_persistence = _safe_fetch("""
+        WITH base AS (
+            SELECT
+                exchange,
+                symbol,
+                timeframe,
+                ts_close,
+                oi_delta_pct,
+                oi_acceleration,
+
+                CASE
+                    WHEN oi_delta_pct > 0 THEN 1
+                    ELSE 0
+                END AS positive_flag
+
+            FROM market_oi_slope
+            WHERE ts_close >= %s
+              AND stage_name != 'нет сигнала'
+        ),
+
+        grouped AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY exchange, symbol, timeframe
+                    ORDER BY ts_close
+                )
+                -
+                ROW_NUMBER() OVER (
+                    PARTITION BY exchange, symbol, timeframe, positive_flag
+                    ORDER BY ts_close
+                ) AS grp
+            FROM base
+        )
+
+        SELECT
+            exchange,
+            symbol,
+            timeframe,
+            MAX(ts_close) AS ts_close,
+
+            COUNT(*) FILTER (
+                WHERE positive_flag = 1
+            ) AS positive_oi_windows,
+
+            ROUND(
+                SUM(
+                    CASE
+                        WHEN positive_flag = 1
+                        THEN oi_delta_pct
+                        ELSE 0
+                    END
+                )::numeric,
+                4
+            ) AS cumulative_oi_delta_pct,
+
+            ROUND(
+                AVG(
+                    CASE
+                        WHEN positive_flag = 1
+                        THEN oi_delta_pct
+                    END
+                )::numeric,
+                4
+            ) AS avg_oi_delta_pct,
+
+            ROUND(
+                AVG(
+                    CASE
+                        WHEN positive_flag = 1
+                        THEN oi_acceleration
+                    END
+                )::numeric,
+                4
+            ) AS avg_oi_acceleration,
+
+            CASE
+                WHEN COUNT(*) FILTER (
+                    WHERE positive_flag = 1
+                ) >= 6
+                AND SUM(
+                    CASE
+                        WHEN positive_flag = 1
+                        THEN oi_delta_pct
+                        ELSE 0
+                    END
+                ) >= 15
+                THEN 'устойчивый набор'
+
+                WHEN COUNT(*) FILTER (
+                    WHERE positive_flag = 1
+                ) >= 3
+                AND AVG(
+                    CASE
+                        WHEN positive_flag = 1
+                        THEN oi_acceleration
+                    END
+                ) >= 0.5
+                THEN 'ступенчатый набор'
+
+                WHEN COUNT(*) FILTER (
+                    WHERE positive_flag = 1
+                ) >= 1
+                THEN 'локальный всплеск'
+
+                ELSE 'нет набора'
+            END AS persistence_state
+
+        FROM grouped
+        GROUP BY exchange, symbol, timeframe, grp
+        ORDER BY ts_close DESC
+    """, (since,))
+
     symbol_baseline = _safe_fetch("""
         SELECT
             exchange,
@@ -453,6 +566,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
     engine_summary_path = ПАПКА_ДАННЫХ / "engine_summary.csv"
     stage_calibration_template_path = ПАПКА_ДАННЫХ / "stage_calibration_template.csv"
     symbol_baseline_path = ПАПКА_ДАННЫХ / "symbol_baseline.csv"
+    oi_persistence_path = ПАПКА_ДАННЫХ / "oi_persistence.csv"
     coverage_path = ПАПКА_ДАННЫХ / "coverage_report.csv"
     gap_path = ПАПКА_ДАННЫХ / "gap_report.csv"
     manifest_path = ПАПКА_ДАННЫХ / "storage_manifest.txt"
@@ -713,6 +827,35 @@ def rebuild_exports(mode: str = "quick") -> Path:
     ]
 
     _write_csv(
+        oi_persistence_path,
+        [
+            "exchange",
+            "symbol",
+            "timeframe",
+            "ts_close",
+            "positive_oi_windows",
+            "cumulative_oi_delta_pct",
+            "avg_oi_delta_pct",
+            "avg_oi_acceleration",
+            "persistence_state",
+        ],
+        [
+            [
+                _v(r, "exchange"),
+                _v(r, "symbol"),
+                _v(r, "timeframe"),
+                _v(r, "ts_close"),
+                _v(r, "positive_oi_windows", 0),
+                _v(r, "cumulative_oi_delta_pct", 0),
+                _v(r, "avg_oi_delta_pct", 0),
+                _v(r, "avg_oi_acceleration", 0),
+                _v(r, "persistence_state"),
+            ]
+            for r in _rows(oi_persistence)
+        ],
+    )
+
+    _write_csv(
         symbol_baseline_path,
         [
             "exchange",
@@ -947,7 +1090,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, engine_summary.csv, stage_calibration_template.csv, symbol_baseline.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, engine_summary.csv, stage_calibration_template.csv, symbol_baseline.csv, oi_persistence.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
             "timestamp_migration=active\n"
             "canonical_close=active\n"
             "contiguous_window_validation=active\n"
@@ -983,6 +1126,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         engine_summary_path,
         stage_calibration_template_path,
         symbol_baseline_path,
+        oi_persistence_path,
         coverage_path,
         gap_path,
         active_universe_path,
