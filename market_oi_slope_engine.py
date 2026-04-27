@@ -46,8 +46,8 @@ def _normalize_strength(raw_strength):
     strength is only a ranking score, not a trade signal.
 
     Goal:
-    - remove fast saturation
-    - keep early OI interest visible
+    - remove top saturation
+    - preserve candidate separation
     - make 100 a rare extreme event
     """
 
@@ -56,15 +56,7 @@ def _normalize_strength(raw_strength):
     if raw_strength <= 0:
         return 0.0
 
-    # Logarithmic compression:
-    # - preserves low-end spread
-    # - slows saturation
-    # - keeps 100 as a rare extreme event
-    # - raw_strength remains diagnostic
-    normalized = (
-        math.log1p(raw_strength)
-        / math.log1p(400.0)
-    ) * 100.0
+    normalized = 35.0 * math.log1p(raw_strength)
 
     return round(_clamp(normalized, 0.0, 100.0), 2)
 
