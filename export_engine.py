@@ -105,6 +105,67 @@ def _fetch_top_oi_rows(since, timeframe: str, limit: int = 100):
     """, (timeframe, latest_ts, limit))
 
 
+def _num(row, key: str, default: float = 0.0) -> float:
+    try:
+        return float(_v(row, key, default) or default)
+    except Exception:
+        return default
+
+
+def _continuation_score(oi, price, volume, alignment) -> float:
+    score = 0.0
+
+    oi_delta = abs(_num(oi, "oi_delta_pct"))
+    oi_accel = abs(_num(oi, "oi_acceleration"))
+    price_delta = abs(_num(price, "price_delta_pct"))
+    volume_norm = _num(volume, "volume_normalized")
+    alignment_score = _num(alignment, "alignment_score")
+
+    if oi_delta >= 5:
+        score += 25
+    if oi_accel >= 3:
+        score += 25
+    if price_delta >= 2:
+        score += 20
+    if volume_norm >= 2:
+        score += 15
+    if alignment_score > 0:
+        score += min(alignment_score, 15)
+
+    return round(min(score, 100), 2)
+
+
+def _exhaustion_score(oi, price, volume, alignment) -> float:
+    score = 0.0
+
+    oi_delta = abs(_num(oi, "oi_delta_pct"))
+    oi_accel = abs(_num(oi, "oi_acceleration"))
+    price_delta = abs(_num(price, "price_delta_pct"))
+    volume_norm = _num(volume, "volume_normalized")
+    alignment_score = _num(alignment, "alignment_score")
+
+    if oi_delta >= 8 and price_delta < 1:
+        score += 35
+    if oi_accel >= 5 and price_delta < 1.5:
+        score += 25
+    if volume_norm >= 2 and price_delta < 1:
+        score += 20
+    if alignment_score < 0:
+        score += min(abs(alignment_score), 20)
+
+    return round(min(score, 100), 2)
+
+
+def _liquidity_event_flag(oi, price, volume, alignment) -> int:
+    continuation = _continuation_score(oi, price, volume, alignment)
+    exhaustion = _exhaustion_score(oi, price, volume, alignment)
+
+    if continuation >= 60 or exhaustion >= 60:
+        return 1
+
+    return 0
+
+
 def rebuild_exports(mode: str = "quick") -> Path:
     now = datetime.now(timezone.utc)
 
@@ -1074,6 +1135,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
             _v(ar, "alignment_score"),
             _v(ar, "reason"),
 
+            _continuation_score(r, pr, vr, ar),
+            _exhaustion_score(r, pr, vr, ar),
+            _liquidity_event_flag(r, pr, vr, ar),
+
             _v(r, "silence_stage"),
             _v(r, "silence_stage_name"),
         ])
@@ -1117,6 +1182,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
             "alignment_state",
             "alignment_score",
             "alignment_reason",
+
+            "continuation_score",
+            "exhaustion_score",
+            "liquidity_event_flag",
 
             "silence_stage",
             "silence_stage_name",
