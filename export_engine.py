@@ -549,6 +549,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
     _write_csv(
         top_oi_4h_path,
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_4h)],
+    )
+
     _write_csv(
         oi_slope_summary_path,
         [
@@ -580,10 +584,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
             ]
             for r in _rows(oi_slope_summary)
         ],
-    )
-
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_4h)],
     )
 
     _write_csv(
