@@ -982,6 +982,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         regime_states_path,
         engine_summary_path,
         stage_calibration_template_path,
+        symbol_baseline_path,
         coverage_path,
         gap_path,
         active_universe_path,
