@@ -566,17 +566,17 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ],
         [
             [
-                r["exchange"],
-                r["timeframe"],
-                r["stage_name"],
-                r["oi_quality"],
-                r["rows_count"],
-                r["min_strength"],
-                r["avg_strength"],
-                r["max_strength"],
-                r["avg_raw_strength"],
-                r["strength_ge_95"],
-                r["strength_eq_100"],
+                _v(r, "exchange"),
+                _v(r, "timeframe"),
+                _v(r, "stage_name"),
+                _v(r, "oi_quality"),
+                _v(r, "rows_count", 0),
+                _v(r, "min_strength", 0),
+                _v(r, "avg_strength", 0),
+                _v(r, "max_strength", 0),
+                _v(r, "avg_raw_strength", 0),
+                _v(r, "strength_ge_95", 0),
+                _v(r, "strength_eq_100", 0),
             ]
             for r in _rows(oi_slope_summary)
         ],
