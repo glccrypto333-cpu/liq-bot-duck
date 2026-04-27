@@ -571,6 +571,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
     symbol_baseline_path = ПАПКА_ДАННЫХ / "symbol_baseline.csv"
     oi_persistence_path = ПАПКА_ДАННЫХ / "oi_persistence.csv"
     metric_alignment_path = ПАПКА_ДАННЫХ / "metric_alignment.csv"
+    stage_metrics_table_path = ПАПКА_ДАННЫХ / "stage_metrics_table.csv"
     coverage_path = ПАПКА_ДАННЫХ / "coverage_report.csv"
     gap_path = ПАПКА_ДАННЫХ / "gap_report.csv"
     manifest_path = ПАПКА_ДАННЫХ / "storage_manifest.txt"
@@ -1015,6 +1016,95 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ],
     )
 
+    stage_metrics_rows = []
+    price_by_key = {
+        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
+        for r in _rows(market_price_state)
+    }
+    volume_by_key = {
+        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
+        for r in _rows(market_volume_state)
+    }
+
+    for r in _rows(market_oi_slope):
+        key = (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close"))
+        pr = price_by_key.get(key, {})
+        vr = volume_by_key.get(key, {})
+
+        stage_metrics_rows.append([
+            _v(r, "calculated_at"),
+            _v(r, "ts_close"),
+            _v(r, "exchange"),
+            _v(r, "symbol"),
+            _v(r, "timeframe"),
+
+            _v(r, "oi_delta_pct"),
+            _v(r, "oi_acceleration"),
+            _v(r, "oi_prev_avg"),
+            _v(r, "raw_strength"),
+            _v(r, "strength"),
+            _v(r, "oi_quality"),
+            _v(r, "stage"),
+            _v(r, "stage_name"),
+            _v(r, "reason"),
+
+            _v(pr, "price_delta_pct"),
+            _v(pr, "range_width_pct"),
+            _v(pr, "price_state"),
+            _v(pr, "price_state_name"),
+            _v(pr, "reason"),
+
+            _v(vr, "volume_delta_pct"),
+            _v(vr, "normalized_volume"),
+            _v(vr, "volume_percentile"),
+            _v(vr, "noise_state"),
+            _v(vr, "volume_state"),
+            _v(vr, "volume_state_name"),
+            _v(vr, "reason"),
+
+            _v(r, "silence_stage"),
+            _v(r, "silence_stage_name"),
+        ])
+
+    _write_csv(
+        stage_metrics_table_path,
+        [
+            "calculated_at",
+            "ts_close",
+            "exchange",
+            "symbol",
+            "timeframe",
+
+            "oi_delta_pct",
+            "oi_acceleration",
+            "oi_prev_avg",
+            "oi_raw_strength",
+            "oi_strength",
+            "oi_quality",
+            "oi_engine_stage",
+            "oi_engine_stage_name",
+            "oi_engine_reason",
+
+            "price_delta_pct",
+            "price_range_width_pct",
+            "price_state",
+            "price_state_name",
+            "price_reason",
+
+            "volume_delta_pct",
+            "volume_normalized",
+            "volume_percentile",
+            "volume_noise_state",
+            "volume_state",
+            "volume_state_name",
+            "volume_reason",
+
+            "silence_stage",
+            "silence_stage_name",
+        ],
+        stage_metrics_rows,
+    )
+
     _write_csv(
         stage_calibration_template_path,
         [
@@ -1215,7 +1305,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, engine_summary.csv, stage_calibration_template.csv, symbol_baseline.csv, oi_persistence.csv, metric_alignment.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, engine_summary.csv, stage_calibration_template.csv, stage_metrics_table.csv, symbol_baseline.csv, oi_persistence.csv, metric_alignment.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
             "timestamp_migration=active\n"
             "canonical_close=active\n"
             "contiguous_window_validation=active\n"
@@ -1251,6 +1341,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         regime_states_path,
         engine_summary_path,
         stage_calibration_template_path,
+        stage_metrics_table_path,
         symbol_baseline_path,
         oi_persistence_path,
         metric_alignment_path,
