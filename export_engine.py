@@ -80,6 +80,7 @@ def _fetch_top_oi_rows(since, timeframe: str, limit: int = 100):
         SELECT MAX(ts_close) AS max_ts
         FROM market_oi_slope
         WHERE timeframe = %s
+          AND stage >= 1
     """, (timeframe,))
 
     latest_ts = _v(latest[0], "max_ts") if latest else None
