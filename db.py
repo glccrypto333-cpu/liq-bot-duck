@@ -4,8 +4,22 @@ from psycopg.rows import dict_row
 from config import DATABASE_URL
 from logger import log
 
+_DB_CONN = None
+
 def _conn():
-    return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+    global _DB_CONN
+
+    if _DB_CONN is not None and not _DB_CONN.closed:
+        return _DB_CONN
+
+    _DB_CONN = psycopg.connect(
+        DATABASE_URL,
+        autocommit=True,
+        row_factory=dict_row,
+        connect_timeout=5,
+        options="-c statement_timeout=15000",
+    )
+    return _DB_CONN
 
 def init_db() -> None:
     if not DATABASE_URL:
