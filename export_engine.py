@@ -532,19 +532,19 @@ def rebuild_exports(mode: str = "quick") -> Path:
     _write_csv(
         top_oi_15m_path,
         ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in top_oi_15m],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_15m)],
     )
 
     _write_csv(
         top_oi_30m_path,
         ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in top_oi_30m],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_30m)],
     )
 
     _write_csv(
         top_oi_1h_path,
         ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in top_oi_1h],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_1h)],
     )
 
     _write_csv(
@@ -583,13 +583,13 @@ def rebuild_exports(mode: str = "quick") -> Path:
     )
 
         ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in top_oi_4h],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_4h)],
     )
 
     _write_csv(
         oi_slope_top_path,
         ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage_name"]] for r in oi_slope_top],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(oi_slope_top)],
     )
 
     oi_groups = {}
