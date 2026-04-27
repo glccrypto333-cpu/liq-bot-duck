@@ -166,6 +166,84 @@ def _liquidity_event_flag(oi, price, volume, alignment) -> int:
     return 0
 
 
+STAGE_ENGINE_RULES = [
+    {
+        "stage_engine_state": "continuation",
+        "stage_engine_score": 90,
+        "min_alignment": 40,
+        "min_continuation": 70,
+        "max_exhaustion": 40,
+        "liquidity_event": 1,
+        "reason": "alignment confirms continuation: OI expansion + price/volume follow-through",
+    },
+    {
+        "stage_engine_state": "exhaustion",
+        "stage_engine_score": 85,
+        "max_alignment": -20,
+        "min_exhaustion": 60,
+        "reason": "exhaustion: OI/volume expanded but price failed to continue",
+    },
+    {
+        "stage_engine_state": "range",
+        "stage_engine_score": 70,
+        "min_exhaustion": 45,
+        "max_continuation": 55,
+        "reason": "range candidate: liquidity event without clean continuation",
+    },
+    {
+        "stage_engine_state": "watch",
+        "stage_engine_score": 45,
+        "min_continuation": 35,
+        "reason": "watch: partial activity, no deterministic regime confirmation",
+    },
+]
+
+
+def _stage_rule_match(rule: dict, alignment_score: float, continuation_score: float, exhaustion_score: float, liquidity_event_flag: int) -> bool:
+    if "min_alignment" in rule and alignment_score < rule["min_alignment"]:
+        return False
+    if "max_alignment" in rule and alignment_score > rule["max_alignment"]:
+        return False
+    if "min_continuation" in rule and continuation_score < rule["min_continuation"]:
+        return False
+    if "max_continuation" in rule and continuation_score > rule["max_continuation"]:
+        return False
+    if "min_exhaustion" in rule and exhaustion_score < rule["min_exhaustion"]:
+        return False
+    if "max_exhaustion" in rule and exhaustion_score > rule["max_exhaustion"]:
+        return False
+    if "liquidity_event" in rule and liquidity_event_flag != rule["liquidity_event"]:
+        return False
+    return True
+
+
+def _stage_engine(oi, price, volume, alignment) -> dict:
+    alignment_score = _num(alignment, "alignment_score")
+    continuation_score = _continuation_score(oi, price, volume, alignment)
+    exhaustion_score = _exhaustion_score(oi, price, volume, alignment)
+    liquidity_event_flag = _liquidity_event_flag(oi, price, volume, alignment)
+
+    for rule in STAGE_ENGINE_RULES:
+        if _stage_rule_match(
+            rule,
+            alignment_score,
+            continuation_score,
+            exhaustion_score,
+            liquidity_event_flag,
+        ):
+            return {
+                "stage_engine_state": rule["stage_engine_state"],
+                "stage_engine_score": rule["stage_engine_score"],
+                "stage_engine_reason": rule["reason"],
+            }
+
+    return {
+        "stage_engine_state": "neutral",
+        "stage_engine_score": 0,
+        "stage_engine_reason": "no deterministic stage rule matched",
+    }
+
+
 def rebuild_exports(mode: str = "quick") -> Path:
     now = datetime.now(timezone.utc)
 
@@ -1097,6 +1175,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
         vr = volume_by_key.get(key, {})
         ar = alignment_by_key.get(key, {})
 
+        se = _stage_engine(r, pr, vr, ar)
+
         stage_metrics_rows.append([
             _v(r, "calculated_at"),
             _v(r, "ts_close"),
@@ -1138,6 +1218,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
             _continuation_score(r, pr, vr, ar),
             _exhaustion_score(r, pr, vr, ar),
             _liquidity_event_flag(r, pr, vr, ar),
+
+            se["stage_engine_state"],
+            se["stage_engine_score"],
+            se["stage_engine_reason"],
 
             _v(r, "silence_stage"),
             _v(r, "silence_stage_name"),
@@ -1186,6 +1270,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
             "continuation_score",
             "exhaustion_score",
             "liquidity_event_flag",
+
+            "stage_engine_state",
+            "stage_engine_score",
+            "stage_engine_reason",
 
             "silence_stage",
             "silence_stage_name",
