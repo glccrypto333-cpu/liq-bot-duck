@@ -53,6 +53,10 @@ def _v(row, key: str, default=None):
             return default
 
 
+def _rows(rows):
+    return [row for row in (rows or []) if row is not None]
+
+
 def _runtime_memory_mb() -> float:
     try:
         # macOS returns bytes, Linux returns KB. Railway/Linux will be KB.
@@ -644,10 +648,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
         [[r["exchange"], r["symbol"], r["timeframe"], r["scenario"], r["confidence"], r["scenario_count"], r["avg_continuation_score"], r["avg_exhaustion_score"], r["avg_compression_score"]] for r in regime_states],
     )
 
-    invalid = [r for r in audit if r["validation_status"] != "валидно"]
-    critical_coverage = [r for r in coverage if r["quality_status"] == "critical"]
-    warning_coverage = [r for r in coverage if r["quality_status"] == "warning"]
-    invalid_data_states = [r for r in market_states if r["market_state"] == "invalid_data"]
+    invalid = [r for r in _rows(audit) if r["validation_status"] != "валидно"]
+    critical_coverage = [r for r in _rows(coverage) if r["quality_status"] == "critical"]
+    warning_coverage = [r for r in _rows(coverage) if r["quality_status"] == "warning"]
+    invalid_data_states = [r for r in _rows(market_states) if r["market_state"] == "invalid_data"]
 
     audit_lines = [
         f"Mighty Duck {APP_VERSION}",

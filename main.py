@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 import threading
+import traceback
 from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -144,6 +145,7 @@ def background(bybit_symbols, binance_symbols):
 
         except Exception as exc:
             log(f"canonical validation cycle error: {type(exc).__name__}: {exc}")
+            log(traceback.format_exc())
 
         time.sleep(ИНТЕРВАЛ_ЦИКЛА_СЕК)
 
