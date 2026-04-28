@@ -149,7 +149,7 @@ def _decide_phase(prev_phase: int, row) -> tuple[int, str]:
     return 0, "no_valid_phase_conditions"
 
 
-def rebuild_market_phase() -> None:
+def rebuild_market_phase() -> int:
     now = datetime.now(timezone.utc)
 
     rows = fetch("""
@@ -286,3 +286,4 @@ def rebuild_market_phase() -> None:
     replace_market_phase(phase_rows)
     insert_market_phase_history(history_rows)
     print(f"market phase rebuilt: rows={len(phase_rows)} transitions={len(history_rows)}")
+    return len(phase_rows)
