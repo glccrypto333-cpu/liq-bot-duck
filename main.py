@@ -84,7 +84,7 @@ def collect(symbols_bybit, symbols_binance):
         except Exception as exc:
             record_failure("BYBIT", s, "PRICE_VOLUME", exc)
 
-    for s in symbols_binance[:ЛИМИТ_СИМВОЛОВ_BINANCE]:
+    for s in (symbols_binance if ЛИМИТ_СИМВОЛОВ_BINANCE <= 0 else symbols_binance[:ЛИМИТ_СИМВОЛОВ_BINANCE]):
         try:
             oi_rows.extend(fetch_binance_oi_5m(s, 200))
         except Exception as exc:
@@ -176,10 +176,16 @@ def main():
         if ("BYBIT", s) not in bad_symbols
     ][:ЛИМИТ_СИМВОЛОВ_BYBIT]
 
-    binance_symbols = [
+    binance_symbols_filtered = [
         s for s in binance_symbols_all
         if ("BINANCE", s) not in bad_symbols
-    ][:ЛИМИТ_СИМВОЛОВ_BINANCE]
+    ]
+
+    binance_symbols = (
+        binance_symbols_filtered
+        if ЛИМИТ_СИМВОЛОВ_BINANCE <= 0
+        else binance_symbols_filtered[:ЛИМИТ_СИМВОЛОВ_BINANCE]
+    )
 
     active_universe = (
         [("BYBIT", s, "runtime_limit_quarantine_filtered") for s in bybit_symbols] +
