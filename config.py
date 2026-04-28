@@ -6,8 +6,9 @@ APP_VERSION = "v3.5.4"
 ИНТЕРВАЛ_ЦИКЛА_СЕК = int(os.getenv("COLLECT_INTERVAL_SECONDS", "180"))
 ДНЕЙ_ХРАНЕНИЯ = int(os.getenv("RETENTION_DAYS", "30"))
 
-ЛИМИТ_СИМВОЛОВ_BYBIT = int(os.getenv("LIMIT_SYMBOLS_BYBIT", "20"))
-ЛИМИТ_СИМВОЛОВ_BINANCE = int(os.getenv("LIMIT_SYMBOLS_BINANCE", "20"))
+ЛИМИТ_СИМВОЛОВ_BYBIT = int(os.getenv("LIMIT_SYMBOLS_BYBIT", "0"))
+ЛИМИТ_СИМВОЛОВ_BINANCE = int(os.getenv("LIMIT_SYMBOLS_BINANCE", "100"))
+BINANCE_UNIVERSE_SKIP_TOP = int(os.getenv("BINANCE_UNIVERSE_SKIP_TOP", "50"))
 
 QUICK_EXPORT_CANDLES = int(os.getenv("QUICK_EXPORT_CANDLES", "96"))
 RESEARCH_EXPORT_DAYS = int(os.getenv("RESEARCH_EXPORT_DAYS", "7"))

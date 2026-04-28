@@ -2,7 +2,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone, timedelta
 import requests
-from config import BYBIT_BASE, BINANCE_BASE
+from config import BYBIT_BASE, BINANCE_BASE, BINANCE_UNIVERSE_SKIP_TOP
 
 UA = {"User-Agent": "Mozilla/5.0 MightyDuck/1.0"}
 
@@ -32,8 +32,36 @@ def fetch_bybit_symbols() -> list[str]:
     return [x["symbol"] for x in data.get("result", {}).get("list", []) if x.get("status") == "Trading" and x.get("quoteCoin") == "USDT"]
 
 def fetch_binance_symbols() -> list[str]:
-    data = _get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo")
-    return [x["symbol"] for x in data.get("symbols", []) if x.get("status") == "TRADING" and x.get("quoteAsset") == "USDT"]
+    """
+    Active universe rule:
+    - Binance USDT perpetuals only
+    - sort by 24h quoteVolume
+    - skip TOP-50
+    - runtime limit is applied in main.py
+    """
+    exchange_info = _get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo")
+    allowed = {
+        x["symbol"]
+        for x in exchange_info.get("symbols", [])
+        if x.get("status") == "TRADING"
+        and x.get("quoteAsset") == "USDT"
+        and x.get("contractType") == "PERPETUAL"
+    }
+
+    tickers = _get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr")
+    rows = []
+    for item in tickers if isinstance(tickers, list) else []:
+        symbol = item.get("symbol")
+        if symbol not in allowed:
+            continue
+        try:
+            quote_volume = float(item.get("quoteVolume", 0) or 0)
+        except (TypeError, ValueError):
+            quote_volume = 0.0
+        rows.append((quote_volume, symbol))
+
+    rows.sort(reverse=True)
+    return [symbol for _, symbol in rows[BINANCE_UNIVERSE_SKIP_TOP:]]
 
 def fetch_bybit_oi_5m(symbol: str, limit: int = 200) -> list[tuple]:
     data = _get(

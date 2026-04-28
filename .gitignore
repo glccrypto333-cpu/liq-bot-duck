@@ -7,3 +7,5 @@ exports/*.tmp
 logs/*.tmp
 runtime/
 .DS_Store
+
+.venv/
