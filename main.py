@@ -208,7 +208,13 @@ def background(bybit_symbols, binance_symbols):
             log(f"canonical validation cycle error: {type(exc).__name__}: {exc}")
             log(traceback.format_exc())
 
-        time.sleep(ИНТЕРВАЛ_ЦИКЛА_СЕК)
+        elapsed = time.time() - cycle_started
+        sleep_seconds = max(0, ИНТЕРВАЛ_ЦИКЛА_СЕК - elapsed)
+        log(
+            f"cycle schedule: target={ИНТЕРВАЛ_ЦИКЛА_СЕК}s "
+            f"elapsed={elapsed:.2f}s sleep={sleep_seconds:.2f}s"
+        )
+        time.sleep(sleep_seconds)
 
 
 def main():
