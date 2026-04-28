@@ -822,8 +822,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
     _write_csv(
         market_price_state_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","price_state","price_state_name","reason","price_delta_pct","range_width_pct","market_state","invalid_reason"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["price_state"],r["price_state_name"],r["reason"],r["price_delta_pct"],r["range_width_pct"],r["market_state"],r["invalid_reason"]] for r in market_price_state],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","price_state","price_state_name","price_structure","price_quality","price_slope_state","price_trend_24h","price_range_from_median_pct","price_reason","reason","price_delta_pct","range_width_pct","market_state","invalid_reason"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["price_state"],r["price_state_name"],_v(r,"price_structure"),_v(r,"price_quality"),_v(r,"price_slope_state"),_v(r,"price_trend_24h"),_v(r,"price_range_from_median_pct"),_v(r,"price_reason"),r["reason"],r["price_delta_pct"],r["range_width_pct"],r["market_state"],r["invalid_reason"]] for r in market_price_state],
     )
 
     _write_csv(
