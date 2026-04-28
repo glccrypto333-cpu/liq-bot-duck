@@ -1,5 +1,8 @@
 from __future__ import annotations
 import time
+import os
+import sys
+import resource
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import traceback
@@ -56,6 +59,17 @@ def _write_runtime_timing_report(timings: list[tuple[str, float]]) -> None:
         lines.append(f"{name},{round(seconds, 2)}")
 
     (runtime_dir / "runtime_timing_report.txt").write_text("\n".join(lines) + "\n")
+
+
+
+def _runtime_memory_mb() -> float:
+    try:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return rss / 1024 / 1024
+        return rss / 1024
+    except Exception:
+        return 0.0
 
 
 def _timed_step(timings: list[tuple[str, float]], name: str, fn):
@@ -139,7 +153,9 @@ def collect(symbols_bybit, symbols_binance):
 
     log(
         f"collect ok: oi={len(oi_rows)} price={len(price_rows)} volume={len(volume_rows)} "
-        f"request_failures={len(failures)}"
+        f"request_failures={len(failures)} "
+        f"binance_symbols={len(binance_collect_symbols)} "
+        f"binance_workers={workers}"
     )
 
 
@@ -171,6 +187,13 @@ def background(bybit_symbols, binance_symbols):
 
             timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
             log(f"cycle timing: {timing_text}")
+            log(
+                f"cycle resource: pid={os.getpid()} "
+                f"memory_max_rss_mb={_runtime_memory_mb():.2f} "
+                f"bybit_symbols={len(bybit_symbols)} "
+                f"binance_symbols={len(binance_symbols)} "
+                f"binance_workers={BINANCE_COLLECT_WORKERS}"
+            )
 
             _write_runtime_timing_report(timings)
 
