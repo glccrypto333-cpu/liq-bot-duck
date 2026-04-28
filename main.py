@@ -75,7 +75,12 @@ def _runtime_memory_mb() -> float:
 def _timed_step(timings: list[tuple[str, float]], name: str, fn):
     started = time.time()
     result = fn()
-    timings.append((name, time.time() - started))
+    elapsed = time.time() - started
+    timings.append((name, elapsed))
+    log(
+        f"step resource: {name}={elapsed:.2f}s "
+        f"memory_max_rss_mb={_runtime_memory_mb():.2f}"
+    )
     return result
 
 
