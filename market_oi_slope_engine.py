@@ -54,20 +54,26 @@ def _trend_from_delta(delta: float) -> str:
 def _oi_structure(oi_delta: float, acceleration: float, prev_avg: float) -> str:
     if oi_delta < -1:
         return "нисходящий OI"
-    if oi_delta < 0.3:
+    if oi_delta < 0.3 and abs(acceleration) < 0.5:
         return "тишина"
     if oi_delta < 1 and abs(acceleration) < 0.5:
         return "спокойный боковик"
-    if oi_delta >= 10:
+    if oi_delta >= 15:
         return "перегрев"
+    if oi_delta >= 10 and acceleration < 0:
+        return "распределение"
+    if oi_delta >= 6 and acceleration < -1:
+        return "всплеск без удержания"
     if oi_delta >= 6 and acceleration >= 2:
         return "агрессивный набор"
     if oi_delta >= 4 and acceleration >= 1:
         return "ускорение"
     if oi_delta >= 2 and prev_avg >= 1:
         return "ступенчатый набор"
-    if oi_delta >= 1:
+    if oi_delta >= 1 and acceleration >= 0:
         return "плавный набор"
+    if oi_delta > 0 and acceleration < 0:
+        return "пила"
     return "пила"
 
 
