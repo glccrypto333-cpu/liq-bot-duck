@@ -214,6 +214,11 @@ def init_db() -> None:
             timeframe TEXT NOT NULL,
             volume_state INTEGER NOT NULL,
             volume_state_name TEXT NOT NULL,
+            volume_structure TEXT,
+            volume_quality TEXT,
+            volume_baseline_24h DOUBLE PRECISION,
+            volume_hold_state TEXT,
+            volume_reason TEXT,
             reason TEXT NOT NULL,
             volume_delta_pct DOUBLE PRECISION,
             normalized_volume DOUBLE PRECISION,
@@ -302,6 +307,11 @@ def init_db() -> None:
         cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS normalized_volume DOUBLE PRECISION")
         cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_percentile INTEGER")
         cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS noise_state TEXT")
+        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_structure TEXT")
+        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_quality TEXT")
+        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_baseline_24h DOUBLE PRECISION")
+        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_hold_state TEXT")
+        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_reason TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_main ON market_volume_state(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_name ON market_volume_state(volume_state_name, timeframe)")
         cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_structure TEXT")
@@ -541,6 +551,11 @@ def replace_volume_state(rows: list[tuple]) -> None:
             timeframe,
             volume_state,
             volume_state_name,
+            volume_structure,
+            volume_quality,
+            volume_baseline_24h,
+            volume_hold_state,
+            volume_reason,
             reason,
             volume_delta_pct,
             normalized_volume,
@@ -548,7 +563,7 @@ def replace_volume_state(rows: list[tuple]) -> None:
             noise_state,
             market_state,
             invalid_reason
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
 
 
