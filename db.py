@@ -88,10 +88,8 @@ def init_db() -> None:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_volume5m_candle ON volume_5m_сырые(exchange, symbol, ts_open)")
 
         # IMPORTANT: rebuild derived tables to guarantee schema correctness
-        cur.execute("DROP TABLE IF EXISTS validation_audit")
-
         cur.execute("""
-        CREATE TABLE bot_aggregates(
+        CREATE TABLE IF NOT EXISTS bot_aggregates(
             metric TEXT NOT NULL,
             timeframe TEXT NOT NULL,
             ts_open TIMESTAMPTZ NOT NULL,
@@ -109,7 +107,7 @@ def init_db() -> None:
         )
         """)
         cur.execute("""
-        CREATE TABLE validation_audit(
+        CREATE TABLE IF NOT EXISTS validation_audit(
             calculated_at TIMESTAMPTZ NOT NULL,
             metric TEXT NOT NULL,
             timeframe TEXT NOT NULL,
@@ -132,7 +130,7 @@ def init_db() -> None:
         )
         """)
         cur.execute("""
-        CREATE TABLE raw_integrity_report(
+        CREATE TABLE IF NOT EXISTS raw_integrity_report(
             calculated_at TIMESTAMPTZ NOT NULL,
             metric TEXT NOT NULL,
             exchange TEXT NOT NULL,
