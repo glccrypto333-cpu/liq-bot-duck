@@ -4,7 +4,7 @@ from psycopg.rows import dict_row
 from config import DATABASE_URL
 import os
 
-DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "300000"))
+DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "60000"))
 from logger import log
 
 _DB_CONN = None
