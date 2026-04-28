@@ -88,9 +88,7 @@ def init_db() -> None:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_volume5m_candle ON volume_5m_сырые(exchange, symbol, ts_open)")
 
         # IMPORTANT: rebuild derived tables to guarantee schema correctness
-        cur.execute("DROP TABLE IF EXISTS bot_aggregates")
         cur.execute("DROP TABLE IF EXISTS validation_audit")
-        cur.execute("DROP TABLE IF EXISTS raw_integrity_report")
 
         cur.execute("""
         CREATE TABLE bot_aggregates(
