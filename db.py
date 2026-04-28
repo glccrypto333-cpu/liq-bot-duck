@@ -252,7 +252,14 @@ def init_db() -> None:
             stage_name TEXT NOT NULL,
             strength DOUBLE PRECISION NOT NULL,
             raw_strength DOUBLE PRECISION,
+            oi_structure TEXT,
             oi_quality TEXT,
+            oi_priority INTEGER,
+            oi_hold_state TEXT,
+            oi_trend_1h TEXT,
+            oi_trend_4h TEXT,
+            oi_trend_24h TEXT,
+            oi_reason TEXT,
             reason TEXT NOT NULL,
             oi_delta_pct DOUBLE PRECISION,
             oi_acceleration DOUBLE PRECISION,
@@ -294,7 +301,14 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_main ON market_price_state(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_name ON market_price_state(price_state_name, timeframe)")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS raw_strength DOUBLE PRECISION")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_structure TEXT")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_quality TEXT")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_priority INTEGER")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_hold_state TEXT")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_1h TEXT")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_4h TEXT")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_24h TEXT")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_reason TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_main ON market_oi_slope(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_stage ON market_oi_slope(stage, timeframe, strength)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
@@ -565,7 +579,14 @@ def replace_oi_slope(rows: list[tuple]) -> None:
             stage_name,
             strength,
             raw_strength,
+            oi_structure,
             oi_quality,
+            oi_priority,
+            oi_hold_state,
+            oi_trend_1h,
+            oi_trend_4h,
+            oi_trend_24h,
+            oi_reason,
             reason,
             oi_delta_pct,
             oi_acceleration,
@@ -575,7 +596,7 @@ def replace_oi_slope(rows: list[tuple]) -> None:
             range_width_pct,
             silence_stage,
             silence_stage_name
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
 
 

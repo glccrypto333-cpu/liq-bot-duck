@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import math
 from statistics import mean
 
 from db import fetch, replace_oi_slope
 from logger import log
-
-
-TIMEFRAMES = {"15m", "30m", "1h", "4h"}
 
 
 def _f(v, default=0.0):
@@ -18,86 +14,93 @@ def _f(v, default=0.0):
         return default
 
 
-def _quality_from_shape(oi_delta, acceleration, price_delta, volume_delta, range_width):
-    if oi_delta >= 3.0 and acceleration > 0.5 and volume_delta >= 35 and price_delta > 1.0:
-        return "сильный наклон"
-    if oi_delta >= 1.5 and acceleration > 0 and volume_delta >= 20 and abs(price_delta) <= 7:
-        return "рабочий наклон"
-    if oi_delta >= 0.8 and volume_delta >= 10 and abs(price_delta) <= 7:
-        return "ранний наклон"
-    if oi_delta >= 2.0 and volume_delta < 10:
-        return "подозрительный ОИ без объема"
-    if abs(price_delta) > 7 and oi_delta < 1.0:
-        return "цена убежала без ОИ"
-    return "нет наклона"
+def _trend_from_delta(delta: float) -> str:
+    if delta < 0:
+        return "снижение"
+    if delta < 1:
+        return "боковик"
+    if delta < 3:
+        return "плавный рост"
+    if delta < 6:
+        return "устойчивый рост"
+    return "агрессивный рост"
 
 
-
-
-def _clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-
-def _normalize_strength(raw_strength):
-    """
-    Soft 0..100 ranking score for OI pressure.
-    Not a signal. Only ranking.
-    Avoids top rows saturating at 100.
-    """
-    import math
-
-    raw_strength = float(raw_strength or 0.0)
-
-    if raw_strength <= 0:
-        return 0.0
-
-    # slower curve: raw=10 -> ~28, raw=30 -> ~45, raw=80 -> ~64, raw=200 -> ~79
-    score = math.log1p(raw_strength) * 15.0
-
-    return round(min(score, 99.0), 2)
-
-
-def _oi_quality(oi_delta, acceleration, price_delta):
-    """
-    Качество наклона ОИ.
-    """
-
-    if oi_delta >= 4 and acceleration >= 1:
-        if abs(price_delta) <= 2:
-            return "рост без цены"
-
-    if oi_delta >= 3 and price_delta < -3:
-        return "рост против цены"
-
-    if oi_delta >= 4 and acceleration >= 2:
+def _oi_structure(oi_delta: float, acceleration: float, prev_avg: float) -> str:
+    if oi_delta < -1:
+        return "нисходящий OI"
+    if oi_delta < 0.3:
+        return "тишина"
+    if oi_delta < 1 and abs(acceleration) < 0.5:
+        return "спокойный боковик"
+    if oi_delta >= 10:
+        return "перегрев"
+    if oi_delta >= 6 and acceleration >= 2:
         return "агрессивный набор"
-
-    if oi_delta >= 1 and acceleration > 0:
+    if oi_delta >= 4 and acceleration >= 1:
+        return "ускорение"
+    if oi_delta >= 2 and prev_avg >= 1:
+        return "ступенчатый набор"
+    if oi_delta >= 1:
         return "плавный набор"
-
-    return "нет качества"
-
+    return "пила"
 
 
-def _stage_from_slope(silence_stage, oi_delta, price_delta, volume_delta, acceleration, *_):
-    """
-    ОИ — основа.
-    Объем — подтверждающий фактор, но не главный.
-    Цена не обязана сразу расти на стадии 1, но не должна показывать явный слив для подтверждения.
-    """
+def _oi_quality(structure: str, price_delta: float) -> str:
+    if structure in ("тишина", "спокойный боковик", "нисходящий OI"):
+        return "нет качества"
+    if structure == "пила":
+        return "пила"
+    if structure == "плавный набор":
+        return "плавный набор"
+    if structure == "ступенчатый набор":
+        return "ступенчатый набор"
+    if structure in ("ускорение", "агрессивный набор"):
+        return "рост против цены" if price_delta < -3 else "агрессивный набор"
+    if structure == "перегрев":
+        return "перегрев"
+    return "нестабильный рост"
 
-    clean_volume = min(max(volume_delta, 0.0), 80.0)
 
-    if silence_stage in (0, 1) and oi_delta >= 0.6 and acceleration > 0 and abs(price_delta) <= 7:
-        return 1, "наблюдение", "ранний рост ОИ из спокойного рынка", "ранний наклон"
+def _oi_priority(structure: str, quality: str) -> int:
+    if quality in ("нет качества", "пила"):
+        return 0
+    if structure == "плавный набор":
+        return 1
+    if structure == "ступенчатый набор":
+        return 2
+    if structure == "ускорение":
+        return 3
+    if structure == "агрессивный набор":
+        return 4
+    if structure == "перегрев":
+        return 2
+    return 1
 
-    if oi_delta >= 1.5 and acceleration > 0 and clean_volume >= 12 and price_delta > -4:
-        return 2, "возня", "наклон ОИ усиливается, объем подтверждает активность", "рабочий наклон"
 
-    if oi_delta >= 3.0 and acceleration > 0 and clean_volume >= 25 and price_delta > 0.8:
-        return 3, "подтверждение", "ОИ, объем и цена подтверждают расширение", "сильный наклон"
+def _hold_state(series: list[float]) -> str:
+    recent = series[-4:]
+    if len(recent) < 4:
+        return "недостаточно данных"
+    if all(v > 0 for v in recent):
+        return "удержание"
+    if recent[-1] > 0 and recent[-2] <= 0:
+        return "попытка удержания"
+    if recent[-1] <= 0:
+        return "нет удержания"
+    return "нестабильно"
 
-    return 0, "нет сигнала", "условия наклона ОИ не собраны", "нет качества"
+
+def _stage_from_oi(priority: int, hold_state: str) -> tuple[int, str]:
+    if priority <= 0:
+        return 0, "нет сигнала"
+    if priority == 1:
+        return 1, "наблюдение"
+    if priority in (2, 3):
+        return 2, "возня"
+    if priority >= 4 and hold_state in ("удержание", "попытка удержания"):
+        return 3, "подтверждение"
+    return 2, "возня"
 
 
 def rebuild_oi_slope() -> int:
@@ -141,30 +144,25 @@ def rebuild_oi_slope() -> int:
         prev_avg = mean(series[-4:-1]) if len(series) >= 4 else 0.0
         acceleration = oi_delta - prev_avg
 
-        stage, stage_name, reason, quality = _stage_from_slope(
-            int(r["silence_stage"] or -1),
-            oi_delta,
-            price_delta,
-            volume_delta,
-            acceleration,
-            range_width,
+        oi_structure = _oi_structure(oi_delta, acceleration, prev_avg)
+        oi_quality = _oi_quality(oi_structure, price_delta)
+        oi_priority = _oi_priority(oi_structure, oi_quality)
+        oi_hold_state = _hold_state(series)
+
+        oi_trend_1h = _trend_from_delta(oi_delta)
+        oi_trend_4h = _trend_from_delta(prev_avg)
+        oi_trend_24h = "ожидает отдельного окна"
+
+        stage, stage_name = _stage_from_oi(oi_priority, oi_hold_state)
+
+        oi_reason = (
+            f"structure={oi_structure}; quality={oi_quality}; "
+            f"priority={oi_priority}; hold={oi_hold_state}; "
+            f"oi_delta={oi_delta:.2f}; acceleration={acceleration:.2f}"
         )
 
-        clean_volume = min(max(volume_delta, 0.0), 80.0)
-
-        raw_strength = (
-            oi_delta * 18
-            + acceleration * 14
-            + clean_volume * 0.08
-        )
-
-        strength = _normalize_strength(raw_strength)
-
-        oi_quality = _oi_quality(
-            oi_delta,
-            acceleration,
-            price_delta,
-        )
+        strength = float(oi_priority)
+        raw_strength = 0.0
 
         out.append((
             calculated_at,
@@ -176,8 +174,15 @@ def rebuild_oi_slope() -> int:
             stage_name,
             strength,
             raw_strength,
+            oi_structure,
             oi_quality,
-            reason,
+            oi_priority,
+            oi_hold_state,
+            oi_trend_1h,
+            oi_trend_4h,
+            oi_trend_24h,
+            oi_reason,
+            oi_reason,
             oi_delta,
             acceleration,
             prev_avg,
