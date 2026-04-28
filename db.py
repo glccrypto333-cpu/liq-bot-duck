@@ -233,6 +233,12 @@ def init_db() -> None:
             timeframe TEXT NOT NULL,
             price_state INTEGER NOT NULL,
             price_state_name TEXT NOT NULL,
+            price_structure TEXT,
+            price_quality TEXT,
+            price_slope_state TEXT,
+            price_trend_24h TEXT,
+            price_range_from_median_pct DOUBLE PRECISION,
+            price_reason TEXT,
             reason TEXT NOT NULL,
             price_delta_pct DOUBLE PRECISION,
             range_width_pct DOUBLE PRECISION,
@@ -298,6 +304,12 @@ def init_db() -> None:
         cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS noise_state TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_main ON market_volume_state(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_name ON market_volume_state(volume_state_name, timeframe)")
+        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_structure TEXT")
+        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_quality TEXT")
+        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_slope_state TEXT")
+        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_trend_24h TEXT")
+        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_range_from_median_pct DOUBLE PRECISION")
+        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_reason TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_main ON market_price_state(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_name ON market_price_state(price_state_name, timeframe)")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS raw_strength DOUBLE PRECISION")
@@ -554,12 +566,18 @@ def replace_price_state(rows: list[tuple]) -> None:
             timeframe,
             price_state,
             price_state_name,
+            price_structure,
+            price_quality,
+            price_slope_state,
+            price_trend_24h,
+            price_range_from_median_pct,
+            price_reason,
             reason,
             price_delta_pct,
             range_width_pct,
             market_state,
             invalid_reason
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
 
 
