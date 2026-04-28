@@ -39,6 +39,7 @@ from market_silence_engine import rebuild_market_silence
 from market_price_engine import rebuild_price_state
 from market_volume_engine import rebuild_volume_state
 from market_oi_slope_engine import rebuild_oi_slope
+from market_phase_engine import rebuild_market_phase
 from export_engine import rebuild_exports
 from telegram_bot import start_polling, send_message
 
@@ -218,6 +219,7 @@ def background(bybit_symbols, binance_symbols):
             price_count = _timed_step(timings, "price_state", rebuild_price_state)
             volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
             oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
+            phase_count = _timed_step(timings, "market_phase", rebuild_market_phase)
 
             _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
 
@@ -240,7 +242,7 @@ def background(bybit_symbols, binance_symbols):
 
             _write_runtime_timing_report(timings)
 
-            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count}")
+            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count} phase={phase_count}")
             _log_db_universe_check()
 
         except Exception as exc:

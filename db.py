@@ -284,6 +284,66 @@ def init_db() -> None:
         """)
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_phase(
+            calculated_at TIMESTAMPTZ NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            phase INTEGER NOT NULL,
+            phase_name TEXT NOT NULL,
+            phase_status TEXT NOT NULL,
+            priority TEXT,
+            phase_started_at TIMESTAMPTZ,
+            phase_updated_at TIMESTAMPTZ,
+            stage1_started_at TIMESTAMPTZ,
+            stage2_started_at TIMESTAMPTZ,
+            stage3_started_at TIMESTAMPTZ,
+            manual_reset_required BOOLEAN DEFAULT FALSE,
+            dmd_level TEXT,
+            confidence TEXT,
+            oi_structure TEXT,
+            oi_quality TEXT,
+            oi_priority INTEGER,
+            oi_hold_state TEXT,
+            oi_trend_1h TEXT,
+            oi_trend_4h TEXT,
+            oi_trend_24h TEXT,
+            price_structure TEXT,
+            price_quality TEXT,
+            price_slope_state TEXT,
+            volume_structure TEXT,
+            volume_quality TEXT,
+            volume_hold_state TEXT,
+            transition_reason TEXT,
+            reason TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_phase_history(
+            calculated_at TIMESTAMPTZ NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            from_phase INTEGER,
+            to_phase INTEGER NOT NULL,
+            from_phase_name TEXT,
+            to_phase_name TEXT NOT NULL,
+            phase_status TEXT,
+            priority TEXT,
+            transition_reason TEXT NOT NULL,
+            oi_structure TEXT,
+            oi_quality TEXT,
+            oi_priority INTEGER,
+            oi_hold_state TEXT,
+            price_structure TEXT,
+            price_quality TEXT,
+            volume_structure TEXT,
+            volume_quality TEXT
+        )
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS request_failure_report(
             calculated_at TIMESTAMPTZ NOT NULL,
             exchange TEXT NOT NULL,
@@ -333,6 +393,9 @@ def init_db() -> None:
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_reason TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_main ON market_oi_slope(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_stage ON market_oi_slope(stage, timeframe, strength)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_main ON market_phase(exchange, symbol, timeframe)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_phase ON market_phase(phase, timeframe, priority)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_history_main ON market_phase_history(exchange, symbol, timeframe, calculated_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
 
 
@@ -508,6 +571,44 @@ def active_universe_sql(alias: str = "") -> str:
     )
 
 
+
+
+
+def replace_market_phase(rows: list[tuple]) -> None:
+    execute("TRUNCATE TABLE market_phase")
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO market_phase(
+            calculated_at, exchange, symbol, timeframe,
+            phase, phase_name, phase_status, priority,
+            phase_started_at, phase_updated_at,
+            stage1_started_at, stage2_started_at, stage3_started_at,
+            manual_reset_required, dmd_level, confidence,
+            oi_structure, oi_quality, oi_priority, oi_hold_state,
+            oi_trend_1h, oi_trend_4h, oi_trend_24h,
+            price_structure, price_quality, price_slope_state,
+            volume_structure, volume_quality, volume_hold_state,
+            transition_reason, reason
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
+
+
+def insert_market_phase_history(rows: list[tuple]) -> None:
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO market_phase_history(
+            calculated_at, exchange, symbol, timeframe,
+            from_phase, to_phase, from_phase_name, to_phase_name,
+            phase_status, priority, transition_reason,
+            oi_structure, oi_quality, oi_priority, oi_hold_state,
+            price_structure, price_quality,
+            volume_structure, volume_quality
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
 
 
 def replace_market_silence(rows: list[tuple]) -> None:
