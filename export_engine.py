@@ -804,8 +804,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
     _write_csv(
         top_volume_anomalies_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","volume_state","volume_state_name","reason","volume_delta_pct","normalized_volume","volume_percentile","noise_state","market_state","invalid_reason"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["volume_state"],r["volume_state_name"],r["reason"],r["volume_delta_pct"],r["normalized_volume"],r["volume_percentile"],r["noise_state"],r["market_state"],r["invalid_reason"]] for r in top_volume_anomalies],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","volume_state","volume_state_name","volume_structure","volume_quality","volume_baseline_24h","volume_hold_state","volume_reason","reason","volume_delta_pct","normalized_volume","volume_percentile","noise_state","market_state","invalid_reason"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["volume_state"],r["volume_state_name"],_v(r,"volume_structure"),_v(r,"volume_quality"),_v(r,"volume_baseline_24h"),_v(r,"volume_hold_state"),_v(r,"volume_reason"),r["reason"],r["volume_delta_pct"],r["normalized_volume"],r["volume_percentile"],r["noise_state"],r["market_state"],r["invalid_reason"]] for r in top_volume_anomalies],
     )
 
     _write_csv(
@@ -816,8 +816,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
     _write_csv(
         market_volume_state_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","volume_state","volume_state_name","reason","volume_delta_pct","normalized_volume","volume_percentile","noise_state","market_state","invalid_reason"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["volume_state"],r["volume_state_name"],r["reason"],r["volume_delta_pct"],r["normalized_volume"],r["volume_percentile"],r["noise_state"],r["market_state"],r["invalid_reason"]] for r in market_volume_state],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","volume_state","volume_state_name","volume_structure","volume_quality","volume_baseline_24h","volume_hold_state","volume_reason","reason","volume_delta_pct","normalized_volume","volume_percentile","noise_state","market_state","invalid_reason"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["volume_state"],r["volume_state_name"],_v(r,"volume_structure"),_v(r,"volume_quality"),_v(r,"volume_baseline_24h"),_v(r,"volume_hold_state"),_v(r,"volume_reason"),r["reason"],r["volume_delta_pct"],r["normalized_volume"],r["volume_percentile"],r["noise_state"],r["market_state"],r["invalid_reason"]] for r in market_volume_state],
     )
 
     _write_csv(
