@@ -129,9 +129,10 @@ def background(bybit_symbols, binance_symbols):
 
             now = time.time()
 
+            # quick export отключён из автоцикла.
+            # Экспорт собирается только по запросу через Telegram.
             if now - last_export >= ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК:
                 last_export = now
-                log(f"quick export rebuilt: {bundle}")
 
             timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
             log(f"cycle timing: {timing_text}")
