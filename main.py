@@ -34,7 +34,6 @@ from market_silence_engine import rebuild_market_silence
 from market_price_engine import rebuild_price_state
 from market_volume_engine import rebuild_volume_state
 from market_oi_slope_engine import rebuild_oi_slope
-from market_regime_engine import rebuild_market_regime
 from export_engine import rebuild_exports
 from telegram_bot import start_polling, send_message
 
@@ -125,7 +124,6 @@ def background(bybit_symbols, binance_symbols):
             price_count = _timed_step(timings, "price_state", rebuild_price_state)
             volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
             oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
-            regime_count = _timed_step(timings, "market_regime", rebuild_market_regime)
 
             _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
 
