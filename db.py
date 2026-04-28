@@ -2,6 +2,9 @@ from __future__ import annotations
 import psycopg
 from psycopg.rows import dict_row
 from config import DATABASE_URL
+import os
+
+DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "300000"))
 from logger import log
 
 _DB_CONN = None
@@ -17,7 +20,7 @@ def _conn():
         autocommit=True,
         row_factory=dict_row,
         connect_timeout=5,
-        options="-c statement_timeout=15000",
+        options=f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
     )
     return _DB_CONN
 
@@ -307,12 +310,14 @@ def execute(sql: str, params: tuple = ()) -> None:
     if not DATABASE_URL:
         return
     with _conn() as conn, conn.cursor() as cur:
+        cur.execute(f"SET LOCAL statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
         cur.execute(sql, params)
 
 def fetch(sql: str, params: tuple = ()) -> list[dict]:
     if not DATABASE_URL:
         return []
     with _conn() as conn, conn.cursor() as cur:
+        cur.execute(f"SET LOCAL statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
         cur.execute(sql, params)
         return list(cur.fetchall())
 

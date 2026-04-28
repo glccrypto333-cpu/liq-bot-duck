@@ -168,6 +168,7 @@ def background(bybit_symbols, binance_symbols):
     last_export = 0.0
 
     while True:
+        cycle_started = time.time()
         try:
             timings = []
 
