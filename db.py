@@ -9,6 +9,15 @@ from logger import log
 
 _DB_CONN = None
 
+def _apply_session_settings(conn):
+    try:
+        conn.execute("SET statement_timeout = 0")
+        conn.execute("SET idle_in_transaction_session_timeout = 0")
+        conn.execute("SET lock_timeout = '30s'")
+    except Exception:
+        pass
+
+
 def _conn():
     global _DB_CONN
 
@@ -20,8 +29,8 @@ def _conn():
         autocommit=True,
         row_factory=dict_row,
         connect_timeout=5,
-        options=f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
     )
+    _apply_session_settings(_DB_CONN)
     return _DB_CONN
 
 def init_db() -> None:
