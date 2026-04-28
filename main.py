@@ -130,7 +130,6 @@ def background(bybit_symbols, binance_symbols):
             now = time.time()
 
             if now - last_export >= ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК:
-                bundle = _timed_step(timings, "quick_export", lambda: rebuild_exports("quick"))
                 last_export = now
                 log(f"quick export rebuilt: {bundle}")
 
