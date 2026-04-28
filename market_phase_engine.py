@@ -177,7 +177,13 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
     # 1 -> 2: Stage 1 >= 1 час, OI P1/P2/P3, slope устойчивый или есть удержание.
     stage2_ok = (
         prev_phase in {1, 2}
-        and (prev_phase == 2 or stage1_age_ok)
+        and (
+            prev_phase == 2
+            or (
+                prev_phase == 1
+                and stage1_age_ok
+            )
+        )
         and oi_priority <= 3
         and (
             oi_structure in STAGE2_OI
@@ -277,12 +283,15 @@ def rebuild_market_phase() -> int:
 
     for r in rows:
         prev_phase = _as_int(_v(r, "prev_phase", 0), 0)
-        new_phase, transition_reason = _decide_phase(prev_phase, r, now)
 
         # Stage 3 не снимается автоматически.
+        # Это правило должно стоять ДО расчета новой фазы,
+        # чтобы история не получала ложные переходы 3 -> 2 или 3 -> 0.
         if prev_phase == 3:
             new_phase = 3
             transition_reason = "stage3_locked_until_manual_reset"
+        else:
+            new_phase, transition_reason = _decide_phase(prev_phase, r, now)
 
         # Прямые 0->3 и 1->3 запрещены.
         if new_phase == 3 and prev_phase != 2:
