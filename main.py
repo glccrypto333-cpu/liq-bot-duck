@@ -1,5 +1,6 @@
 from __future__ import annotations
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import traceback
 from pathlib import Path
@@ -15,6 +16,7 @@ from config import (
     ИНТЕРВАЛ_ЦИКЛА_СЕК,
     ЛИМИТ_СИМВОЛОВ_BYBIT,
     ЛИМИТ_СИМВОЛОВ_BINANCE,
+    BINANCE_COLLECT_WORKERS,
     ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК,
 )
 from logger import log
@@ -63,6 +65,28 @@ def _timed_step(timings: list[tuple[str, float]], name: str, fn):
     return result
 
 
+
+def _collect_binance_symbol(symbol: str):
+    oi_rows = []
+    price_rows = []
+    volume_rows = []
+    failures = []
+
+    try:
+        oi_rows.extend(fetch_binance_oi_5m(symbol, 200))
+    except Exception as exc:
+        failures.append(("BINANCE", symbol, "OI", exc))
+
+    try:
+        p, v = fetch_binance_kline_5m(symbol, 200)
+        price_rows.extend(p)
+        volume_rows.extend(v)
+    except Exception as exc:
+        failures.append(("BINANCE", symbol, "PRICE_VOLUME", exc))
+
+    return oi_rows, price_rows, volume_rows, failures
+
+
 def collect(symbols_bybit, symbols_binance):
     oi_rows, price_rows, volume_rows = [], [], []
     failures = []
@@ -84,18 +108,29 @@ def collect(symbols_bybit, symbols_binance):
         except Exception as exc:
             record_failure("BYBIT", s, "PRICE_VOLUME", exc)
 
-    for s in (symbols_binance if ЛИМИТ_СИМВОЛОВ_BINANCE <= 0 else symbols_binance[:ЛИМИТ_СИМВОЛОВ_BINANCE]):
-        try:
-            oi_rows.extend(fetch_binance_oi_5m(s, 200))
-        except Exception as exc:
-            record_failure("BINANCE", s, "OI", exc)
+    binance_collect_symbols = (
+        symbols_binance
+        if ЛИМИТ_СИМВОЛОВ_BINANCE <= 0
+        else symbols_binance[:ЛИМИТ_СИМВОЛОВ_BINANCE]
+    )
 
-        try:
-            p, v = fetch_binance_kline_5m(s, 200)
-            price_rows.extend(p)
-            volume_rows.extend(v)
-        except Exception as exc:
-            record_failure("BINANCE", s, "PRICE_VOLUME", exc)
+    workers = max(1, BINANCE_COLLECT_WORKERS)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(_collect_binance_symbol, symbol)
+            for symbol in binance_collect_symbols
+        ]
+
+        for future in as_completed(futures):
+            b_oi_rows, b_price_rows, b_volume_rows, symbol_failures = future.result()
+
+            oi_rows.extend(b_oi_rows)
+            price_rows.extend(b_price_rows)
+            volume_rows.extend(b_volume_rows)
+
+            for exchange, symbol, data_type, exc in symbol_failures:
+                record_failure(exchange, symbol, data_type, exc)
 
     upsert_oi(oi_rows)
     upsert_price(price_rows)
