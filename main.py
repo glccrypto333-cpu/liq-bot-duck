@@ -139,7 +139,7 @@ def background(bybit_symbols, binance_symbols):
 
             _write_runtime_timing_report(timings)
 
-            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count} regime={regime_count}")
+            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count}")
 
         except Exception as exc:
             log(f"canonical validation cycle error: {type(exc).__name__}: {exc}")
