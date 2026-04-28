@@ -14,6 +14,31 @@ def _f(v, default=0.0):
         return default
 
 
+
+def _bucket_oi_delta(v: float) -> str:
+    if v < 0:
+        return "отрицательный"
+    if v < 3:
+        return "0-3%"
+    if v < 5:
+        return "3-5%"
+    if v < 10:
+        return "5-10%"
+    if v < 15:
+        return "10-15%"
+    return "15%+"
+
+
+def _bucket_acceleration(v: float) -> str:
+    if v < 0:
+        return "отрицательное"
+    if v < 0.5:
+        return "нейтральное"
+    if v < 2:
+        return "растет"
+    return "резко растет"
+
+
 def _trend_from_delta(delta: float) -> str:
     if delta < 0:
         return "снижение"
@@ -149,6 +174,8 @@ def rebuild_oi_slope() -> int:
         oi_priority = _oi_priority(oi_structure, oi_quality)
         oi_hold_state = _hold_state(series)
 
+        oi_delta_bucket = _bucket_oi_delta(oi_delta)
+        oi_acceleration_bucket = _bucket_acceleration(acceleration)
         oi_trend_1h = _trend_from_delta(oi_delta)
         oi_trend_4h = _trend_from_delta(prev_avg)
         oi_trend_24h = "ожидает отдельного окна"
@@ -158,6 +185,7 @@ def rebuild_oi_slope() -> int:
         oi_reason = (
             f"structure={oi_structure}; quality={oi_quality}; "
             f"priority={oi_priority}; hold={oi_hold_state}; "
+            f"delta_bucket={oi_delta_bucket}; acceleration_bucket={oi_acceleration_bucket}; "
             f"oi_delta={oi_delta:.2f}; acceleration={acceleration:.2f}"
         )
 
