@@ -1211,7 +1211,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             _v(r, "silence_stage_name"),
         ])
 
-    market_phase = fetch("""
+    market_phase = _safe_fetch("""
         SELECT *
         FROM market_phase
         ORDER BY priority, phase DESC, exchange, symbol, timeframe
