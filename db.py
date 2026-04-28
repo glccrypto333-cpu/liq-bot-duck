@@ -396,6 +396,10 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_main ON market_phase(exchange, symbol, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_phase ON market_phase(phase, timeframe, priority)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_history_main ON market_phase_history(exchange, symbol, timeframe, calculated_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_latest ON market_phase(exchange, symbol, timeframe, phase_updated_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_latest ON market_oi_slope(exchange, symbol, timeframe, ts_close DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_latest ON market_price_state(exchange, symbol, timeframe, ts_close DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_latest ON market_volume_state(exchange, symbol, timeframe, ts_close DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
 
 
