@@ -96,8 +96,10 @@ def _fetch_top_oi_rows(since, timeframe: str, limit: int = 100):
           AND stage >= 1
         ORDER BY
             stage DESC,
-            strength DESC,
-            raw_strength DESC,
+            oi_priority DESC,
+            oi_quality DESC,
+            oi_hold_state DESC,
+            oi_acceleration DESC,
             ts_close DESC,
             exchange,
             symbol
@@ -453,7 +455,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         SELECT *
         FROM market_oi_slope
         WHERE ts_close >= %s
-        ORDER BY stage DESC, strength DESC, exchange, symbol, timeframe, ts_close
+        ORDER BY stage DESC, oi_priority DESC, oi_quality DESC, oi_hold_state DESC, oi_acceleration DESC, exchange, symbol, timeframe, ts_close
     """, (since,))
 
     oi_slope_top = _safe_fetch("""
@@ -463,8 +465,10 @@ def rebuild_exports(mode: str = "quick") -> Path:
           AND stage >= 1
         ORDER BY
             stage DESC,
-            strength DESC,
-            raw_strength DESC,
+            oi_priority DESC,
+            oi_quality DESC,
+            oi_hold_state DESC,
+            oi_acceleration DESC,
             exchange,
             symbol,
             timeframe,
@@ -487,14 +491,14 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
             COUNT(*) AS rows_count,
 
-            MIN(strength) AS min_strength,
-            AVG(strength) AS avg_strength,
-            MAX(strength) AS max_strength,
+            MIN(oi_priority) AS min_oi_priority,
+            AVG(oi_priority) AS avg_oi_priority,
+            MAX(oi_priority) AS max_oi_priority,
 
             AVG(raw_strength) AS avg_raw_strength,
 
-            SUM(CASE WHEN strength >= 95 THEN 1 ELSE 0 END) AS strength_ge_95,
-            SUM(CASE WHEN strength >= 100 THEN 1 ELSE 0 END) AS strength_eq_100
+            SUM(CASE WHEN oi_priority >= 3 THEN 1 ELSE 0 END) AS oi_priority_ge_3,
+            SUM(CASE WHEN oi_priority >= 4 THEN 1 ELSE 0 END) AS oi_priority_ge_4
 
         FROM market_oi_slope
         WHERE ts_close >= %s
@@ -508,7 +512,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY
             timeframe,
             stage_name,
-            avg_strength DESC,
+            avg_oi_priority DESC,
             rows_count DESC
     """, (since,))
 
@@ -824,8 +828,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
     _write_csv(
         market_oi_slope_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","oi_prev_avg","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage","silence_stage_name"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],r["strength"],r["raw_strength"],r["oi_quality"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["oi_prev_avg"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage"],r["silence_stage_name"]] for r in market_oi_slope],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","oi_structure","oi_quality","oi_priority","oi_hold_state","oi_trend_1h","oi_trend_4h","oi_trend_24h","oi_reason","strength","raw_strength","reason","oi_delta_pct","oi_acceleration","oi_prev_avg","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage","silence_stage_name"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],_v(r,"oi_structure"),_v(r,"oi_quality"),_v(r,"oi_priority"),_v(r,"oi_hold_state"),_v(r,"oi_trend_1h"),_v(r,"oi_trend_4h"),_v(r,"oi_trend_24h"),_v(r,"oi_reason"),r["strength"],r["raw_strength"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["oi_prev_avg"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage"],r["silence_stage_name"]] for r in market_oi_slope],
     )
 
 
@@ -865,8 +869,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
             "avg_strength",
             "max_strength",
             "avg_raw_strength",
-            "strength_ge_95",
-            "strength_eq_100",
+            "oi_priority_ge_3",
+            "oi_priority_ge_4",
         ],
         [
             [
@@ -879,8 +883,8 @@ def rebuild_exports(mode: str = "quick") -> Path:
                 _v(r, "avg_strength", 0),
                 _v(r, "max_strength", 0),
                 _v(r, "avg_raw_strength", 0),
-                _v(r, "strength_ge_95", 0),
-                _v(r, "strength_eq_100", 0),
+                _v(r, "oi_priority_ge_3", 0),
+                _v(r, "oi_priority_ge_4", 0),
             ]
             for r in _rows(oi_slope_summary)
         ],
