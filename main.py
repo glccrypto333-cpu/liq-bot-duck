@@ -164,6 +164,43 @@ def collect(symbols_bybit, symbols_binance):
     )
 
 
+
+def _log_db_universe_check() -> None:
+    try:
+        from db import fetch
+
+        tables = [
+            "oi_5m_сырые",
+            "price_5m_сырые",
+            "volume_5m_сырые",
+            "bot_aggregates",
+            "market_research",
+            "market_oi_slope",
+            "active_symbol_universe",
+        ]
+
+        for table in tables:
+            rows = fetch(f"""
+                SELECT
+                    exchange,
+                    COUNT(DISTINCT symbol) AS symbols,
+                    COUNT(*) AS rows
+                FROM {table}
+                GROUP BY exchange
+                ORDER BY exchange
+            """)
+
+            summary = " ".join(
+                f'{r["exchange"]}:symbols={r["symbols"]}:rows={r["rows"]}'
+                for r in rows
+            )
+
+            log(f"db universe check: {table} {summary}")
+
+    except Exception as exc:
+        log(f"db universe check error: {type(exc).__name__}: {exc}")
+
+
 def background(bybit_symbols, binance_symbols):
     last_export = 0.0
 
@@ -204,6 +241,7 @@ def background(bybit_symbols, binance_symbols):
             _write_runtime_timing_report(timings)
 
             log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count}")
+            _log_db_universe_check()
 
         except Exception as exc:
             log(f"canonical validation cycle error: {type(exc).__name__}: {exc}")
