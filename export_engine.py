@@ -665,30 +665,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY exchange, symbol, timeframe, stage
     """, (since,))
 
-    market_regime = _safe_fetch("""
-        SELECT *
-        FROM market_regime
-        WHERE ts_close >= %s
-        ORDER BY exchange, symbol, timeframe, ts_close
-    """, (since,))
-
-    regime_states = _safe_fetch("""
-        SELECT
-            exchange,
-            symbol,
-            timeframe,
-            scenario,
-            confidence,
-            COUNT(*) AS scenario_count,
-            AVG(continuation_score) AS avg_continuation_score,
-            AVG(exhaustion_score) AS avg_exhaustion_score,
-            AVG(compression_score) AS avg_compression_score
-        FROM market_regime
-        WHERE ts_close >= %s
-        GROUP BY exchange, symbol, timeframe, scenario, confidence
-        ORDER BY exchange, symbol, timeframe, scenario_count DESC
-    """, (since,))
-
     storage_summary = _safe_fetch(f"""
         SELECT metric, MIN(ts_open) AS oldest_ts, MAX(ts_open) AS newest_ts, COUNT(*) AS rows_count
         FROM (
@@ -744,8 +720,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
     oi_slope_summary_path = ПАПКА_ДАННЫХ / "oi_slope_summary.csv"
     silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
-    market_regime_path = ПАПКА_ДАННЫХ / "market_regime.csv"
-    regime_states_path = ПАПКА_ДАННЫХ / "regime_states.csv"
     engine_summary_path = ПАПКА_ДАННЫХ / "engine_summary.csv"
     stage_calibration_template_path = ПАПКА_ДАННЫХ / "stage_calibration_template.csv"
     symbol_baseline_path = ПАПКА_ДАННЫХ / "symbol_baseline.csv"
@@ -962,12 +936,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
         [[r["exchange"], r["symbol"], r["timeframe"], r["stage"], r["stage_name"], r["stage_count"], r["avg_score"]] for r in silence_states],
     )
 
-    _write_csv(
-        market_regime_path,
-        ["calculated_at", "ts_close", "exchange", "symbol", "timeframe", "market_state", "scenario", "confidence", "reason", "oi_delta_pct", "price_delta_pct", "volume_delta_pct", "range_width_pct", "continuation_score", "exhaustion_score", "compression_score", "invalid_reason"],
-        [[r["calculated_at"], r["ts_close"], r["exchange"], r["symbol"], r["timeframe"], r["market_state"], r["scenario"], r["confidence"], r["reason"], r["oi_delta_pct"], r["price_delta_pct"], r["volume_delta_pct"], r["range_width_pct"], r["continuation_score"], r["exhaustion_score"], r["compression_score"], r["invalid_reason"]] for r in market_regime],
-    )
-
     engine_summary = [
         [
             "market_silence",
@@ -1000,14 +968,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
             len([r for r in _rows(market_oi_slope) if _v(r, "stage_name") == "возня"]),
             round(sum(float(_v(r, "strength", 0) or 0) for r in _rows(market_oi_slope)) / max(len(_rows(market_oi_slope)), 1), 2),
             max([float(_v(r, "strength", 0) or 0) for r in _rows(market_oi_slope)] or [0]),
-        ],
-        [
-            "market_regime",
-            len(_rows(market_regime)),
-            len([r for r in _rows(market_regime) if _v(r, "scenario") == "compression"]),
-            len([r for r in _rows(market_regime) if _v(r, "scenario") == "continuation"]),
-            len([r for r in _rows(market_regime) if _v(r, "scenario") == "range"]),
-            len([r for r in _rows(market_regime) if _v(r, "scenario") == "exhaustion"]),
         ],
     ]
 
@@ -1359,12 +1319,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
     )
 
 
-    _write_csv(
-        regime_states_path,
-        ["exchange", "symbol", "timeframe", "scenario", "confidence", "scenario_count", "avg_continuation_score", "avg_exhaustion_score", "avg_compression_score"],
-        [[r["exchange"], r["symbol"], r["timeframe"], r["scenario"], r["confidence"], r["scenario_count"], r["avg_continuation_score"], r["avg_exhaustion_score"], r["avg_compression_score"]] for r in regime_states],
-    )
-
     invalid = [r for r in _rows(audit) if r["validation_status"] != "валидно"]
     critical_coverage = [r for r in _rows(coverage) if r["quality_status"] == "critical"]
     warning_coverage = [r for r in _rows(coverage) if r["quality_status"] == "warning"]
@@ -1400,8 +1354,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"request_failure_rows: {len(request_failures)}",
         f"market_research_rows: {len(market_research)}",
         f"market_states_rows: {len(market_states)}",
-        f"market_regime_rows: {len(market_regime)}",
-        f"regime_states_rows: {len(regime_states)}",
         f"invalid_data_state_rows: {len(invalid_data_states)}",
         f"request_failure_rows: {len(request_failures)}",
         "",
@@ -1439,8 +1391,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
         "",
         f"market_research_rows: {len(market_research)}",
         f"market_states_rows: {len(market_states)}",
-        f"market_regime_rows: {len(market_regime)}",
-        f"regime_states_rows: {len(regime_states)}",
         f"invalid_data_state_rows: {len(invalid_data_states)}",
         f"request_failure_rows: {len(request_failures)}",
         "",
@@ -1522,7 +1472,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             f"Mighty Duck {APP_VERSION}\n"
             f"mode={mode}\n"
             "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, market_regime.csv, regime_states.csv, engine_summary.csv, stage_calibration_template.csv, stage_metrics_table.csv, symbol_baseline.csv, oi_persistence.csv, metric_alignment.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
+            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, engine_summary.csv, stage_calibration_template.csv, stage_metrics_table.csv, symbol_baseline.csv, oi_persistence.csv, metric_alignment.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
             "timestamp_migration=active\n"
             "canonical_close=active\n"
             "contiguous_window_validation=active\n"
@@ -1554,8 +1504,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
         top_oi_1h_path,
         top_oi_4h_path,
         oi_slope_summary_path,
-        market_regime_path,
-        regime_states_path,
         engine_summary_path,
         stage_calibration_template_path,
         stage_metrics_table_path,
