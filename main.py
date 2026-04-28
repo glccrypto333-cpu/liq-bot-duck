@@ -221,7 +221,9 @@ def background(bybit_symbols, binance_symbols):
 def main():
     log(f"Новая чистая база {APP_VERSION} запущена")
 
+    log("init_db start")
     init_db()
+    log("init_db ok")
     migrate_canonical_ts_close()
 
     start_polling()
