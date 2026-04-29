@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from db import fetch, execute, _conn, safe_ddl
+from db import fetch, execute, _conn
 from logger import log
 
 
