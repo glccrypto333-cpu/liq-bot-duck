@@ -60,25 +60,25 @@ def init_research_schema() -> None:
 
 
 def _score_continuation(oi_delta: float, price_delta: float, volume_delta: float) -> float:
-    oi_part = min(40.0, max(0.0, oi_delta) * 12.0)
-    price_part = min(35.0, abs(price_delta) * 18.0)
-    volume_part = min(25.0, max(0.0, volume_delta) * 1.8)
+    oi_part = min(60.0, max(0.0, oi_delta) * 16.0)
+    price_part = min(25.0, abs(price_delta) * 10.0)
+    volume_part = min(15.0, max(0.0, volume_delta) * 1.0)
     return max(0.0, min(100.0, oi_part + price_part + volume_part))
 
 
 def _score_exhaustion(oi_delta: float, price_delta: float, volume_delta: float) -> float:
-    impulse_part = min(45.0, abs(price_delta) * 20.0)
-    volume_part = min(35.0, max(0.0, volume_delta) * 2.0)
-    oi_drop_part = min(20.0, max(0.0, -oi_delta) * 10.0)
-    return max(0.0, min(100.0, impulse_part + volume_part + oi_drop_part))
+    oi_drop_part = min(55.0, max(0.0, -oi_delta) * 18.0)
+    impulse_part = min(25.0, abs(price_delta) * 8.0)
+    volume_part = min(20.0, max(0.0, volume_delta) * 1.0)
+    return max(0.0, min(100.0, oi_drop_part + impulse_part + volume_part))
 
 
 def _score_compression(oi_delta: float, price_delta: float, volume_delta: float, range_width: float) -> float:
-    narrow_range = max(0.0, 45.0 - range_width * 35.0)
-    quiet_price = max(0.0, 25.0 - abs(price_delta) * 35.0)
-    oi_build = min(20.0, max(0.0, oi_delta) * 8.0)
-    quiet_volume = max(0.0, 10.0 - abs(volume_delta) * 1.5)
-    return max(0.0, min(100.0, narrow_range + quiet_price + oi_build + quiet_volume))
+    oi_build = min(45.0, max(0.0, oi_delta) * 14.0)
+    quiet_price = max(0.0, 30.0 - abs(price_delta) * 30.0)
+    narrow_range = max(0.0, 20.0 - range_width * 15.0)
+    quiet_volume = max(0.0, 5.0 - max(0.0, volume_delta) * 0.8)
+    return max(0.0, min(100.0, oi_build + quiet_price + narrow_range + quiet_volume))
 
 
 def _classify_state(
@@ -90,11 +90,11 @@ def _classify_state(
     compression_score: float,
 ) -> str:
     if compression_score >= 65:
-        return "сжатие"
-    if exhaustion_score >= 65:
-        return "выдох"
-    if continuation_score >= 60:
-        return "продолжение"
+        return "набор_позиции"
+    if continuation_score >= 65 and abs(price_delta) > 0.35:
+        return "импульс_после_набора"
+    if exhaustion_score >= 70 and oi_delta < 0:
+        return "разгрузка"
     if abs(price_delta) <= 0.35 and abs(oi_delta) <= 0.60 and range_width <= 1.20:
         return "диапазон"
     return "нейтрально"
