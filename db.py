@@ -86,7 +86,7 @@ def init_db() -> None:
 
         # Add collected_at if old tables exist without it
         for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ DEFAULT NOW()")
+            safe_ddl(cur, f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ DEFAULT NOW()")
 
         # Deduplicate old raw rows before unique index
         for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
