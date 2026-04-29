@@ -6,6 +6,13 @@ import os
 
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "60000"))
 from logger import log
+import psycopg
+
+def safe_ddl(cur, sql: str) -> None:
+    try:
+        cur.execute(sql)
+    except psycopg.errors.LockNotAvailable as exc:
+        log(f"DDL skipped due lock timeout: {sql[:120]} | {exc}")
 
 _DB_CONN = None
 
@@ -380,9 +387,9 @@ def init_db() -> None:
         cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_reason TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_main ON market_volume_state(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_name ON market_volume_state(volume_state_name, timeframe)")
-        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_structure TEXT")
-        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_quality TEXT")
-        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_slope_state TEXT")
+        safe_ddl(cur, "ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_structure TEXT")
+        safe_ddl(cur, "ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_quality TEXT")
+        safe_ddl(cur, "ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_slope_state TEXT")
         cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_trend_24h TEXT")
         cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_range_from_median_pct DOUBLE PRECISION")
         cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_reason TEXT")
@@ -626,7 +633,13 @@ def replace_market_silence(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         print("replace_market_silence skipped: empty rows, old table preserved")
         return
-    execute("TRUNCATE TABLE market_silence")
+    execute("""
+        DELETE FROM market_silence
+        WHERE ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM market_research
+        )
+    """)
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
         INSERT INTO market_silence(
@@ -654,7 +667,13 @@ def replace_volume_state(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         print("replace_volume_state skipped: empty rows, old table preserved")
         return
-    execute("TRUNCATE TABLE market_volume_state")
+    execute("""
+        DELETE FROM market_volume_state
+        WHERE ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM market_research
+        )
+    """)
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
         INSERT INTO market_volume_state(
@@ -685,7 +704,13 @@ def replace_price_state(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         print("replace_price_state skipped: empty rows, old table preserved")
         return
-    execute("TRUNCATE TABLE market_price_state")
+    execute("""
+        DELETE FROM market_price_state
+        WHERE ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM market_research
+        )
+    """)
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
         INSERT INTO market_price_state(
