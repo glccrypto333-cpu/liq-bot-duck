@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from statistics import mean
 
-from db import fetch, replace_price_state
+from db import fetch, replace_price_state, execute, _conn
 from logger import log
 
 
@@ -78,8 +78,47 @@ def _legacy_state(structure: str) -> tuple[int, str]:
     return mapping.get(structure, (0, "нейтрально"))
 
 
-def rebuild_price_state() -> int:
-    rows = fetch("""
+
+def _insert_price_state_rows(rows: list[tuple]) -> None:
+    if not rows:
+        return
+
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO market_price_state(
+            calculated_at,
+            ts_close,
+            exchange,
+            symbol,
+            timeframe,
+            price_state,
+            price_state_name,
+            price_structure,
+            price_quality,
+            price_slope_state,
+            price_trend_24h,
+            price_range_from_median_pct,
+            price_reason,
+            reason,
+            price_delta_pct,
+            range_width_pct,
+            market_state,
+            invalid_reason
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
+
+
+def _rebuild_price_state_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[int, dict]:
+    if not symbols:
+        return 0, {}
+
+    values_sql = ",".join(["(%s,%s)"] * len(symbols))
+    params = []
+    for exchange, symbol in symbols:
+        params.extend([exchange, symbol])
+
+    rows = fetch(
+        f"""
         SELECT
             calculated_at,
             ts_close,
@@ -92,15 +131,19 @@ def rebuild_price_state() -> int:
             market_state,
             invalid_reason
         FROM market_research
-        WHERE ts_close >= (
+        WHERE (exchange, symbol) IN ({values_sql})
+          AND ts_close >= (
             SELECT MAX(ts_close) - '24 hours'::interval
             FROM market_research
-        )
+          )
         ORDER BY exchange, symbol, timeframe, ts_close
-    """)
+        """,
+        tuple(params),
+    )
 
     history = {}
     out = []
+    counts = {}
     calculated_at = datetime.now(timezone.utc)
 
     for r in rows:
@@ -148,11 +191,43 @@ def rebuild_price_state() -> int:
             r["invalid_reason"],
         ))
 
-    replace_price_state(out)
+        counts[state_name] = counts.get(state_name, 0) + 1
 
-    counts = {}
-    for row in out:
-        counts[row[6]] = counts.get(row[6], 0) + 1
+    _insert_price_state_rows(out)
+    return len(out), counts
 
-    log(f"price state rebuilt: rows={len(out)} {counts}")
-    return len(out)
+
+def rebuild_price_state() -> int:
+    execute("""
+        DELETE FROM market_price_state
+        WHERE ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM market_research
+        )
+    """)
+
+    symbols = [
+        (r["exchange"], r["symbol"])
+        for r in fetch("""
+            SELECT DISTINCT exchange, symbol
+            FROM market_research
+            WHERE ts_close >= (
+                SELECT MAX(ts_close) - '24 hours'::interval
+                FROM market_research
+            )
+            ORDER BY exchange, symbol
+        """)
+    ]
+
+    total_rows = 0
+    total_counts = {}
+    batch_size = 25
+
+    for i in range(0, len(symbols), batch_size):
+        rows_count, counts = _rebuild_price_state_symbol_batch(symbols[i:i + batch_size])
+        total_rows += rows_count
+        for k, v in counts.items():
+            total_counts[k] = total_counts.get(k, 0) + v
+
+    log(f"price state rebuilt: rows={total_rows} {total_counts}")
+    return total_rows
