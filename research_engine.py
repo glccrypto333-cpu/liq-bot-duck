@@ -9,6 +9,7 @@ from logger import log
 
 
 MIN_RESEARCH_COVERAGE_PCT = 97.0
+RESEARCH_LOOKBACK_HOURS = 24
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -182,6 +183,10 @@ def rebuild_market_research() -> int:
             delta_pct,
             unique_candles
         FROM bot_aggregates
+        WHERE ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM bot_aggregates
+        )
         ORDER BY exchange, symbol, timeframe, ts_close
         """
     )
@@ -319,7 +324,13 @@ def rebuild_market_research() -> int:
             )
         )
 
-    execute("TRUNCATE TABLE market_research")
+    execute("""
+        DELETE FROM market_research
+        WHERE ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM bot_aggregates
+        )
+    """)
 
     if out:
         from db import _conn
