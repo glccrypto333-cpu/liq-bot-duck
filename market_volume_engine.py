@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from statistics import mean
 import math
 
-from db import fetch, replace_volume_state
+from db import fetch, replace_volume_state, execute, _conn
 from logger import log
 
 
@@ -90,8 +90,48 @@ def _legacy_state(structure: str) -> tuple[int, str]:
     return mapping.get(structure, (0, "обычный объем"))
 
 
-def rebuild_volume_state() -> int:
-    rows = fetch("""
+
+def _insert_volume_state_rows(rows: list[tuple]) -> None:
+    if not rows:
+        return
+
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO market_volume_state(
+            calculated_at,
+            ts_close,
+            exchange,
+            symbol,
+            timeframe,
+            volume_state,
+            volume_state_name,
+            volume_structure,
+            volume_quality,
+            volume_baseline_24h,
+            volume_hold_state,
+            volume_reason,
+            reason,
+            volume_delta_pct,
+            normalized_volume,
+            volume_percentile,
+            noise_state,
+            market_state,
+            invalid_reason
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
+
+
+def _rebuild_volume_state_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[int, dict]:
+    if not symbols:
+        return 0, {}
+
+    values_sql = ",".join(["(%s,%s)"] * len(symbols))
+    params = []
+    for exchange, symbol in symbols:
+        params.extend([exchange, symbol])
+
+    rows = fetch(
+        f"""
         SELECT
             calculated_at,
             ts_close,
@@ -104,14 +144,18 @@ def rebuild_volume_state() -> int:
             market_state,
             invalid_reason
         FROM market_research
-        WHERE ts_close >= (
+        WHERE (exchange, symbol) IN ({values_sql})
+          AND ts_close >= (
             SELECT MAX(ts_close) - '24 hours'::interval
             FROM market_research
-        )
+          )
         ORDER BY exchange, symbol, timeframe, ts_close
-    """)
+        """,
+        tuple(params),
+    )
 
     out = []
+    counts = {}
     calculated_at = datetime.now(timezone.utc)
     history_by_key = {}
     percentile_by_key = {}
@@ -171,12 +215,43 @@ def rebuild_volume_state() -> int:
 
         history_by_key.setdefault(key, []).append(volume_delta)
         percentile_by_key.setdefault(key, []).append(percentile)
+        counts[state_name] = counts.get(state_name, 0) + 1
 
-    replace_volume_state(out)
+    _insert_volume_state_rows(out)
+    return len(out), counts
 
-    counts = {}
-    for row in out:
-        counts[row[6]] = counts.get(row[6], 0) + 1
 
-    log(f"volume state rebuilt: rows={len(out)} {counts}")
-    return len(out)
+def rebuild_volume_state() -> int:
+    execute("""
+        DELETE FROM market_volume_state
+        WHERE ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM market_research
+        )
+    """)
+
+    symbols = [
+        (r["exchange"], r["symbol"])
+        for r in fetch("""
+            SELECT DISTINCT exchange, symbol
+            FROM market_research
+            WHERE ts_close >= (
+                SELECT MAX(ts_close) - '24 hours'::interval
+                FROM market_research
+            )
+            ORDER BY exchange, symbol
+        """)
+    ]
+
+    total_rows = 0
+    total_counts = {}
+    batch_size = 25
+
+    for i in range(0, len(symbols), batch_size):
+        rows_count, counts = _rebuild_volume_state_symbol_batch(symbols[i:i + batch_size])
+        total_rows += rows_count
+        for k, v in counts.items():
+            total_counts[k] = total_counts.get(k, 0) + v
+
+    log(f"volume state rebuilt: rows={total_rows} {total_counts}")
+    return total_rows
