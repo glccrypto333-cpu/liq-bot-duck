@@ -204,8 +204,10 @@ def _log_db_universe_check() -> None:
 
 def background(bybit_symbols, binance_symbols):
     last_export = 0.0
+    cycle_no = 0
 
     while True:
+        cycle_no += 1
         cycle_started = time.time()
         try:
             timings = []
@@ -213,7 +215,12 @@ def background(bybit_symbols, binance_symbols):
             _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
 
             agg_count = _timed_step(timings, "aggregates", rebuild_bot_aggregates)
-            audit_count = _timed_step(timings, "validation_audit", rebuild_all)
+            if cycle_no % 6 == 0:
+                audit_count = _timed_step(timings, "validation_audit", rebuild_all)
+            else:
+                audit_count = -1
+                log("validation_audit skipped: scheduled every 6 cycles")
+
             research_count = _timed_step(timings, "market_research", rebuild_market_research)
             silence_count = _timed_step(timings, "market_silence", rebuild_market_silence)
             price_count = _timed_step(timings, "price_state", rebuild_price_state)
