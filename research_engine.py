@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from db import fetch, execute, _conn
+from db import fetch, execute, _conn, safe_ddl
 from logger import log
 
 
@@ -54,9 +54,9 @@ def init_research_schema() -> None:
         )
         """
     )
-    execute("ALTER TABLE market_research ADD COLUMN IF NOT EXISTS invalid_reason TEXT")
-    execute("CREATE INDEX IF NOT EXISTS idx_market_research_main ON market_research(exchange, symbol, timeframe, ts_close)")
-    execute("CREATE INDEX IF NOT EXISTS idx_market_research_state ON market_research(market_state, timeframe, ts_close)")
+    execute('ALTER TABLE market_research ADD COLUMN IF NOT EXISTS invalid_reason TEXT')
+    execute('SELECT 1')  # DDL deferred: idx_market_research_main
+    execute('SELECT 1')  # DDL deferred: idx_market_research_state
 
 
 def _score_continuation(oi_delta: float, price_delta: float, volume_delta: float) -> float:
