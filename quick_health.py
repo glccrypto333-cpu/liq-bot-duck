@@ -1,4 +1,6 @@
-from db import fetch
+from db import execute, fetch
+
+execute("SET statement_timeout = '10s'")
 
 for r in fetch("""
 SELECT 'market_research' table_name, COUNT(*) rows, MAX(ts_close) latest_ts FROM market_research
