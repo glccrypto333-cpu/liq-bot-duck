@@ -787,7 +787,7 @@ def replace_oi_slope(rows):
         if staging_count != len(rows):
             raise RuntimeError(f"staging count mismatch: staging={staging_count}, rows={len(rows)}")
 
-        cur.execute("TRUNCATE market_oi_slope")
+        cur.execute("DELETE FROM market_oi_slope WHERE ts_close >= NOW() - INTERVAL '24 hours'")
         cur.execute(f"""
             INSERT INTO market_oi_slope ({col_sql})
             SELECT {col_sql}
@@ -798,7 +798,7 @@ def replace_oi_slope(rows):
 
 
 def replace_request_failures(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE request_failure_report")
+    execute("DELETE FROM request_failure_report")
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
