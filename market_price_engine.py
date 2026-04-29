@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from statistics import mean
 
-from db import fetch, replace_price_state, execute, _conn
+from db import fetch, execute, _conn
 from logger import log
 
 

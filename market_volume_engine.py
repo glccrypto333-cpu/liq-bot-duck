@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from statistics import mean
 import math
 
-from db import fetch, replace_volume_state, execute, _conn
+from db import fetch, execute, _conn
 from logger import log
 
 

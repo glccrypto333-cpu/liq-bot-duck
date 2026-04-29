@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from db import fetch, execute, replace_market_silence, _conn
+from db import fetch, execute, _conn
 from logger import log
 
 
