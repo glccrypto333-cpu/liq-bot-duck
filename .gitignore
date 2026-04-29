@@ -9,3 +9,9 @@ runtime/
 .DS_Store
 
 .venv/
+
+# runtime diagnostics
+runtime/fast_snapshot/
+runtime/*.zip
+runtime/*.csv
+runtime/rebuild.lock

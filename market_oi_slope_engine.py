@@ -77,22 +77,6 @@ def _oi_structure(oi_delta: float, acceleration: float, prev_avg: float) -> str:
     return "пила"
 
 
-def _oi_quality(structure: str, price_delta: float) -> str:
-    if structure in ("тишина", "спокойный боковик", "нисходящий OI"):
-        return "нет качества"
-    if structure == "пила":
-        return "пила"
-    if structure == "плавный набор":
-        return "плавный набор"
-    if structure == "ступенчатый набор":
-        return "ступенчатый набор"
-    if structure in ("ускорение", "агрессивный набор"):
-        return "рост против цены" if price_delta < -3 else "агрессивный набор"
-    if structure == "перегрев":
-        return "перегрев"
-    return "нестабильный рост"
-
-
 def _oi_priority(structure: str, quality: str) -> int:
     if quality in ("нет качества", "пила"):
         return 0
@@ -146,8 +130,7 @@ def rebuild_oi_slope() -> int:
             r.price_delta_pct,
             r.volume_delta_pct,
             r.range_width_pct,
-            s.stage AS silence_stage,
-            s.stage_name AS silence_stage_name
+            s.stage AS silence_stage
         FROM market_research r
         LEFT JOIN market_silence s
           ON s.exchange = r.exchange
@@ -176,27 +159,27 @@ def rebuild_oi_slope() -> int:
         acceleration = oi_delta - prev_avg
 
         oi_structure = _oi_structure(oi_delta, acceleration, prev_avg)
-        oi_quality = _oi_quality(oi_structure, price_delta)
-        oi_priority = _oi_priority(oi_structure, oi_quality)
+        oi_priority = _oi_priority(oi_structure, "")
         oi_hold_state = _hold_state(series)
 
         oi_delta_bucket = _bucket_oi_delta(oi_delta)
         oi_acceleration_bucket = _bucket_acceleration(acceleration)
-        oi_trend_1h = _trend_from_delta(oi_delta)
-        oi_trend_4h = _trend_from_delta(prev_avg)
+        oi_trend_15m = _trend_from_delta(mean(series[-3:]) if len(series) >= 3 else oi_delta)
+        oi_trend_30m = _trend_from_delta(mean(series[-6:]) if len(series) >= 6 else oi_delta)
+        oi_trend_1h = _trend_from_delta(mean(series[-12:]) if len(series) >= 12 else oi_delta)
+        oi_trend_4h = _trend_from_delta(mean(series[-48:]) if len(series) >= 48 else prev_avg)
         oi_trend_24h = "ожидает отдельного окна"
 
         stage, stage_name = _stage_from_oi(oi_priority, oi_hold_state)
 
         oi_reason = (
-            f"structure={oi_structure}; quality={oi_quality}; "
+            f"structure={oi_structure}; "
             f"priority={oi_priority}; hold={oi_hold_state}; "
             f"delta_bucket={oi_delta_bucket}; acceleration_bucket={oi_acceleration_bucket}; "
+            f"trend15m={oi_trend_15m}; trend30m={oi_trend_30m}; "
+            f"trend1h={oi_trend_1h}; trend4h={oi_trend_4h}; "
             f"oi_delta={oi_delta:.2f}; acceleration={acceleration:.2f}"
         )
-
-        strength = float(oi_priority)
-        raw_strength = 0.0
 
         out.append((
             calculated_at,
@@ -206,12 +189,11 @@ def rebuild_oi_slope() -> int:
             r["timeframe"],
             stage,
             stage_name,
-            strength,
-            raw_strength,
             oi_structure,
-            oi_quality,
             oi_priority,
             oi_hold_state,
+            oi_trend_15m,
+            oi_trend_30m,
             oi_trend_1h,
             oi_trend_4h,
             oi_trend_24h,
@@ -224,7 +206,6 @@ def rebuild_oi_slope() -> int:
             volume_delta,
             range_width,
             int(r["silence_stage"] or -1),
-            r["silence_stage_name"] or "нет данных",
         ))
 
     replace_oi_slope(out)

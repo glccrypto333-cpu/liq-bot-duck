@@ -115,7 +115,7 @@ def _fetch_top_oi_rows(since, timeframe: str, limit: int = 100):
         ORDER BY
             stage DESC,
             oi_priority DESC,
-            oi_quality DESC,
+            
             oi_hold_state DESC,
             oi_acceleration DESC,
             ts_close DESC,
@@ -215,8 +215,7 @@ STAGE_ENGINE_RULES = [
         "stage_engine_score": 45,
         "min_continuation": 35,
         "reason": "watch: partial activity, no deterministic regime confirmation",
-    },
-]
+    }]
 
 
 def _stage_rule_match(rule: dict, alignment_score: float, continuation_score: float, exhaustion_score: float, liquidity_event_flag: int) -> bool:
@@ -376,8 +375,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             price_row["price_high"] if price_row else None,
             price_row["price_low"] if price_row else None,
             price_row["price_close"] if price_row else None,
-            volume_row["volume"] if volume_row else None,
-        ])
+            volume_row["volume"] if volume_row else None])
 
     aggregates = fetch("""
         SELECT *
@@ -473,7 +471,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         SELECT *
         FROM market_oi_slope
         WHERE ts_close >= %s
-        ORDER BY stage DESC, oi_priority DESC, oi_quality DESC, oi_hold_state DESC, oi_acceleration DESC, exchange, symbol, timeframe, ts_close
+        ORDER BY stage DESC, oi_priority DESC,  oi_hold_state DESC, oi_acceleration DESC, exchange, symbol, timeframe, ts_close
     """, (since,))
 
     oi_slope_top = _safe_fetch("""
@@ -484,7 +482,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         ORDER BY
             stage DESC,
             oi_priority DESC,
-            oi_quality DESC,
+            
             oi_hold_state DESC,
             oi_acceleration DESC,
             exchange,
@@ -505,7 +503,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
             exchange,
             timeframe,
             stage_name,
-            oi_quality,
 
             COUNT(*) AS rows_count,
 
@@ -513,7 +510,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
             AVG(oi_priority) AS avg_oi_priority,
             MAX(oi_priority) AS max_oi_priority,
 
-            AVG(raw_strength) AS avg_raw_strength,
 
             SUM(CASE WHEN oi_priority >= 3 THEN 1 ELSE 0 END) AS oi_priority_ge_3,
             SUM(CASE WHEN oi_priority >= 4 THEN 1 ELSE 0 END) AS oi_priority_ge_4
@@ -525,7 +521,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
             exchange,
             timeframe,
             stage_name,
-            oi_quality
 
         ORDER BY
             timeframe,
@@ -844,33 +839,33 @@ def rebuild_exports(mode: str = "quick") -> Path:
 
     _write_csv(
         market_oi_slope_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","oi_structure","oi_quality","oi_priority","oi_hold_state","oi_trend_1h","oi_trend_4h","oi_trend_24h","oi_reason","strength","raw_strength","reason","oi_delta_pct","oi_acceleration","oi_prev_avg","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage","silence_stage_name"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],_v(r,"oi_structure"),_v(r,"oi_quality"),_v(r,"oi_priority"),_v(r,"oi_hold_state"),_v(r,"oi_trend_1h"),_v(r,"oi_trend_4h"),_v(r,"oi_trend_24h"),_v(r,"oi_reason"),r["strength"],r["raw_strength"],r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["oi_prev_avg"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage"],r["silence_stage_name"]] for r in market_oi_slope],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","oi_structure","oi_priority","oi_hold_state","oi_trend_1h","oi_trend_4h","oi_trend_24h","oi_reason","reason","oi_delta_pct","oi_acceleration","oi_prev_avg","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage"],
+        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],_v(r,"oi_structure"),_v(r,"oi_priority"),_v(r,"oi_hold_state"),_v(r,"oi_trend_1h"),_v(r,"oi_trend_4h"),_v(r,"oi_trend_24h"),_v(r,"oi_reason"),r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["oi_prev_avg"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage"]] for r in market_oi_slope],
     )
 
 
     _write_csv(
         top_oi_15m_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_15m)],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(top_oi_15m)],
     )
 
     _write_csv(
         top_oi_30m_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_30m)],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(top_oi_30m)],
     )
 
     _write_csv(
         top_oi_1h_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_1h)],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(top_oi_1h)],
     )
 
     _write_csv(
         top_oi_4h_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(top_oi_4h)],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(top_oi_4h)],
     )
 
     _write_csv(
@@ -879,70 +874,27 @@ def rebuild_exports(mode: str = "quick") -> Path:
             "exchange",
             "timeframe",
             "stage_name",
-            "oi_quality",
+            
             "rows_count",
-            "min_strength",
-            "avg_strength",
-            "max_strength",
-            "avg_raw_strength",
             "oi_priority_ge_3",
-            "oi_priority_ge_4",
-        ],
+            "oi_priority_ge_4"],
         [
             [
                 _v(r, "exchange"),
                 _v(r, "timeframe"),
                 _v(r, "stage_name"),
-                _v(r, "oi_quality"),
                 _v(r, "rows_count", 0),
-                _v(r, "min_strength", 0),
-                _v(r, "avg_strength", 0),
-                _v(r, "max_strength", 0),
-                _v(r, "avg_raw_strength", 0),
                 _v(r, "oi_priority_ge_3", 0),
-                _v(r, "oi_priority_ge_4", 0),
-            ]
+                _v(r, "oi_priority_ge_4", 0)]
             for r in _rows(oi_slope_summary)
         ],
     )
 
     _write_csv(
         oi_slope_top_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","strength","raw_strength","oi_quality","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage_name"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"strength"),_v(r,"raw_strength"),_v(r,"oi_quality"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r,"silence_stage_name")] for r in _rows(oi_slope_top)],
+        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
+        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(oi_slope_top)],
     )
-
-    oi_groups = {}
-
-    for r in market_oi_slope:
-        key = (r["timeframe"], r["stage"], r["stage_name"])
-        g = oi_groups.setdefault(key, {
-            "timeframe": r["timeframe"],
-            "stage": r["stage"],
-            "stage_name": r["stage_name"],
-            "rows_count": 0,
-            "strength_sum": 0.0,
-            "strength_min": None,
-            "strength_max": None,
-            "raw_strength_max": None,
-            "strength_100_count": 0,
-            "unique_strength": set(),
-        })
-
-        strength = float(r["strength"] or 0.0)
-        raw_strength = float(r["raw_strength"] or 0.0)
-
-        g["rows_count"] += 1
-        g["strength_sum"] += strength
-        g["strength_min"] = strength if g["strength_min"] is None else min(g["strength_min"], strength)
-        g["strength_max"] = strength if g["strength_max"] is None else max(g["strength_max"], strength)
-        g["raw_strength_max"] = raw_strength if g["raw_strength_max"] is None else max(g["raw_strength_max"], raw_strength)
-
-        if strength >= 100:
-            g["strength_100_count"] += 1
-
-        g["unique_strength"].add(strength)
-
 
     _write_csv(
         market_silence_path,
@@ -963,33 +915,28 @@ def rebuild_exports(mode: str = "quick") -> Path:
             len([r for r in _rows(market_silence) if _v(r, "stage_name") == "тишина"]),
             len([r for r in _rows(market_silence) if _v(r, "stage_name") == "сухой рынок"]),
             None,
-            None,
-        ],
+            None],
         [
             "market_price_state",
             len(_rows(market_price_state)),
             len([r for r in _rows(market_price_state) if _v(r, "price_state_name") == "сжатие"]),
             len([r for r in _rows(market_price_state) if "импульс" in str(_v(r, "price_state_name", ""))]),
             None,
-            None,
-        ],
+            None],
         [
             "market_volume_state",
             len(_rows(market_volume_state)),
             len([r for r in _rows(market_volume_state) if _v(r, "noise_state") == "шум"]),
             len([r for r in _rows(market_volume_state) if _v(r, "volume_state_name") == "аномальный объем"]),
             round(sum(float(_v(r, "volume_percentile", 0) or 0) for r in _rows(market_volume_state)) / max(len(_rows(market_volume_state)), 1), 2),
-            None,
-        ],
+            None],
         [
             "market_oi_slope",
             len(_rows(market_oi_slope)),
             len([r for r in _rows(market_oi_slope) if _v(r, "stage_name") == "наблюдение"]),
             len([r for r in _rows(market_oi_slope) if _v(r, "stage_name") == "возня"]),
-            round(sum(float(_v(r, "strength", 0) or 0) for r in _rows(market_oi_slope)) / max(len(_rows(market_oi_slope)), 1), 2),
-            max([float(_v(r, "strength", 0) or 0) for r in _rows(market_oi_slope)] or [0]),
-        ],
-    ]
+            round(sum(float(_v(r,  0) or 0) for r in _rows(market_oi_slope)) / max(len(_rows(market_oi_slope)), 1), 2),
+            max([float(_v(r,  0) or 0) for r in _rows(market_oi_slope)] or [0])]]
 
     oi_state_map = {
         (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
@@ -1086,8 +1033,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             "cumulative_oi_delta_pct",
             "avg_oi_delta_pct",
             "avg_oi_acceleration",
-            "persistence_state",
-        ],
+            "persistence_state"],
         [
             [
                 _v(r, "exchange"),
@@ -1098,8 +1044,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
                 _v(r, "cumulative_oi_delta_pct", 0),
                 _v(r, "avg_oi_delta_pct", 0),
                 _v(r, "avg_oi_acceleration", 0),
-                _v(r, "persistence_state"),
-            ]
+                _v(r, "persistence_state")]
             for r in _rows(oi_persistence)
         ],
     )
@@ -1118,8 +1063,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             "avg_range_width_pct",
             "avg_abs_price_delta_pct",
             "avg_abs_volume_delta_pct",
-            "avg_abs_oi_delta_pct",
-        ],
+            "avg_abs_oi_delta_pct"],
         [
             [
                 _v(r, "exchange"),
@@ -1133,8 +1077,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
                 _v(r, "avg_range_width_pct", 0),
                 _v(r, "avg_abs_price_delta_pct", 0),
                 _v(r, "avg_abs_volume_delta_pct", 0),
-                _v(r, "avg_abs_oi_delta_pct", 0),
-            ]
+                _v(r, "avg_abs_oi_delta_pct", 0)]
             for r in _rows(symbol_baseline)
         ],
     )
@@ -1173,9 +1116,6 @@ def rebuild_exports(mode: str = "quick") -> Path:
             _v(r, "oi_prev_avg"),
             abs(float(_v(r, "oi_delta_pct", 0) or 0)),
             abs(float(_v(r, "oi_acceleration", 0) or 0)),
-            _v(r, "raw_strength"),
-            _v(r, "strength"),
-            _v(r, "oi_quality"),
             _v(r, "stage"),
             _v(r, "stage_name"),
             _v(r, "reason"),
@@ -1207,9 +1147,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
             se["stage_engine_score"],
             se["stage_engine_reason"],
 
-            _v(r, "silence_stage"),
-            _v(r, "silence_stage_name"),
-        ])
+            _v(r, "silence_stage")])
 
     market_phase = _safe_fetch("""
         SELECT *
@@ -1224,26 +1162,24 @@ def rebuild_exports(mode: str = "quick") -> Path:
             "phase","phase_name","phase_status","priority",
             "phase_started_at","phase_updated_at",
             "stage1_started_at","stage2_started_at","stage3_started_at",
-            "manual_reset_required","dmd_level","confidence",
-            "oi_structure","oi_quality","oi_priority","oi_hold_state",
+            "manual_reset_required","confidence",
+            "oi_structure","oi_priority","oi_hold_state",
             "oi_trend_1h","oi_trend_4h","oi_trend_24h",
             "price_structure","price_quality","price_slope_state",
             "volume_structure","volume_quality","volume_hold_state",
-            "transition_reason","reason",
-        ],
+            "transition_reason","reason"],
         [
             [
                 r["calculated_at"], r["exchange"], r["symbol"], r["timeframe"],
                 r["phase"], r["phase_name"], r["phase_status"], r["priority"],
                 r["phase_started_at"], r["phase_updated_at"],
                 r["stage1_started_at"], r["stage2_started_at"], r["stage3_started_at"],
-                r["manual_reset_required"], r["dmd_level"], r["confidence"],
-                r["oi_structure"], r["oi_quality"], r["oi_priority"], r["oi_hold_state"],
+                r["manual_reset_required"], r["confidence"],
+                r["oi_structure"], r["oi_priority"], r["oi_hold_state"],
                 r["oi_trend_1h"], r["oi_trend_4h"], r["oi_trend_24h"],
                 r["price_structure"], r["price_quality"], r["price_slope_state"],
                 r["volume_structure"], r["volume_quality"], r["volume_hold_state"],
-                r["transition_reason"], r["reason"],
-            ]
+                r["transition_reason"], r["reason"]]
             for r in market_phase
         ],
     )
@@ -1293,8 +1229,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"invalid_data_state_rows: {len(invalid_data_states)}",
         f"request_failure_rows: {len(request_failures)}",
         "",
-        "Top invalid audit:",
-    ]
+        "Top invalid audit:"]
 
     for r in invalid[:100]:
         audit_lines.append(f'{r["metric"]} {r["symbol"]} {r["exchange"]} {r["timeframe"]} drift={r["drift"]} status={r["validation_status"]}')
@@ -1330,8 +1265,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"invalid_data_state_rows: {len(invalid_data_states)}",
         f"request_failure_rows: {len(request_failures)}",
         "",
-        "Состояния:",
-    ]
+        "Состояния:"]
 
     for r in market_states[:200]:
         research_lines.append(
@@ -1355,8 +1289,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"coverage_critical_rows: {len(critical_coverage)}",
         f"coverage_warning_rows: {len(warning_coverage)}",
         "",
-        "Storage summary:",
-    ]
+        "Storage summary:"]
 
     for r in storage_summary:
         oldest = r["oldest_ts"]
@@ -1397,8 +1330,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         f"market_research_rows_exported: {len(market_research)}",
         "",
         "Runtime note:",
-        "This report is generated during export rebuild. It does not restart the bot.",
-    ]
+        "This report is generated during export rebuild. It does not restart the bot."]
 
     _write_text(runtime_health_path, "\n".join(runtime_lines))
 
@@ -1453,8 +1385,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
         manifest_path,
         storage_health_path,
         runtime_health_path,
-        runtime_timing_path,
-    ]
+        runtime_timing_path]
 
     _zip(bundle_path, bundle_files)
     _zip(mode_bundle_path, bundle_files + [audit_report_path, research_report_path])

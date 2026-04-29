@@ -119,26 +119,14 @@ def _confidence(phase: int, oi_priority, oi_structure, volume_structure, price_s
     return "NONE"
 
 
-def _dmd_level(phase: int, oi_priority, volume_structure) -> str:
-    oi_p = _as_int(oi_priority)
-
-    if phase == 3 and oi_p <= 1 and volume_structure in VOLUME_BOOST:
-        return "DMD_HIGH"
-
-    if phase >= 2 and oi_p <= 2:
-        return "DMD_MEDIUM"
-
-    if phase >= 1:
-        return "DMD_LOW"
-
-    return "DMD_NONE"
-
-
 def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
     oi_structure = _v(row, "oi_structure")
-    oi_quality = _v(row, "oi_quality")
     oi_priority = _as_int(_v(row, "oi_priority", 5))
     oi_hold_state = _v(row, "oi_hold_state")
+    oi_trend_15m = _v(row, "oi_trend_15m")
+    oi_trend_30m = _v(row, "oi_trend_30m")
+    oi_trend_15m = _v(row, "oi_trend_15m")
+    oi_trend_30m = _v(row, "oi_trend_30m")
     oi_trend_1h = _v(row, "oi_trend_1h")
     oi_trend_4h = _v(row, "oi_trend_4h")
     price_structure = _v(row, "price_structure")
@@ -150,25 +138,33 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
     stage1_age_ok = _age_ok(stage1_started_at, now, STAGE1_MIN_AGE)
     stage2_age_ok = _age_ok(stage2_started_at, now, STAGE2_MIN_AGE)
 
-    # 2 -> 0 / 1 -> 0: мусорный OI ломает фазу.
-    if oi_structure in BAD_OI:
-        return 0, f"bad_oi_structure={oi_structure}"
+    # oi_structure больше не управляет фазами напрямую.
+    # CORE:
+    # oi_priority
+    # oi_trend_15m
+    # oi_trend_30m
+    # oi_trend_1h
+    # oi_trend_4h
+    # oi_hold_state
+
+    # Жесткий фильтр: priority=0 не может быть Stage 1/2/3.
+    if oi_priority <= 0:
+        return 0, f"dead_oi_priority={oi_priority}"
 
     # Price сам не управляет фазой, но хаос без OI-поддержки отправляет в 0.
-    if price_structure in BAD_PRICE and oi_structure not in STAGE2_OI:
-        return 0, f"bad_price_without_oi_support price={price_structure} oi={oi_structure}"
+    if price_structure in BAD_PRICE and oi_priority >= 4:
+        return 0, f"bad_price_without_oi_support price={price_structure} oi_priority={oi_priority}"
 
     # 2 -> 3: только после Stage 2 >= 15 минут.
     stage3_ok = (
         prev_phase == 2
         and stage2_age_ok
         and oi_priority <= 2
-        and (
-            oi_structure in STAGE3_OI
-            or oi_quality == "агрессивный набор"
-            or oi_trend_1h in STRONG_OI_TRENDS
-            or oi_trend_4h in STRONG_OI_TRENDS
-        )
+        and oi_trend_15m in STRONG_OI_TRENDS
+        and oi_trend_30m in POSITIVE_OI_TRENDS
+        and oi_trend_1h in POSITIVE_OI_TRENDS
+        and oi_hold_state in {"holding", "hold", "удержание"}
+        and oi_trend_4h not in {"strong_down", "down", "нисходящий"}
     )
 
     if stage3_ok:
@@ -185,30 +181,27 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
             )
         )
         and oi_priority <= 3
-        and (
-            oi_structure in STAGE2_OI
-            or oi_trend_1h in POSITIVE_OI_TRENDS
-            or oi_trend_4h in POSITIVE_OI_TRENDS
-            or oi_hold_state in {"holding", "hold", "удержание", "trying_hold"}
-        )
+        and oi_trend_1h in POSITIVE_OI_TRENDS
+        and oi_hold_state in {"holding", "hold", "удержание", "trying_hold"}
     )
 
     if stage2_ok:
         return 2, "stage1_to_stage2_or_hold: stage1_age_ok oi_slope_or_hold"
 
     # 2 -> 1: OI остыл, но мусора нет.
-    if prev_phase == 2 and oi_structure in GOOD_STAGE1_OI:
-        return 1, "downgrade_stage2_to_stage1: oi_cooled_no_bad_oi"
+    if prev_phase == 2 and oi_priority in {2, 3, 4}:
+        return 1, "downgrade_stage2_to_stage1: oi_cooled_but_alive"
 
-    # 0 -> 1: OI ожил, структура не мусор, price не хаос.
+    # 0 -> 1: только живой OI, не спокойный боковик.
     stage1_ok = (
-        oi_structure in GOOD_STAGE1_OI
+        oi_priority in {1, 2, 3}
+        and oi_trend_1h in POSITIVE_OI_TRENDS
+        and oi_trend_4h not in {"strong_down", "down", "нисходящий", "снижение"}
         and price_structure in OK_PRICE
-        and volume_structure in VOLUME_OK.union({None})
     )
 
     if stage1_ok:
-        return 1, "stage0_to_stage1_or_hold: early_oi_interest"
+        return 1, "stage0_to_stage1: oi_priority_alive_price_not_bad"
 
     return 0, "no_valid_phase_conditions"
 
@@ -255,9 +248,10 @@ def rebuild_market_phase() -> int:
             pp.stage3_started_at,
 
             oi.oi_structure,
-            oi.oi_quality,
             oi.oi_priority,
             oi.oi_hold_state,
+            oi.oi_trend_15m,
+            oi.oi_trend_30m,
             oi.oi_trend_1h,
             oi.oi_trend_4h,
             oi.oi_trend_24h,
@@ -325,7 +319,6 @@ def rebuild_market_phase() -> int:
             _v(r, "price_structure"),
         )
 
-        dmd = _dmd_level(new_phase, _v(r, "oi_priority"), _v(r, "volume_structure"))
 
         prev_started = _v(r, "phase_started_at")
         stage1_started = _v(r, "stage1_started_at")
@@ -351,7 +344,6 @@ def rebuild_market_phase() -> int:
         reason = (
             f"{transition_reason}; "
             f"oi_structure={_v(r,'oi_structure')}; "
-            f"oi_quality={_v(r,'oi_quality')}; "
             f"oi_priority={_v(r,'oi_priority')}; "
             f"oi_hold_state={_v(r,'oi_hold_state')}; "
             f"oi_trend_1h={_v(r,'oi_trend_1h')}; "
@@ -376,10 +368,8 @@ def rebuild_market_phase() -> int:
             stage2_started,
             stage3_started,
             new_phase == 3,
-            dmd,
             confidence,
             _v(r, "oi_structure"),
-            _v(r, "oi_quality"),
             _v(r, "oi_priority"),
             _v(r, "oi_hold_state"),
             _v(r, "oi_trend_1h"),
@@ -409,7 +399,6 @@ def rebuild_market_phase() -> int:
                 priority,
                 transition_reason,
                 _v(r, "oi_structure"),
-                _v(r, "oi_quality"),
                 _v(r, "oi_priority"),
                 _v(r, "oi_hold_state"),
                 _v(r, "price_structure"),

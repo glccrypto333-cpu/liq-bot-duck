@@ -28,8 +28,8 @@ def _conn():
         DATABASE_URL,
         autocommit=True,
         row_factory=dict_row,
-        connect_timeout=5,
-    )
+        connect_timeout=5
+        )
     _apply_session_settings(_DB_CONN)
     return _DB_CONN
 
@@ -270,12 +270,11 @@ def init_db() -> None:
             timeframe TEXT NOT NULL,
             stage INTEGER NOT NULL,
             stage_name TEXT NOT NULL,
-            strength DOUBLE PRECISION NOT NULL,
-            raw_strength DOUBLE PRECISION,
             oi_structure TEXT,
-            oi_quality TEXT,
             oi_priority INTEGER,
             oi_hold_state TEXT,
+            oi_trend_15m TEXT,
+            oi_trend_30m TEXT,
             oi_trend_1h TEXT,
             oi_trend_4h TEXT,
             oi_trend_24h TEXT,
@@ -287,8 +286,7 @@ def init_db() -> None:
             price_delta_pct DOUBLE PRECISION,
             volume_delta_pct DOUBLE PRECISION,
             range_width_pct DOUBLE PRECISION,
-            silence_stage INTEGER,
-            silence_stage_name TEXT
+            silence_stage INTEGER
         )
         """)
 
@@ -308,12 +306,12 @@ def init_db() -> None:
             stage2_started_at TIMESTAMPTZ,
             stage3_started_at TIMESTAMPTZ,
             manual_reset_required BOOLEAN DEFAULT FALSE,
-            dmd_level TEXT,
             confidence TEXT,
             oi_structure TEXT,
-            oi_quality TEXT,
             oi_priority INTEGER,
             oi_hold_state TEXT,
+            oi_trend_15m TEXT,
+            oi_trend_30m TEXT,
             oi_trend_1h TEXT,
             oi_trend_4h TEXT,
             oi_trend_24h TEXT,
@@ -342,7 +340,6 @@ def init_db() -> None:
             priority TEXT,
             transition_reason TEXT NOT NULL,
             oi_structure TEXT,
-            oi_quality TEXT,
             oi_priority INTEGER,
             oi_hold_state TEXT,
             price_structure TEXT,
@@ -391,17 +388,17 @@ def init_db() -> None:
         cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_reason TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_main ON market_price_state(exchange, symbol, timeframe, ts_close)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_name ON market_price_state(price_state_name, timeframe)")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS raw_strength DOUBLE PRECISION")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_structure TEXT")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_quality TEXT")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_priority INTEGER")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_hold_state TEXT")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_15m TEXT")
+        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_30m TEXT")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_1h TEXT")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_4h TEXT")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_24h TEXT")
         cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_reason TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_main ON market_oi_slope(exchange, symbol, timeframe, ts_close)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_stage ON market_oi_slope(stage, timeframe, strength)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_stage ON market_oi_slope(stage, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_main ON market_phase(exchange, symbol, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_phase ON market_phase(phase, timeframe, priority)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_history_main ON market_phase_history(exchange, symbol, timeframe, calculated_at)")
@@ -588,9 +585,10 @@ def active_universe_sql(alias: str = "") -> str:
 
 
 def replace_market_phase(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE market_phase")
     if not DATABASE_URL or not rows:
+        print("replace_market_phase skipped: empty rows, old table preserved")
         return
+    execute("TRUNCATE TABLE market_phase")
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
         INSERT INTO market_phase(
@@ -598,13 +596,13 @@ def replace_market_phase(rows: list[tuple]) -> None:
             phase, phase_name, phase_status, priority,
             phase_started_at, phase_updated_at,
             stage1_started_at, stage2_started_at, stage3_started_at,
-            manual_reset_required, dmd_level, confidence,
-            oi_structure, oi_quality, oi_priority, oi_hold_state,
+            manual_reset_required, confidence,
+            oi_structure, oi_priority, oi_hold_state,
             oi_trend_1h, oi_trend_4h, oi_trend_24h,
             price_structure, price_quality, price_slope_state,
             volume_structure, volume_quality, volume_hold_state,
             transition_reason, reason
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
 
 
@@ -617,17 +615,18 @@ def insert_market_phase_history(rows: list[tuple]) -> None:
             calculated_at, exchange, symbol, timeframe,
             from_phase, to_phase, from_phase_name, to_phase_name,
             phase_status, priority, transition_reason,
-            oi_structure, oi_quality, oi_priority, oi_hold_state,
+            oi_structure, oi_priority, oi_hold_state,
             price_structure, price_quality,
             volume_structure, volume_quality
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
 
 
 def replace_market_silence(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE market_silence")
     if not DATABASE_URL or not rows:
+        print("replace_market_silence skipped: empty rows, old table preserved")
         return
+    execute("TRUNCATE TABLE market_silence")
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
         INSERT INTO market_silence(
@@ -652,9 +651,10 @@ def replace_market_silence(rows: list[tuple]) -> None:
 
 
 def replace_volume_state(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE market_volume_state")
     if not DATABASE_URL or not rows:
+        print("replace_volume_state skipped: empty rows, old table preserved")
         return
+    execute("TRUNCATE TABLE market_volume_state")
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
         INSERT INTO market_volume_state(
@@ -682,9 +682,10 @@ def replace_volume_state(rows: list[tuple]) -> None:
 
 
 def replace_price_state(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE market_price_state")
     if not DATABASE_URL or not rows:
+        print("replace_price_state skipped: empty rows, old table preserved")
         return
+    execute("TRUNCATE TABLE market_price_state")
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
         INSERT INTO market_price_state(
@@ -710,41 +711,74 @@ def replace_price_state(rows: list[tuple]) -> None:
         """, rows)
 
 
-def replace_oi_slope(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE market_oi_slope")
-    if not DATABASE_URL or not rows:
+def replace_oi_slope(rows):
+    if not rows:
+        print("replace_oi_slope skipped: empty rows, old table preserved")
         return
+
+    cols = [
+        "calculated_at",
+        "ts_close",
+        "exchange",
+        "symbol",
+        "timeframe",
+        "stage",
+        "stage_name",
+        "oi_structure",
+        "oi_priority",
+        "oi_hold_state",
+        "oi_trend_15m",
+        "oi_trend_30m",
+        "oi_trend_1h",
+        "oi_trend_4h",
+        "oi_trend_24h",
+        "oi_reason",
+        "reason",
+        "oi_delta_pct",
+        "oi_acceleration",
+        "oi_prev_avg",
+        "price_delta_pct",
+        "volume_delta_pct",
+        "range_width_pct",
+        "silence_stage",
+    ]
+
+    expected = len(cols)
+
+    bad = [i for i, r in enumerate(rows[:20]) if len(tuple(r)) != expected]
+    if bad:
+        raise ValueError(f"replace_oi_slope bad row length: expected={expected}, bad_indexes={bad}, first_len={len(tuple(rows[0]))}")
+
+    col_sql = ",".join(cols)
+    ph_sql = ",".join(["%s"] * expected)
+
     with _conn() as conn, conn.cursor() as cur:
-        cur.executemany("""
-        INSERT INTO market_oi_slope(
-            calculated_at,
-            ts_close,
-            exchange,
-            symbol,
-            timeframe,
-            stage,
-            stage_name,
-            strength,
-            raw_strength,
-            oi_structure,
-            oi_quality,
-            oi_priority,
-            oi_hold_state,
-            oi_trend_1h,
-            oi_trend_4h,
-            oi_trend_24h,
-            oi_reason,
-            reason,
-            oi_delta_pct,
-            oi_acceleration,
-            oi_prev_avg,
-            price_delta_pct,
-            volume_delta_pct,
-            range_width_pct,
-            silence_stage,
-            silence_stage_name
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, rows)
+        cur.execute("DROP TABLE IF EXISTS market_oi_slope_staging")
+        cur.execute("CREATE UNLOGGED TABLE market_oi_slope_staging (LIKE market_oi_slope INCLUDING DEFAULTS)")
+        conn.commit()
+
+        batch_size = 1000
+        for i in range(0, len(rows), batch_size):
+            cur.executemany(
+                f"INSERT INTO market_oi_slope_staging ({col_sql}) VALUES ({ph_sql})",
+                rows[i:i + batch_size],
+            )
+            conn.commit()
+
+        cur.execute("SELECT COUNT(*) AS cnt FROM market_oi_slope_staging")
+        staging_count = cur.fetchone()["cnt"]
+
+        if staging_count != len(rows):
+            raise RuntimeError(f"staging count mismatch: staging={staging_count}, rows={len(rows)}")
+
+        cur.execute("TRUNCATE market_oi_slope")
+        cur.execute(f"""
+            INSERT INTO market_oi_slope ({col_sql})
+            SELECT {col_sql}
+            FROM market_oi_slope_staging
+        """)
+        cur.execute("DROP TABLE IF EXISTS market_oi_slope_staging")
+        conn.commit()
 
 
 def replace_request_failures(rows: list[tuple]) -> None:
