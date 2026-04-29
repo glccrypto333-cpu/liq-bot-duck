@@ -92,6 +92,10 @@ def rebuild_price_state() -> int:
             market_state,
             invalid_reason
         FROM market_research
+        WHERE ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM market_research
+        )
         ORDER BY exchange, symbol, timeframe, ts_close
     """)
 

@@ -143,6 +143,10 @@ def rebuild_oi_slope() -> int:
          AND s.symbol = r.symbol
          AND s.timeframe = r.timeframe
          AND s.ts_close = r.ts_close
+        WHERE r.ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM market_research
+        )
         ORDER BY r.exchange, r.symbol, r.timeframe, r.ts_close
     """)
 
