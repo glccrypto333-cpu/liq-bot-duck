@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from statistics import mean
 
-from db import fetch, replace_oi_slope
+from db import fetch, execute, _conn
 from logger import log
 
 
@@ -124,8 +124,34 @@ def _stage_from_oi(priority: int, hold_state: str) -> tuple[int, str]:
     return 2, "возня"
 
 
-def rebuild_oi_slope() -> int:
-    rows = fetch("""
+
+def _insert_oi_slope_rows(rows: list[tuple]) -> None:
+    if not rows:
+        return
+
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO market_oi_slope(
+            calculated_at, ts_close, exchange, symbol, timeframe,
+            stage, stage_name, oi_structure, oi_priority, oi_hold_state,
+            oi_trend_15m, oi_trend_30m, oi_trend_1h, oi_trend_4h, oi_trend_24h,
+            oi_reason, reason, oi_delta_pct, oi_acceleration, oi_prev_avg,
+            price_delta_pct, volume_delta_pct, range_width_pct, silence_stage
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
+
+
+def _rebuild_oi_slope_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[int, dict]:
+    if not symbols:
+        return 0, {}
+
+    values_sql = ",".join(["(%s,%s)"] * len(symbols))
+    params = []
+    for exchange, symbol in symbols:
+        params.extend([exchange, symbol])
+
+    rows = fetch(
+        f"""
         SELECT
             r.calculated_at,
             r.ts_close,
@@ -143,15 +169,19 @@ def rebuild_oi_slope() -> int:
          AND s.symbol = r.symbol
          AND s.timeframe = r.timeframe
          AND s.ts_close = r.ts_close
-        WHERE r.ts_close >= (
+        WHERE (r.exchange, r.symbol) IN ({values_sql})
+          AND r.ts_close >= (
             SELECT MAX(ts_close) - '24 hours'::interval
             FROM market_research
-        )
+          )
         ORDER BY r.exchange, r.symbol, r.timeframe, r.ts_close
-    """)
+        """,
+        tuple(params),
+    )
 
     history = {}
     out = []
+    counts = {}
     calculated_at = datetime.now(timezone.utc)
 
     for r in rows:
@@ -218,11 +248,43 @@ def rebuild_oi_slope() -> int:
             int(r["silence_stage"] or -1),
         ))
 
-    replace_oi_slope(out)
+        counts[stage_name] = counts.get(stage_name, 0) + 1
 
-    counts = {}
-    for row in out:
-        counts[row[6]] = counts.get(row[6], 0) + 1
+    _insert_oi_slope_rows(out)
+    return len(out), counts
 
-    log(f"oi slope rebuilt: rows={len(out)} {counts}")
-    return len(out)
+
+def rebuild_oi_slope() -> int:
+    execute("""
+        DELETE FROM market_oi_slope
+        WHERE ts_close >= (
+            SELECT MAX(ts_close) - '24 hours'::interval
+            FROM market_research
+        )
+    """)
+
+    symbols = [
+        (r["exchange"], r["symbol"])
+        for r in fetch("""
+            SELECT DISTINCT exchange, symbol
+            FROM market_research
+            WHERE ts_close >= (
+                SELECT MAX(ts_close) - '24 hours'::interval
+                FROM market_research
+            )
+            ORDER BY exchange, symbol
+        """)
+    ]
+
+    total_rows = 0
+    total_counts = {}
+    batch_size = 25
+
+    for i in range(0, len(symbols), batch_size):
+        rows_count, counts = _rebuild_oi_slope_symbol_batch(symbols[i:i + batch_size])
+        total_rows += rows_count
+        for k, v in counts.items():
+            total_counts[k] = total_counts.get(k, 0) + v
+
+    log(f"oi slope rebuilt: rows={total_rows} {total_counts}")
+    return total_rows
