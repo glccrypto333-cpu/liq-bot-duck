@@ -495,7 +495,7 @@ def replace_bot_aggregates(rows: list[tuple]) -> None:
         """, rows)
 
 def replace_validation(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE validation_audit")
+    execute("DELETE FROM validation_audit")
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
@@ -510,7 +510,7 @@ def replace_validation(rows: list[tuple]) -> None:
         """, rows)
 
 def replace_integrity(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE raw_integrity_report")
+    execute("DELETE FROM raw_integrity_report")
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
@@ -522,7 +522,7 @@ def replace_integrity(rows: list[tuple]) -> None:
         """, rows)
 
 def replace_coverage(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE coverage_report")
+    execute("DELETE FROM coverage_report")
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
@@ -546,7 +546,7 @@ def replace_coverage(rows: list[tuple]) -> None:
 
 
 def replace_gaps(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE gap_report")
+    execute("DELETE FROM gap_report")
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
@@ -565,7 +565,7 @@ def replace_gaps(rows: list[tuple]) -> None:
 
 
 def replace_active_universe(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE active_symbol_universe")
+    execute("DELETE FROM active_symbol_universe")
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
@@ -595,7 +595,7 @@ def replace_market_phase(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         print("replace_market_phase skipped: empty rows, old table preserved")
         return
-    execute("TRUNCATE TABLE market_phase")
+    execute("DELETE FROM market_phase")
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
         INSERT INTO market_phase(
