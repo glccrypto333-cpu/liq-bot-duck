@@ -482,7 +482,7 @@ def upsert_volume(rows: list[tuple]) -> None:
         """, rows)
 
 def replace_bot_aggregates(rows: list[tuple]) -> None:
-    execute("TRUNCATE TABLE bot_aggregates")
+    execute("DELETE FROM bot_aggregates WHERE ts_close >= NOW() - INTERVAL '24 hours'")
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
