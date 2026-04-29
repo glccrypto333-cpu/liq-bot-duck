@@ -727,9 +727,15 @@ def replace_price_state(rows: list[tuple]) -> None:
         """, rows)
 
 
+
+
 def replace_oi_slope(rows):
+    if not DATABASE_URL:
+        return
+
+    execute("DELETE FROM market_oi_slope WHERE ts_close >= NOW() - INTERVAL '24 hours'")
+
     if not rows:
-        print("replace_oi_slope skipped: empty rows, old table preserved")
         return
 
     cols = [
@@ -760,41 +766,21 @@ def replace_oi_slope(rows):
     ]
 
     expected = len(cols)
-
     bad = [i for i, r in enumerate(rows[:20]) if len(tuple(r)) != expected]
     if bad:
-        raise ValueError(f"replace_oi_slope bad row length: expected={expected}, bad_indexes={bad}, first_len={len(tuple(rows[0]))}")
+        raise ValueError(
+            f"replace_oi_slope bad row length: expected={expected}, "
+            f"bad_indexes={bad}, first_len={len(tuple(rows[0]))}"
+        )
 
     col_sql = ",".join(cols)
     ph_sql = ",".join(["%s"] * expected)
 
     with _conn() as conn, conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS market_oi_slope_staging")
-        cur.execute("CREATE UNLOGGED TABLE market_oi_slope_staging (LIKE market_oi_slope INCLUDING DEFAULTS)")
-        conn.commit()
-
-        batch_size = 1000
-        for i in range(0, len(rows), batch_size):
-            cur.executemany(
-                f"INSERT INTO market_oi_slope_staging ({col_sql}) VALUES ({ph_sql})",
-                rows[i:i + batch_size],
-            )
-            conn.commit()
-
-        cur.execute("SELECT COUNT(*) AS cnt FROM market_oi_slope_staging")
-        staging_count = cur.fetchone()["cnt"]
-
-        if staging_count != len(rows):
-            raise RuntimeError(f"staging count mismatch: staging={staging_count}, rows={len(rows)}")
-
-        cur.execute("DELETE FROM market_oi_slope WHERE ts_close >= NOW() - INTERVAL '24 hours'")
-        cur.execute(f"""
-            INSERT INTO market_oi_slope ({col_sql})
-            SELECT {col_sql}
-            FROM market_oi_slope_staging
-        """)
-        cur.execute("DROP TABLE IF EXISTS market_oi_slope_staging")
-        conn.commit()
+        cur.executemany(
+            f"INSERT INTO market_oi_slope ({col_sql}) VALUES ({ph_sql})",
+            rows,
+        )
 
 
 def replace_request_failures(rows: list[tuple]) -> None:
