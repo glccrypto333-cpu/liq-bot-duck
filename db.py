@@ -367,53 +367,53 @@ def init_db() -> None:
         )
         """)
 
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_agg_main ON bot_aggregates(metric, timeframe, exchange, symbol, ts_close)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_price_main ON price_5m_сырые(exchange, symbol, ts_open)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_volume_main ON volume_5m_сырые(exchange, symbol, ts_open)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_coverage_report_main ON coverage_report(metric, exchange, symbol, coverage_pct)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_gap_report_main ON gap_report(metric, exchange, symbol, gap_start)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_active_symbol_universe_main ON active_symbol_universe(exchange, symbol)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_silence_main ON market_silence(exchange, symbol, timeframe, ts_close)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_silence_stage ON market_silence(stage, timeframe)")
-        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS normalized_volume DOUBLE PRECISION")
-        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_percentile INTEGER")
-        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS noise_state TEXT")
-        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_structure TEXT")
-        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_quality TEXT")
-        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_baseline_24h DOUBLE PRECISION")
-        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_hold_state TEXT")
-        cur.execute("ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_reason TEXT")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_main ON market_volume_state(exchange, symbol, timeframe, ts_close)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_name ON market_volume_state(volume_state_name, timeframe)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_bot_agg_main ON bot_aggregates(metric, timeframe, exchange, symbol, ts_close)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_raw_price_main ON price_5m_сырые(exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_raw_volume_main ON volume_5m_сырые(exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_coverage_report_main ON coverage_report(metric, exchange, symbol, coverage_pct)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_gap_report_main ON gap_report(metric, exchange, symbol, gap_start)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_active_symbol_universe_main ON active_symbol_universe(exchange, symbol)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_silence_main ON market_silence(exchange, symbol, timeframe, ts_close)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_silence_stage ON market_silence(stage, timeframe)")
+        safe_ddl(cur, "ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS normalized_volume DOUBLE PRECISION")
+        safe_ddl(cur, "ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_percentile INTEGER")
+        safe_ddl(cur, "ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS noise_state TEXT")
+        safe_ddl(cur, "ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_structure TEXT")
+        safe_ddl(cur, "ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_quality TEXT")
+        safe_ddl(cur, "ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_baseline_24h DOUBLE PRECISION")
+        safe_ddl(cur, "ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_hold_state TEXT")
+        safe_ddl(cur, "ALTER TABLE market_volume_state ADD COLUMN IF NOT EXISTS volume_reason TEXT")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_volume_state_main ON market_volume_state(exchange, symbol, timeframe, ts_close)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_volume_state_name ON market_volume_state(volume_state_name, timeframe)")
         safe_ddl(cur, "ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_structure TEXT")
         safe_ddl(cur, "ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_quality TEXT")
         safe_ddl(cur, "ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_slope_state TEXT")
-        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_trend_24h TEXT")
-        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_range_from_median_pct DOUBLE PRECISION")
-        cur.execute("ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_reason TEXT")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_main ON market_price_state(exchange, symbol, timeframe, ts_close)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_name ON market_price_state(price_state_name, timeframe)")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_structure TEXT")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_priority INTEGER")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_hold_state TEXT")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_15m TEXT")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_30m TEXT")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_1h TEXT")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_4h TEXT")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_24h TEXT")
-        cur.execute("ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_reason TEXT")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_main ON market_oi_slope(exchange, symbol, timeframe, ts_close)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_stage ON market_oi_slope(stage, timeframe)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_main ON market_phase(exchange, symbol, timeframe)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_phase ON market_phase(phase, timeframe, priority)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_history_main ON market_phase_history(exchange, symbol, timeframe, calculated_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_phase_latest ON market_phase(exchange, symbol, timeframe, phase_updated_at DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_oi_slope_latest ON market_oi_slope(exchange, symbol, timeframe, ts_close DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_price_state_latest ON market_price_state(exchange, symbol, timeframe, ts_close DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_market_volume_state_latest ON market_volume_state(exchange, symbol, timeframe, ts_close DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
+        safe_ddl(cur, "ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_trend_24h TEXT")
+        safe_ddl(cur, "ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_range_from_median_pct DOUBLE PRECISION")
+        safe_ddl(cur, "ALTER TABLE market_price_state ADD COLUMN IF NOT EXISTS price_reason TEXT")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_price_state_main ON market_price_state(exchange, symbol, timeframe, ts_close)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_price_state_name ON market_price_state(price_state_name, timeframe)")
+        safe_ddl(cur, "ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_structure TEXT")
+        safe_ddl(cur, "ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_priority INTEGER")
+        safe_ddl(cur, "ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_hold_state TEXT")
+        safe_ddl(cur, "ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_15m TEXT")
+        safe_ddl(cur, "ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_30m TEXT")
+        safe_ddl(cur, "ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_1h TEXT")
+        safe_ddl(cur, "ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_4h TEXT")
+        safe_ddl(cur, "ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_trend_24h TEXT")
+        safe_ddl(cur, "ALTER TABLE market_oi_slope ADD COLUMN IF NOT EXISTS oi_reason TEXT")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_oi_slope_main ON market_oi_slope(exchange, symbol, timeframe, ts_close)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_oi_slope_stage ON market_oi_slope(stage, timeframe)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_phase_main ON market_phase(exchange, symbol, timeframe)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_phase_phase ON market_phase(phase, timeframe, priority)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_phase_history_main ON market_phase_history(exchange, symbol, timeframe, calculated_at)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_phase_latest ON market_phase(exchange, symbol, timeframe, phase_updated_at DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_oi_slope_latest ON market_oi_slope(exchange, symbol, timeframe, ts_close DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_price_state_latest ON market_price_state(exchange, symbol, timeframe, ts_close DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_volume_state_latest ON market_volume_state(exchange, symbol, timeframe, ts_close DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
 
 
     log("Postgres: canonical schema + derived tables готовы")
@@ -635,10 +635,7 @@ def replace_market_silence(rows: list[tuple]) -> None:
         return
     execute("""
         DELETE FROM market_silence
-        WHERE ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
-            FROM market_research
-        )
+        WHERE ts_close >= NOW() - '24 hours'::interval
     """)
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
@@ -669,10 +666,7 @@ def replace_volume_state(rows: list[tuple]) -> None:
         return
     execute("""
         DELETE FROM market_volume_state
-        WHERE ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
-            FROM market_research
-        )
+        WHERE ts_close >= NOW() - '24 hours'::interval
     """)
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
@@ -706,10 +700,7 @@ def replace_price_state(rows: list[tuple]) -> None:
         return
     execute("""
         DELETE FROM market_price_state
-        WHERE ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
-            FROM market_research
-        )
+        WHERE ts_close >= NOW() - '24 hours'::interval
     """)
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
