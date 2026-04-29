@@ -80,17 +80,23 @@ def _oi_structure(oi_delta: float, acceleration: float, prev_avg: float) -> str:
 def _oi_priority(structure: str, quality: str) -> int:
     if quality in ("нет качества", "пила"):
         return 0
-    if structure == "плавный набор":
-        return 1
-    if structure == "ступенчатый набор":
-        return 2
-    if structure == "ускорение":
-        return 3
-    if structure == "агрессивный набор":
+
+    if structure in {"нисходящий OI", "тишина", "пила", "всплеск без удержания"}:
+        return 0
+
+    if structure in {"распределение", "спокойный боковик", "перегрев"}:
         return 4
-    if structure == "перегрев":
+
+    if structure == "плавный набор":
+        return 3
+
+    if structure in {"ступенчатый набор", "ускорение"}:
         return 2
-    return 1
+
+    if structure in {"агрессивный набор", "удержание после роста"}:
+        return 1
+
+    return 5
 
 
 def _hold_state(series: list[float]) -> str:

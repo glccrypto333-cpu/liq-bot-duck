@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from market_silence_engine import rebuild_market_silence
 from market_volume_engine import rebuild_volume_state
+from market_price_engine import rebuild_price_state
 from market_oi_slope_engine import rebuild_oi_slope
 from market_phase_engine import rebuild_market_phase
 from db import fetch
@@ -19,6 +20,7 @@ def health():
     SELECT 'market_research' table_name, COUNT(*) rows, MAX(ts_close) latest_ts FROM market_research
     UNION ALL SELECT 'market_silence', COUNT(*), MAX(ts_close) FROM market_silence
     UNION ALL SELECT 'market_oi_slope', COUNT(*), MAX(ts_close) FROM market_oi_slope
+    UNION ALL SELECT 'market_price_state', COUNT(*), MAX(ts_close) FROM market_price_state
     UNION ALL SELECT 'market_phase', COUNT(*), MAX(phase_updated_at) FROM market_phase
     ORDER BY table_name
     """):
@@ -41,6 +43,10 @@ try:
     log("rebuild_volume_state start")
     volume = rebuild_volume_state()
     log(f"rebuild_volume_state done rows={volume}")
+
+    log("rebuild_price_state start")
+    price = rebuild_price_state()
+    log(f"rebuild_price_state done rows={price}")
 
     log("rebuild_oi_slope start")
     oi = rebuild_oi_slope()

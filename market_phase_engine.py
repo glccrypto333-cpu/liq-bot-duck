@@ -27,6 +27,35 @@ VOLUME_FADE = {"объем падает"}
 POSITIVE_OI_TRENDS = {"плавный рост", "устойчивый рост", "агрессивный рост"}
 STRONG_OI_TRENDS = {"устойчивый рост", "агрессивный рост"}
 
+REAL_HOLD = {"holding", "hold", "удержание"}
+
+STAGE2_BLOCKED_OI = {
+    "нисходящий OI",
+    "тишина",
+    "пила",
+    "всплеск без удержания",
+}
+
+STAGE2_DOWNGRADE_TO_1 = {
+    "пила",
+    "распределение",
+    "всплеск без удержания",
+}
+
+STAGE2_DOWNGRADE_TO_0 = {
+    "нисходящий OI",
+    "тишина",
+}
+
+STAGE3_BLOCKED_OI = {
+    "нисходящий OI",
+    "тишина",
+    "пила",
+    "всплеск без удержания",
+    "распределение",
+    "перегрев",
+}
+
 STAGE1_MIN_AGE = timedelta(hours=1)
 STAGE2_MIN_AGE = timedelta(minutes=15)
 
@@ -125,8 +154,6 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
     oi_hold_state = _v(row, "oi_hold_state")
     oi_trend_15m = _v(row, "oi_trend_15m")
     oi_trend_30m = _v(row, "oi_trend_30m")
-    oi_trend_15m = _v(row, "oi_trend_15m")
-    oi_trend_30m = _v(row, "oi_trend_30m")
     oi_trend_1h = _v(row, "oi_trend_1h")
     oi_trend_4h = _v(row, "oi_trend_4h")
     price_structure = _v(row, "price_structure")
@@ -160,10 +187,11 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
         prev_phase == 2
         and stage2_age_ok
         and oi_priority <= 2
+        and oi_structure not in STAGE3_BLOCKED_OI
         and oi_trend_15m in STRONG_OI_TRENDS
         and oi_trend_30m in POSITIVE_OI_TRENDS
         and oi_trend_1h in POSITIVE_OI_TRENDS
-        and oi_hold_state in {"holding", "hold", "удержание"}
+        and oi_hold_state in REAL_HOLD
         and oi_trend_4h not in {"strong_down", "down", "нисходящий"}
     )
 
@@ -181,14 +209,24 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
             )
         )
         and oi_priority <= 3
+        and oi_structure not in STAGE2_BLOCKED_OI
         and oi_trend_1h in POSITIVE_OI_TRENDS
-        and oi_hold_state in {"holding", "hold", "удержание", "trying_hold"}
+        and oi_hold_state in REAL_HOLD
     )
 
     if stage2_ok:
-        return 2, "stage1_to_stage2_or_hold: stage1_age_ok oi_slope_or_hold"
+        return 2, "stage1_to_stage2_or_hold: stage1_age_ok oi_slope_and_real_hold"
 
-    # 2 -> 1: OI остыл, но мусора нет.
+    if prev_phase == 2 and oi_structure in STAGE2_DOWNGRADE_TO_0:
+        return 0, f"downgrade_stage2_to_stage0: bad_oi_structure={oi_structure}"
+
+    if prev_phase == 2 and oi_structure in STAGE2_DOWNGRADE_TO_1:
+        return 1, f"downgrade_stage2_to_stage1: weak_oi_structure={oi_structure}"
+
+    if prev_phase == 2 and oi_hold_state not in REAL_HOLD:
+        return 1, f"downgrade_stage2_to_stage1: hold_lost={oi_hold_state}"
+
+    # 2 -> 1: ОИ остыл, но мусора нет.
     if prev_phase == 2 and oi_priority in {2, 3, 4}:
         return 1, "downgrade_stage2_to_stage1: oi_cooled_but_alive"
 
@@ -286,6 +324,21 @@ def rebuild_market_phase() -> int:
             transition_reason = "stage3_locked_until_manual_reset"
         else:
             new_phase, transition_reason = _decide_phase(prev_phase, r, now)
+
+        # Финальная защита Stage 2:
+        # мусорная структура не может остаться в сильном наблюдении
+        # даже если прошла через старое состояние или побочную ветку.
+        if new_phase == 2 and _v(r, "oi_structure") in STAGE2_DOWNGRADE_TO_0:
+            new_phase = 0
+            transition_reason = f"final_guard_stage2_to_stage0: bad_oi_structure={_v(r, 'oi_structure')}"
+
+        if new_phase == 2 and _v(r, "oi_structure") in STAGE2_DOWNGRADE_TO_1:
+            new_phase = 1
+            transition_reason = f"final_guard_stage2_to_stage1: weak_oi_structure={_v(r, 'oi_structure')}"
+
+        if new_phase == 2 and _v(r, "oi_hold_state") not in REAL_HOLD:
+            new_phase = 1
+            transition_reason = f"final_guard_stage2_to_stage1: hold_lost={_v(r, 'oi_hold_state')}"
 
         # Прямые 0->3 и 1->3 запрещены.
         if new_phase == 3 and prev_phase != 2:
