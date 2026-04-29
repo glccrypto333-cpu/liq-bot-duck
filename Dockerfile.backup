@@ -1,0 +1,12 @@
+FROM postgres:18-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends awscli ca-certificates gzip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY backup_to_s3.sh /app/backup_to_s3.sh
+RUN chmod +x /app/backup_to_s3.sh
+
+CMD ["/app/backup_to_s3.sh"]
