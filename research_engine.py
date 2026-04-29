@@ -184,33 +184,36 @@ def _insert_market_research_rows(out: list[tuple]) -> None:
         )
 
 
-def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str, str, str], dict]) -> tuple[int, int]:
+
+def _rebuild_market_research_symbol_batch(
+    timeframe: str,
+    symbols: list[tuple[str, str]],
+    coverage: dict[tuple[str, str, str], dict],
+) -> tuple[int, int]:
+    if not symbols:
+        return 0, 0
+
+    values_sql = ",".join(["(%s,%s)"] * len(symbols))
+    params: list[Any] = [timeframe]
+    for exchange, symbol in symbols:
+        params.extend([exchange, symbol])
+
     rows = fetch(
-        """
+        f"""
         SELECT
-            metric,
-            timeframe,
-            ts_open,
-            ts_close,
-            exchange,
-            symbol,
-            open_value,
-            high_value,
-            low_value,
-            close_value,
-            sum_value,
-            avg_value,
-            delta_pct,
-            unique_candles
-        FROM bot_aggregates
+            metric, timeframe, ts_open, ts_close, exchange, symbol,
+            open_value, high_value, low_value, close_value,
+            sum_value, avg_value, delta_pct, unique_candles
+        FROM bot_aggregates b
         WHERE timeframe = %s
+          AND (exchange, symbol) IN ({values_sql})
           AND ts_close >= (
             SELECT MAX(ts_close) - '24 hours'::interval
             FROM bot_aggregates
           )
         ORDER BY exchange, symbol, timeframe, ts_close
         """,
-        (timeframe,),
+        tuple(params),
     )
 
     metric_map: dict[tuple, dict] = {}
@@ -304,6 +307,37 @@ def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str,
 
     _insert_market_research_rows(out)
     return len(out), invalid_data_rows
+
+
+def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str, str, str], dict]) -> tuple[int, int]:
+    symbols = [
+        (r["exchange"], r["symbol"])
+        for r in fetch(
+            """
+            SELECT DISTINCT exchange, symbol
+            FROM bot_aggregates
+            WHERE timeframe = %s
+              AND ts_close >= (
+                SELECT MAX(ts_close) - '24 hours'::interval
+                FROM bot_aggregates
+              )
+            ORDER BY exchange, symbol
+            """,
+            (timeframe,),
+        )
+    ]
+
+    total_rows = 0
+    total_invalid = 0
+    batch_size = 25
+
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
+        rows_count, invalid_count = _rebuild_market_research_symbol_batch(timeframe, batch, coverage)
+        total_rows += rows_count
+        total_invalid += invalid_count
+
+    return total_rows, total_invalid
 
 
 def rebuild_market_research() -> int:
