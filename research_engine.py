@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from db import fetch, execute
+from db import fetch, execute, _conn
 from logger import log
 
 
@@ -152,19 +152,39 @@ def _invalid_reason(
     return None
 
 
-def rebuild_market_research() -> int:
-    """
-    Исследовательский слой.
-    Источник истины: bot_aggregates + coverage_report.
-    Fake rows: нет.
-    Сигналы: нет.
 
-    v3.5.4:
-    Если данных недостаточно или coverage плохой:
-        market_state = invalid_data
-    """
-    init_research_schema()
+def _insert_market_research_rows(out: list[tuple]) -> None:
+    if not out:
+        return
 
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO market_research(
+                calculated_at,
+                ts_close,
+                exchange,
+                symbol,
+                timeframe,
+                oi_delta_pct,
+                price_delta_pct,
+                volume_delta_pct,
+                oi_velocity,
+                oi_acceleration,
+                range_width_pct,
+                continuation_score,
+                exhaustion_score,
+                compression_score,
+                market_state,
+                invalid_reason
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            out,
+        )
+
+
+def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str, str, str], dict]) -> tuple[int, int]:
     rows = fetch(
         """
         SELECT
@@ -183,15 +203,15 @@ def rebuild_market_research() -> int:
             delta_pct,
             unique_candles
         FROM bot_aggregates
-        WHERE ts_close >= (
+        WHERE timeframe = %s
+          AND ts_close >= (
             SELECT MAX(ts_close) - '24 hours'::interval
             FROM bot_aggregates
-        )
+          )
         ORDER BY exchange, symbol, timeframe, ts_close
-        """
+        """,
+        (timeframe,),
     )
-
-    coverage = _coverage_map()
 
     metric_map: dict[tuple, dict] = {}
     keys = set()
@@ -206,9 +226,9 @@ def rebuild_market_research() -> int:
     oi_history: dict[tuple, list[tuple]] = defaultdict(list)
     volume_history: dict[tuple, list[tuple]] = defaultdict(list)
 
-    for exchange, symbol, timeframe, ts_close in sorted_keys:
-        base = (exchange, symbol, timeframe, ts_close)
-        group = (exchange, symbol, timeframe)
+    for exchange, symbol, tf, ts_close in sorted_keys:
+        base = (exchange, symbol, tf, ts_close)
+        group = (exchange, symbol, tf)
 
         oi = metric_map.get(base + ("OI",))
         volume = metric_map.get(base + ("VOLUME",))
@@ -222,9 +242,9 @@ def rebuild_market_research() -> int:
     out = []
     invalid_data_rows = 0
 
-    for exchange, symbol, timeframe, ts_close in sorted_keys:
-        base = (exchange, symbol, timeframe, ts_close)
-        group = (exchange, symbol, timeframe)
+    for exchange, symbol, tf, ts_close in sorted_keys:
+        base = (exchange, symbol, tf, ts_close)
+        group = (exchange, symbol, tf)
 
         oi = metric_map.get(base + ("OI",))
         price = metric_map.get(base + ("PRICE",))
@@ -234,26 +254,7 @@ def rebuild_market_research() -> int:
 
         if invalid_reason:
             invalid_data_rows += 1
-            out.append(
-                (
-                    calculated_at,
-                    ts_close,
-                    exchange,
-                    symbol,
-                    timeframe,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    0.0,
-                    0.0,
-                    0.0,
-                    "invalid_data",
-                    invalid_reason,
-                )
-            )
+            out.append((calculated_at, ts_close, exchange, symbol, tf, None, None, None, None, None, None, 0.0, 0.0, 0.0, "invalid_data", invalid_reason))
             continue
 
         oi_delta = _safe_float(oi.get("delta_pct"))
@@ -270,15 +271,12 @@ def rebuild_market_research() -> int:
         oi_velocity = 0.0
         oi_acceleration = 0.0
         oi_series = oi_history[group]
-
         for idx, (t, current_delta) in enumerate(oi_series):
             if t == ts_close:
                 previous_delta = oi_series[idx - 1][1] if idx > 0 else None
                 previous_previous_delta = oi_series[idx - 2][1] if idx > 1 else None
-
                 if previous_delta is not None:
                     oi_velocity = current_delta - previous_delta
-
                 if previous_delta is not None and previous_previous_delta is not None:
                     previous_velocity = previous_delta - previous_previous_delta
                     oi_acceleration = oi_velocity - previous_velocity
@@ -287,7 +285,6 @@ def rebuild_market_research() -> int:
         price_high = _safe_float(price.get("high_value"))
         price_low = _safe_float(price.get("low_value"))
         price_close = _safe_float(price.get("close_value"))
-
         range_width = ((price_high - price_low) / price_close) * 100.0 if price_close else 0.0
 
         continuation_score = _score_continuation(oi_delta, price_delta, volume_delta)
@@ -303,26 +300,29 @@ def rebuild_market_research() -> int:
             compression_score=compression_score,
         )
 
-        out.append(
-            (
-                calculated_at,
-                ts_close,
-                exchange,
-                symbol,
-                timeframe,
-                oi_delta,
-                price_delta,
-                volume_delta,
-                oi_velocity,
-                oi_acceleration,
-                range_width,
-                continuation_score,
-                exhaustion_score,
-                compression_score,
-                market_state,
-                None,
+        out.append((calculated_at, ts_close, exchange, symbol, tf, oi_delta, price_delta, volume_delta, oi_velocity, oi_acceleration, range_width, continuation_score, exhaustion_score, compression_score, market_state, None))
+
+    _insert_market_research_rows(out)
+    return len(out), invalid_data_rows
+
+
+def rebuild_market_research() -> int:
+    init_research_schema()
+
+    timeframes = [
+        r["timeframe"]
+        for r in fetch("""
+            SELECT DISTINCT timeframe
+            FROM bot_aggregates
+            WHERE ts_close >= (
+                SELECT MAX(ts_close) - '24 hours'::interval
+                FROM bot_aggregates
             )
-        )
+            ORDER BY timeframe
+        """)
+    ]
+
+    coverage = _coverage_map()
 
     execute("""
         DELETE FROM market_research
@@ -332,34 +332,14 @@ def rebuild_market_research() -> int:
         )
     """)
 
-    if out:
-        from db import _conn
+    total_rows = 0
+    total_invalid = 0
 
-        with _conn() as conn, conn.cursor() as cur:
-            cur.executemany(
-                """
-                INSERT INTO market_research(
-                    calculated_at,
-                    ts_close,
-                    exchange,
-                    symbol,
-                    timeframe,
-                    oi_delta_pct,
-                    price_delta_pct,
-                    volume_delta_pct,
-                    oi_velocity,
-                    oi_acceleration,
-                    range_width_pct,
-                    continuation_score,
-                    exhaustion_score,
-                    compression_score,
-                    market_state,
-                    invalid_reason
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                out,
-            )
+    for timeframe in timeframes:
+        rows_count, invalid_count = _rebuild_market_research_timeframe(timeframe, coverage)
+        total_rows += rows_count
+        total_invalid += invalid_count
+        log(f"market research batch rebuilt: timeframe={timeframe} rows={rows_count} invalid_data={invalid_count}")
 
-    log(f"market research rebuilt: rows={len(out)} invalid_data={invalid_data_rows}")
-    return len(out)
+    log(f"market research rebuilt: rows={total_rows} invalid_data={total_invalid}")
+    return total_rows
