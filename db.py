@@ -86,7 +86,7 @@ def init_db() -> None:
 
         # Add collected_at if old tables exist without it
         for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
-            safe_ddl(cur, f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ DEFAULT NOW()")
+            log(f"DDL deferred: collected_at migration skipped for {table}")
 
         # Deduplicate old raw rows before unique index
         for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
@@ -367,7 +367,7 @@ def init_db() -> None:
         )
         """)
 
-        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_bot_agg_main ON bot_aggregates(metric, timeframe, exchange, symbol, ts_close)")
+        log("DDL deferred: idx_bot_agg_main")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_raw_price_main ON price_5m_сырые(exchange, symbol, ts_open)")
