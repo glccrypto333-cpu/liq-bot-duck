@@ -214,7 +214,11 @@ def background(bybit_symbols, binance_symbols):
 
             _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
 
-            agg_count = _timed_step(timings, "aggregates", rebuild_bot_aggregates)
+            if os.getenv("SKIP_HEAVY_AGGREGATES") == "1":
+                agg_count = -1
+                log("aggregates skipped: SKIP_HEAVY_AGGREGATES=1")
+            else:
+                agg_count = _timed_step(timings, "aggregates", rebuild_bot_aggregates)
             if cycle_no % 6 == 0:
                 audit_count = _timed_step(timings, "validation_audit", rebuild_all)
             else:

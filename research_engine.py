@@ -54,9 +54,11 @@ def init_research_schema() -> None:
         )
         """
     )
-    execute('ALTER TABLE market_research ADD COLUMN IF NOT EXISTS invalid_reason TEXT')
-    execute('SELECT 1')  # DDL deferred: idx_market_research_main
-    execute('SELECT 1')  # DDL deferred: idx_market_research_state
+    run_runtime_ddl = __import__("os").getenv("RUN_DDL_MIGRATIONS") == "1"
+    if run_runtime_ddl:
+        execute('ALTER TABLE market_research ADD COLUMN IF NOT EXISTS invalid_reason TEXT')
+        execute('SELECT 1')  # DDL deferred: idx_market_research_main
+        execute('SELECT 1')  # DDL deferred: idx_market_research_state
 
 
 def _score_continuation(oi_delta: float, price_delta: float, volume_delta: float) -> float:
