@@ -88,20 +88,25 @@ def init_db() -> None:
         for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
             log(f"DDL deferred: collected_at migration skipped for {table}")
 
-        # Deduplicate old raw rows before unique index
-        for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
-            cur.execute(f"""
-            DELETE FROM {table} a
-            USING {table} b
-            WHERE a.ctid < b.ctid
-              AND a.exchange = b.exchange
-              AND a.symbol = b.symbol
-              AND a.ts_open = b.ts_open
-            """)
+        run_runtime_ddl = os.getenv("RUN_DDL_MIGRATIONS") == "1"
 
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_oi5m_candle ON oi_5m_сырые(exchange, symbol, ts_open)")
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_price5m_candle ON price_5m_сырые(exchange, symbol, ts_open)")
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_volume5m_candle ON volume_5m_сырые(exchange, symbol, ts_open)")
+        if run_runtime_ddl:
+            # Deduplicate old raw rows before unique index
+            for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
+                cur.execute(f"""
+                DELETE FROM {table} a
+                USING {table} b
+                WHERE a.ctid < b.ctid
+                  AND a.exchange = b.exchange
+                  AND a.symbol = b.symbol
+                  AND a.ts_open = b.ts_open
+                """)
+
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_oi5m_candle ON oi_5m_сырые(exchange, symbol, ts_open)")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_price5m_candle ON price_5m_сырые(exchange, symbol, ts_open)")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_volume5m_candle ON volume_5m_сырые(exchange, symbol, ts_open)")
+        else:
+            log("DDL deferred: raw dedupe + unique indexes skipped")
 
         # IMPORTANT: rebuild derived tables to guarantee schema correctness
         cur.execute("""
