@@ -12,7 +12,7 @@ from logger import log
 def _runtime_ddl_enabled() -> bool:
     return os.getenv("RUN_DDL_MIGRATIONS") == "1"
 
-def _executemany_with_lock_retry(cur, sql: str, rows: list[tuple], batch_size: int = 500) -> None:
+def _executemany_with_lock_retry(cur, sql: str, rows: list[tuple], batch_size: int = 100) -> None:
     if not rows:
         return
 
