@@ -52,17 +52,43 @@ def _apply_session_settings(conn):
 def _conn():
     global _DB_CONN
 
-    if _DB_CONN is not None and not _DB_CONN.closed:
-        return _DB_CONN
+    for attempt in range(5):
+        try:
+            if _DB_CONN is not None and not _DB_CONN.closed:
+                try:
+                    with _DB_CONN.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    return _DB_CONN
+                except Exception:
+                    try:
+                        _DB_CONN.close()
+                    except Exception:
+                        pass
+                    _DB_CONN = None
 
-    _DB_CONN = psycopg.connect(
-        DATABASE_URL,
-        autocommit=True,
-        row_factory=dict_row,
-        connect_timeout=5
-        )
-    _apply_session_settings(_DB_CONN)
-    return _DB_CONN
+            _DB_CONN = psycopg.connect(
+                DATABASE_URL,
+                autocommit=True,
+                row_factory=dict_row,
+                connect_timeout=5,
+            )
+
+            _apply_session_settings(_DB_CONN)
+
+            with _DB_CONN.cursor() as cur:
+                cur.execute("SELECT 1")
+
+            return _DB_CONN
+
+        except Exception as e:
+            _DB_CONN = None
+
+            if attempt == 4:
+                raise
+
+            print(f"DB reconnect retry {attempt + 1}/5: {e}")
+
+            time.sleep(2)
 
 def init_db() -> None:
     if not DATABASE_URL:
