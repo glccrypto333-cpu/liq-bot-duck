@@ -1,7 +1,7 @@
 from __future__ import annotations
 import psycopg
 from psycopg.rows import dict_row
-from config import DATABASE_URL
+from config import DATABASE_URL, RAW_RETENTION_DAYS
 import os
 import time
 
