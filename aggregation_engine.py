@@ -68,6 +68,7 @@ def rebuild_bot_aggregates() -> int:
         SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close
         FROM oi_5m_сырые x
         WHERE ts_close <= NOW() - interval '30 seconds'
+          AND ts_close >= NOW() - interval '30 hours'
           AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
     """)
@@ -101,6 +102,7 @@ def rebuild_bot_aggregates() -> int:
         SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close
         FROM price_5m_сырые x
         WHERE ts_close <= NOW() - interval '30 seconds'
+          AND ts_close >= NOW() - interval '30 hours'
           AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
     """)
@@ -134,6 +136,7 @@ def rebuild_bot_aggregates() -> int:
         SELECT ts_open, ts_close, exchange, symbol, volume
         FROM volume_5m_сырые x
         WHERE ts_close <= NOW() - interval '30 seconds'
+          AND ts_close >= NOW() - interval '30 hours'
           AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
     """)
