@@ -6,6 +6,10 @@ import os
 
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "60000"))
 from logger import log
+
+
+def _runtime_ddl_enabled() -> bool:
+    return os.getenv("RUN_DDL_MIGRATIONS") == "1"
 import psycopg
 
 def safe_ddl(cur, sql: str) -> None:
@@ -88,7 +92,7 @@ def init_db() -> None:
         for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
             log(f"DDL deferred: collected_at migration skipped for {table}")
 
-        run_runtime_ddl = os.getenv("RUN_DDL_MIGRATIONS") == "1"
+        run_runtime_ddl = _runtime_ddl_enabled()
 
         if run_runtime_ddl:
             # Deduplicate old raw rows before unique index
@@ -372,7 +376,7 @@ def init_db() -> None:
         )
         """)
 
-        run_runtime_ddl = os.getenv("RUN_DDL_MIGRATIONS") == "1"
+        run_runtime_ddl = _runtime_ddl_enabled()
         log(f"DDL migrations enabled: {run_runtime_ddl}")
 
         if not run_runtime_ddl:
