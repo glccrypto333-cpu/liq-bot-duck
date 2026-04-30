@@ -13,7 +13,7 @@ def _runtime_ddl_enabled() -> bool:
     return os.getenv("RUN_DDL_MIGRATIONS") == "1"
 
 def _executemany_with_lock_retry(cur, sql: str, rows: list[tuple], batch_size: int = 100) -> None:
-    if not rows:
+    if not DATABASE_URL or not rows:
         return
 
     for i in range(0, len(rows), batch_size):
@@ -537,10 +537,11 @@ def replace_bot_aggregates(rows: list[tuple]) -> None:
 
 def replace_validation(rows: list[tuple]) -> None:
     execute("DELETE FROM validation_audit")
+
     if not DATABASE_URL or not rows:
         return
-    with _conn() as conn, conn.cursor() as cur:
-        cur.executemany("""
+
+    sql = """
         INSERT INTO validation_audit(
             calculated_at, metric, timeframe, ts_close, exchange, symbol,
             bot_open, audit_open, bot_close, audit_close,
@@ -548,7 +549,15 @@ def replace_validation(rows: list[tuple]) -> None:
             bot_sum, audit_sum, bot_avg, audit_avg,
             drift, unique_candles, validation_status
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, rows)
+    """
+
+    batch_size = 1000
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            for i in range(0, len(rows), batch_size):
+                cur.executemany(sql, rows[i:i + batch_size])
+        conn.commit()
 
 def replace_integrity(rows: list[tuple]) -> None:
     execute("DELETE FROM raw_integrity_report")

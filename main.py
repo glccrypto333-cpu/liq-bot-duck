@@ -248,11 +248,11 @@ def background(bybit_symbols, binance_symbols):
                 log(f"aggregates skipped: scheduled every {AGGREGATES_EVERY_CYCLES} cycles")
             else:
                 agg_count = _timed_step(timings, "aggregates", rebuild_bot_aggregates)
-            if cycle_no % 6 == 0:
+            if os.getenv("ENABLE_RUNTIME_VALIDATION_AUDIT") == "1":
                 audit_count = _timed_step(timings, "validation_audit", rebuild_all)
             else:
                 audit_count = -1
-                log("validation_audit skipped: scheduled every 6 cycles")
+                log("validation_audit skipped: ENABLE_RUNTIME_VALIDATION_AUDIT!=1")
 
             auto_skip_stage2 = (
                 os.getenv("SKIP_STAGE2_REBUILDS") == "1"
