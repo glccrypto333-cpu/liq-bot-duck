@@ -348,7 +348,7 @@ def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str,
 
 def rebuild_market_research() -> int:
     init_research_schema()
-    window_hours = int(os.getenv("DERIVED_WINDOW_HOURS", "2"))
+    window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
 
     timeframes = [
         r["timeframe"]

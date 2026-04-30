@@ -257,7 +257,7 @@ def _rebuild_oi_slope_symbol_batch(symbols: list[tuple[str, str]], window_hours:
 
 
 def rebuild_oi_slope() -> int:
-    window_hours = int(os.getenv("DERIVED_WINDOW_HOURS", "2"))
+    window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
 
     execute("""
         DELETE FROM market_oi_slope

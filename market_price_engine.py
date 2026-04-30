@@ -200,7 +200,7 @@ def _rebuild_price_state_symbol_batch(symbols: list[tuple[str, str]], window_hou
 
 
 def rebuild_price_state() -> int:
-    window_hours = int(os.getenv("DERIVED_WINDOW_HOURS", "2"))
+    window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
 
     execute("""
         DELETE FROM market_price_state

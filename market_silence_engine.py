@@ -125,7 +125,7 @@ def _rebuild_market_silence_symbol_batch(symbols: list[tuple[str, str]], window_
 
 
 def rebuild_market_silence() -> int:
-    window_hours = int(os.getenv("DERIVED_WINDOW_HOURS", "2"))
+    window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
 
     execute("""
         DELETE FROM market_silence

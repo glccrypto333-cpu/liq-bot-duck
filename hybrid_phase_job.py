@@ -13,6 +13,7 @@ from market_silence_engine import rebuild_market_silence
 from market_phase_engine import rebuild_market_phase
 from phase_audit import main as phase_audit_main
 from phase_snapshot import insert_phase_snapshot
+from cleanup_derived_windows import cleanup_derived_windows
 
 
 LOCK_KEY = 330003
@@ -51,6 +52,7 @@ def main() -> None:
         "market_oi_slope": _step("market_oi_slope", rebuild_oi_slope),
         "market_silence": _step("market_silence", rebuild_market_silence),
         "market_phase": _step("market_phase", rebuild_market_phase),
+        "cleanup_derived_windows": _step("cleanup_derived_windows", cleanup_derived_windows),
         "phase_snapshot": _step("phase_snapshot", insert_phase_snapshot),
     }
 
