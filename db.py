@@ -3,6 +3,7 @@ import psycopg
 from psycopg.rows import dict_row
 from config import DATABASE_URL
 import os
+import time
 
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "60000"))
 from logger import log
@@ -10,7 +11,25 @@ from logger import log
 
 def _runtime_ddl_enabled() -> bool:
     return os.getenv("RUN_DDL_MIGRATIONS") == "1"
-import psycopg
+
+def _executemany_with_lock_retry(cur, sql: str, rows: list[tuple], batch_size: int = 5000) -> None:
+    if not rows:
+        return
+
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+
+        for attempt in range(3):
+            try:
+                cur.executemany(sql, batch)
+                break
+            except Exception as exc:
+                if "LockNotAvailable" not in type(exc).__name__ and "lock timeout" not in str(exc).lower():
+                    raise
+                if attempt == 2:
+                    raise
+                time.sleep(2 * (attempt + 1))
+
 
 def safe_ddl(cur, sql: str) -> None:
     try:
@@ -453,7 +472,7 @@ def upsert_oi(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
-        cur.executemany("""
+        _executemany_with_lock_retry(cur, """
         INSERT INTO oi_5m_сырые(ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close, collected_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
         ON CONFLICT (exchange, symbol, ts_open)
@@ -470,7 +489,7 @@ def upsert_price(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
-        cur.executemany("""
+        _executemany_with_lock_retry(cur, """
         INSERT INTO price_5m_сырые(ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close, collected_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
         ON CONFLICT (exchange, symbol, ts_open)
@@ -487,7 +506,7 @@ def upsert_volume(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
-        cur.executemany("""
+        _executemany_with_lock_retry(cur, """
         INSERT INTO volume_5m_сырые(ts_open, ts_close, exchange, symbol, volume, collected_at)
         VALUES (%s,%s,%s,%s,%s,NOW())
         ON CONFLICT (exchange, symbol, ts_open)
