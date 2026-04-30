@@ -677,6 +677,10 @@ def dedupe_derived_tables() -> None:
         "market_oi_slope",
     ]
 
+    if not _runtime_ddl_enabled():
+        log("DDL deferred: derived dedupe + unique indexes skipped")
+        return
+
     for table in tables:
         execute(f"""
             DELETE FROM {table} a
@@ -691,7 +695,7 @@ def dedupe_derived_tables() -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS ux_{table}_key
             ON {table}(exchange, symbol, timeframe, ts_close)
         """)
-        print(f"dedupe + unique ok: {table}")
+        log(f"dedupe + unique ok: {table}")
 
 def replace_market_silence(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
