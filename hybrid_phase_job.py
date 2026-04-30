@@ -12,6 +12,7 @@ from market_oi_slope_engine import rebuild_oi_slope
 from market_silence_engine import rebuild_market_silence
 from market_phase_engine import rebuild_market_phase
 from phase_audit import main as phase_audit_main
+from phase_snapshot import insert_phase_snapshot
 
 
 LOCK_KEY = 330003
@@ -53,6 +54,7 @@ def main() -> None:
             "market_oi_slope": _step("market_oi_slope", rebuild_oi_slope),
             "market_silence": _step("market_silence", rebuild_market_silence),
             "market_phase": _step("market_phase", rebuild_market_phase),
+            "phase_snapshot": _step("phase_snapshot", insert_phase_snapshot),
         }
 
         if not args.skip_audit:
