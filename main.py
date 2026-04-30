@@ -303,7 +303,7 @@ def main():
     )
     log("Telegram OK")
 
-    bybit_symbols_all = fetch_bybit_symbols() if ЛИМИТ_СИМВОЛОВ_BYBIT > 0 else []
+    bybit_symbols_all = fetch_bybit_symbols()
     binance_symbols_all = fetch_binance_symbols()
 
     bad_symbols = load_quarantine_symbols(95.0)
@@ -311,7 +311,9 @@ def main():
     bybit_symbols = [
         s for s in bybit_symbols_all
         if ("BYBIT", s) not in bad_symbols
-    ][:ЛИМИТ_СИМВОЛОВ_BYBIT]
+    ]
+    if ЛИМИТ_СИМВОЛОВ_BYBIT > 0:
+        bybit_symbols = bybit_symbols[:ЛИМИТ_СИМВОЛОВ_BYBIT]
 
     binance_symbols_filtered = [
         s for s in binance_symbols_all
