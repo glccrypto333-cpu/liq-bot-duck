@@ -237,7 +237,8 @@ def background(bybit_symbols, binance_symbols):
         try:
             timings = []
 
-            collect_seconds = _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
+            _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
+            collect_seconds = next((seconds for name, seconds in timings if name == "collect"), 0.0)
 
             if os.getenv("SKIP_HEAVY_AGGREGATES") == "1":
                 agg_count = -1
