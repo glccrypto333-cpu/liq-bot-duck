@@ -29,7 +29,12 @@ def _closed(ts_close: datetime) -> bool:
 
 def fetch_bybit_symbols() -> list[str]:
     data = _get(f"{BYBIT_BASE}/v5/market/instruments-info", {"category": "linear", "limit": 1000})
-    return [x["symbol"] for x in data.get("result", {}).get("list", []) if x.get("status") == "Trading" and x.get("quoteCoin") == "USDT"]
+    symbols = [
+        x["symbol"]
+        for x in data.get("result", {}).get("list", [])
+        if x.get("status") == "Trading" and x.get("quoteCoin") == "USDT"
+    ]
+    return sorted(symbols)[BYBIT_UNIVERSE_SKIP_TOP:]
 
 def fetch_binance_symbols() -> list[str]:
     """

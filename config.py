@@ -11,6 +11,7 @@ APP_VERSION = "v3.5.4"
 BINANCE_UNIVERSE_SKIP_TOP = int(os.getenv("BINANCE_UNIVERSE_SKIP_TOP", "50"))
 BYBIT_UNIVERSE_SKIP_TOP = int(os.getenv("BYBIT_UNIVERSE_SKIP_TOP", "50"))
 BINANCE_COLLECT_WORKERS = int(os.getenv("BINANCE_COLLECT_WORKERS", "6"))
+BYBIT_COLLECT_WORKERS = int(os.getenv("BYBIT_COLLECT_WORKERS", "4"))
 
 QUICK_EXPORT_CANDLES = int(os.getenv("QUICK_EXPORT_CANDLES", "96"))
 RESEARCH_EXPORT_DAYS = int(os.getenv("RESEARCH_EXPORT_DAYS", "7"))
@@ -47,3 +48,5 @@ BINANCE_BASE = "https://fapi.binance.com"
     "🗄 Хранение истории: {retention} дней\n\n"
     "Команды:\n{commands}"
 )
+
+RAW_RETENTION_DAYS = int(os.getenv("RAW_RETENTION_DAYS", "7"))
