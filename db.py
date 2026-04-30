@@ -636,6 +636,34 @@ def insert_market_phase_history(rows: list[tuple]) -> None:
         """, rows)
 
 
+def dedupe_derived_tables() -> None:
+    if not DATABASE_URL:
+        print("dedupe_derived_tables skipped: no DATABASE_URL")
+        return
+
+    tables = [
+        "market_silence",
+        "market_volume_state",
+        "market_price_state",
+        "market_oi_slope",
+    ]
+
+    for table in tables:
+        execute(f"""
+            DELETE FROM {table} a
+            USING {table} b
+            WHERE a.ctid < b.ctid
+              AND a.exchange = b.exchange
+              AND a.symbol = b.symbol
+              AND a.timeframe = b.timeframe
+              AND a.ts_close = b.ts_close
+        """)
+        execute(f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_{table}_key
+            ON {table}(exchange, symbol, timeframe, ts_close)
+        """)
+        print(f"dedupe + unique ok: {table}")
+
 def replace_market_silence(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         print("replace_market_silence skipped: empty rows, old table preserved")
