@@ -347,6 +347,10 @@ def rebuild_market_phase() -> int:
             new_phase = 1
             transition_reason = f"final_guard_stage2_to_stage1: hold_lost={_v(r, 'oi_hold_state')}"
 
+        if new_phase == 2 and _v(r, "oi_structure") in {"тишина", "пила"}:
+            new_phase = 0
+            transition_reason = f"final_guard_stage2_to_stage0: blocked_weak_oi_structure={_v(r, 'oi_structure')}"
+
         # Прямые 0->3 и 1->3 запрещены.
         if new_phase == 3 and prev_phase != 2:
             new_phase = 2

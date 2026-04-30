@@ -53,9 +53,9 @@ CHECKS = {
     """,
 
     "stage3_transition_audit": """
-        SELECT old_phase, new_phase, old_phase_name, new_phase_name, transition_reason, COUNT(*) cnt
+        SELECT from_phase, to_phase, from_phase_name, to_phase_name, transition_reason, COUNT(*) cnt
         FROM market_phase_history
-        WHERE new_phase = 3
+        WHERE to_phase = 3
         GROUP BY 1,2,3,4,5
         ORDER BY cnt DESC
     """,
