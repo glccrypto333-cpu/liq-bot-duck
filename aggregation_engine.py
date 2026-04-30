@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import timedelta
 
+import os
+
 from db import fetch, replace_bot_aggregates, insert_bot_aggregates, active_universe_sql
 from metrics import изменение_в_процентах
 from logger import log
@@ -58,6 +60,7 @@ def _flush_aggregates(rows_out: list[tuple]) -> int:
 
 
 def rebuild_bot_aggregates() -> int:
+    window_hours = int(os.getenv("AGGREGATES_WINDOW_HOURS", "6"))
     replace_bot_aggregates([])
     rows_out = []
     total_out = 0
@@ -68,10 +71,10 @@ def rebuild_bot_aggregates() -> int:
         SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close
         FROM oi_5m_сырые x
         WHERE ts_close <= NOW() - interval '30 seconds'
-          AND ts_close >= NOW() - interval '6 hours'
+          AND ts_close >= NOW() - (%s || ' hours')::interval
           AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
-    """)
+    """, (window_hours,))
 
     for (exchange, symbol), items in _groups(oi_rows).items():
         for timeframe, need in WINDOWS.items():
@@ -102,10 +105,10 @@ def rebuild_bot_aggregates() -> int:
         SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close
         FROM price_5m_сырые x
         WHERE ts_close <= NOW() - interval '30 seconds'
-          AND ts_close >= NOW() - interval '6 hours'
+          AND ts_close >= NOW() - (%s || ' hours')::interval
           AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
-    """)
+    """, (window_hours,))
 
     for (exchange, symbol), items in _groups(price_rows).items():
         for timeframe, need in WINDOWS.items():
@@ -136,10 +139,10 @@ def rebuild_bot_aggregates() -> int:
         SELECT ts_open, ts_close, exchange, symbol, volume
         FROM volume_5m_сырые x
         WHERE ts_close <= NOW() - interval '30 seconds'
-          AND ts_close >= NOW() - interval '6 hours'
+          AND ts_close >= NOW() - (%s || ' hours')::interval
           AND {active_universe_sql("x")}
         ORDER BY exchange, symbol, ts_open
-    """)
+    """, (window_hours,))
 
     for (exchange, symbol), items in _groups(volume_rows).items():
         for timeframe, need in WINDOWS.items():
