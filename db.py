@@ -517,9 +517,7 @@ def upsert_volume(rows: list[tuple]) -> None:
             collected_at=NOW()
         """, rows)
 
-def replace_bot_aggregates(rows: list[tuple]) -> None:
-    execute("DELETE FROM bot_aggregates WHERE ts_close < NOW() - INTERVAL '72 hours'")
-    execute("DELETE FROM bot_aggregates WHERE ts_close >= NOW() - INTERVAL '24 hours'")
+def insert_bot_aggregates(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
@@ -530,6 +528,12 @@ def replace_bot_aggregates(rows: list[tuple]) -> None:
             sum_value, avg_value, delta_pct, unique_candles
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, rows)
+
+
+def replace_bot_aggregates(rows: list[tuple]) -> None:
+    execute("DELETE FROM bot_aggregates WHERE ts_close < NOW() - INTERVAL '72 hours'")
+    execute("DELETE FROM bot_aggregates WHERE ts_close >= NOW() - INTERVAL '24 hours'")
+    insert_bot_aggregates(rows)
 
 def replace_validation(rows: list[tuple]) -> None:
     execute("DELETE FROM validation_audit")

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import timedelta
 
-from db import fetch, replace_bot_aggregates, active_universe_sql
+from db import fetch, replace_bot_aggregates, insert_bot_aggregates, active_universe_sql
 from metrics import изменение_в_процентах
 from logger import log
 
@@ -50,8 +50,18 @@ def _is_contiguous_5m(chunk) -> bool:
     return True
 
 
+def _flush_aggregates(rows_out: list[tuple]) -> int:
+    if not rows_out:
+        return 0
+    insert_bot_aggregates(rows_out)
+    return len(rows_out)
+
+
 def rebuild_bot_aggregates() -> int:
+    replace_bot_aggregates([])
     rows_out = []
+    total_out = 0
+    flush_size = 5000
     skipped_non_contiguous = 0
 
     oi_rows = fetch(f"""
@@ -83,6 +93,9 @@ def rebuild_bot_aggregates() -> int:
                     изменение_в_процентах(chunk[0]["oi_open"], chunk[-1]["oi_close"]),
                     len(chunk),
                 ))
+                if len(rows_out) >= flush_size:
+                    total_out += _flush_aggregates(rows_out)
+                    rows_out.clear()
 
     price_rows = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close
@@ -113,6 +126,9 @@ def rebuild_bot_aggregates() -> int:
                     изменение_в_процентах(chunk[0]["price_open"], chunk[-1]["price_close"]),
                     len(chunk),
                 ))
+                if len(rows_out) >= flush_size:
+                    total_out += _flush_aggregates(rows_out)
+                    rows_out.clear()
 
     volume_rows = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, volume
@@ -145,12 +161,17 @@ def rebuild_bot_aggregates() -> int:
                     None,
                     len(chunk),
                 ))
+                if len(rows_out) >= flush_size:
+                    total_out += _flush_aggregates(rows_out)
+                    rows_out.clear()
 
-    replace_bot_aggregates(rows_out)
+    total_out += _flush_aggregates(rows_out)
+    rows_out.clear()
+
     log(
         f"aggregates rebuilt: raw_oi={len(oi_rows)} "
         f"raw_price={len(price_rows)} raw_volume={len(volume_rows)} "
-        f"aggregates={len(rows_out)} "
+        f"aggregates={total_out} "
         f"skipped_non_contiguous={skipped_non_contiguous}"
     )
-    return len(rows_out)
+    return total_out
