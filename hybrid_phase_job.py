@@ -4,6 +4,7 @@ import argparse
 import time
 
 from logger import log
+from aggregation_engine import rebuild_bot_aggregates
 from research_engine import rebuild_market_research
 from market_price_engine import rebuild_price_state
 from market_volume_engine import rebuild_volume_state
@@ -43,6 +44,7 @@ def main() -> None:
     log("hybrid phase job start")
 
     counts = {
+        "bot_aggregates": _step("bot_aggregates", rebuild_bot_aggregates),
         "market_research": _step("market_research", rebuild_market_research),
         "market_price_state": _step("market_price_state", rebuild_price_state),
         "market_volume_state": _step("market_volume_state", rebuild_volume_state),
