@@ -19,6 +19,7 @@ from config import (
     ИНТЕРВАЛ_ЦИКЛА_СЕК,
     ЛИМИТ_СИМВОЛОВ_BYBIT,
     ЛИМИТ_СИМВОЛОВ_BINANCE,
+    BYBIT_COLLECT_WORKERS,
     BINANCE_COLLECT_WORKERS,
     ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК,
 )
@@ -116,18 +117,37 @@ def collect(symbols_bybit, symbols_binance):
     def record_failure(exchange: str, symbol: str, data_type: str, exc: Exception) -> None:
         failures.append((now, exchange, symbol, data_type, type(exc).__name__, str(exc)[:500]))
 
-    for s in symbols_bybit[:ЛИМИТ_СИМВОЛОВ_BYBIT]:
+    bybit_collect_symbols = symbols_bybit
+
+    def collect_bybit_symbol(s: str):
+        local_oi, local_price, local_volume = [], [], []
         try:
-            oi_rows.extend(fetch_bybit_oi_5m(s, 200))
+            local_oi.extend(fetch_bybit_oi_5m(s, 200))
         except Exception as exc:
             record_failure("BYBIT", s, "OI", exc)
 
         try:
             p, v = fetch_bybit_kline_5m(s, 200)
-            price_rows.extend(p)
-            volume_rows.extend(v)
+            local_price.extend(p)
+            local_volume.extend(v)
         except Exception as exc:
             record_failure("BYBIT", s, "PRICE_VOLUME", exc)
+
+        return local_oi, local_price, local_volume
+
+    bybit_workers = max(1, BYBIT_COLLECT_WORKERS)
+
+    with ThreadPoolExecutor(max_workers=bybit_workers) as executor:
+        futures = [
+            executor.submit(collect_bybit_symbol, symbol)
+            for symbol in bybit_collect_symbols
+        ]
+
+        for future in as_completed(futures):
+            local_oi, local_price, local_volume = future.result()
+            oi_rows.extend(local_oi)
+            price_rows.extend(local_price)
+            volume_rows.extend(local_volume)
 
     binance_collect_symbols = (
         symbols_binance
@@ -259,7 +279,7 @@ def background(bybit_symbols, binance_symbols):
             log(
                 f"cycle resource: pid={os.getpid()} "
                 f"memory_max_rss_mb={_runtime_memory_mb():.2f} "
-                f"bybit_symbols={len(bybit_symbols)} "
+                f"bybit_symbols={len(bybit_symbols)} bybit_workers={BYBIT_COLLECT_WORKERS} "
                 f"binance_symbols={len(binance_symbols)} "
                 f"binance_workers={BINANCE_COLLECT_WORKERS}"
             )
