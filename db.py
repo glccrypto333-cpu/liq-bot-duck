@@ -891,6 +891,9 @@ def cleanup_old(days: int) -> None:
     for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
         execute(f"DELETE FROM {table} WHERE ts_open < NOW() - (%s || ' days')::interval", (RAW_RETENTION_DAYS,))
 
+    execute("DELETE FROM bot_aggregates WHERE ts_close < NOW() - INTERVAL '72 hours'")
+    execute("DELETE FROM market_research WHERE ts_close < NOW() - INTERVAL '72 hours'")
+
 def migrate_canonical_ts_close() -> None:
     """
     v3.5.1 migration:
