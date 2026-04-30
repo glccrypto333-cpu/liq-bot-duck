@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from datetime import datetime, timezone
 from statistics import mean
 
@@ -141,7 +143,7 @@ def _insert_oi_slope_rows(rows: list[tuple]) -> None:
         """, rows)
 
 
-def _rebuild_oi_slope_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[int, dict]:
+def _rebuild_oi_slope_symbol_batch(symbols: list[tuple[str, str]], window_hours: int) -> tuple[int, dict]:
     if not symbols:
         return 0, {}
 
@@ -171,12 +173,12 @@ def _rebuild_oi_slope_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[int,
          AND s.ts_close = r.ts_close
         WHERE (r.exchange, r.symbol) IN ({values_sql})
           AND r.ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
+            SELECT MAX(ts_close) - (%s || ' hours')::interval
             FROM market_research
           )
         ORDER BY r.exchange, r.symbol, r.timeframe, r.ts_close
         """,
-        tuple(params),
+        tuple(params + [window_hours]),
     )
 
     history = {}
@@ -255,13 +257,15 @@ def _rebuild_oi_slope_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[int,
 
 
 def rebuild_oi_slope() -> int:
+    window_hours = int(os.getenv("DERIVED_WINDOW_HOURS", "2"))
+
     execute("""
         DELETE FROM market_oi_slope
         WHERE ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
+            SELECT MAX(ts_close) - (%s || ' hours')::interval
             FROM market_research
         )
-    """)
+    """, (window_hours,))
 
     symbols = [
         (r["exchange"], r["symbol"])
@@ -269,11 +273,11 @@ def rebuild_oi_slope() -> int:
             SELECT DISTINCT exchange, symbol
             FROM market_research
             WHERE ts_close >= (
-                SELECT MAX(ts_close) - '24 hours'::interval
+                SELECT MAX(ts_close) - (%s || ' hours')::interval
                 FROM market_research
             )
             ORDER BY exchange, symbol
-        """)
+        """, (window_hours,))
     ]
 
     total_rows = 0
@@ -281,7 +285,7 @@ def rebuild_oi_slope() -> int:
     batch_size = 25
 
     for i in range(0, len(symbols), batch_size):
-        rows_count, counts = _rebuild_oi_slope_symbol_batch(symbols[i:i + batch_size])
+        rows_count, counts = _rebuild_oi_slope_symbol_batch(symbols[i:i + batch_size], window_hours)
         total_rows += rows_count
         for k, v in counts.items():
             total_counts[k] = total_counts.get(k, 0) + v

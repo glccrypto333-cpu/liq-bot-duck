@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+import os
+
 from datetime import datetime, timezone
 from db import fetch, execute, _conn
 from logger import log
@@ -70,7 +72,7 @@ def _insert_market_silence_rows(rows: list[tuple]) -> None:
         """, rows)
 
 
-def _rebuild_market_silence_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[int, dict]:
+def _rebuild_market_silence_symbol_batch(symbols: list[tuple[str, str]], window_hours: int) -> tuple[int, dict]:
     if not symbols:
         return 0, {}
 
@@ -85,12 +87,12 @@ def _rebuild_market_silence_symbol_batch(symbols: list[tuple[str, str]]) -> tupl
         FROM market_research
         WHERE (exchange, symbol) IN ({values_sql})
           AND ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
+            SELECT MAX(ts_close) - (%s || ' hours')::interval
             FROM market_research
           )
         ORDER BY exchange, symbol, timeframe, ts_close
         """,
-        tuple(params),
+        tuple(params + [window_hours]),
     )
 
     now = datetime.now(timezone.utc)
@@ -123,33 +125,15 @@ def _rebuild_market_silence_symbol_batch(symbols: list[tuple[str, str]]) -> tupl
 
 
 def rebuild_market_silence() -> int:
-    execute("""
-        CREATE TABLE IF NOT EXISTS market_silence(
-            calculated_at TIMESTAMPTZ NOT NULL,
-            ts_close TIMESTAMPTZ NOT NULL,
-            exchange TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            timeframe TEXT NOT NULL,
-            stage INTEGER NOT NULL,
-            stage_name TEXT NOT NULL,
-            score DOUBLE PRECISION NOT NULL,
-            reason TEXT NOT NULL,
-            oi_delta_pct DOUBLE PRECISION,
-            price_delta_pct DOUBLE PRECISION,
-            volume_delta_pct DOUBLE PRECISION,
-            range_width_pct DOUBLE PRECISION,
-            market_state TEXT,
-            invalid_reason TEXT
-        )
-    """)
+    window_hours = int(os.getenv("DERIVED_WINDOW_HOURS", "2"))
 
     execute("""
         DELETE FROM market_silence
         WHERE ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
+            SELECT MAX(ts_close) - (%s || ' hours')::interval
             FROM market_research
         )
-    """)
+    """, (window_hours,))
 
     symbols = [
         (r["exchange"], r["symbol"])
@@ -157,11 +141,11 @@ def rebuild_market_silence() -> int:
             SELECT DISTINCT exchange, symbol
             FROM market_research
             WHERE ts_close >= (
-                SELECT MAX(ts_close) - '24 hours'::interval
+                SELECT MAX(ts_close) - (%s || ' hours')::interval
                 FROM market_research
             )
             ORDER BY exchange, symbol
-        """)
+        """, (window_hours,))
     ]
 
     total_rows = 0
@@ -169,7 +153,7 @@ def rebuild_market_silence() -> int:
     batch_size = 25
 
     for i in range(0, len(symbols), batch_size):
-        rows_count, counts = _rebuild_market_silence_symbol_batch(symbols[i:i + batch_size])
+        rows_count, counts = _rebuild_market_silence_symbol_batch(symbols[i:i + batch_size], window_hours)
         total_rows += rows_count
         for k, v in counts.items():
             total_counts[k] = total_counts.get(k, 0) + v

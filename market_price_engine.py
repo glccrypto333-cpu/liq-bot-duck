@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from datetime import datetime, timezone
 from statistics import mean
 
@@ -108,7 +110,7 @@ def _insert_price_state_rows(rows: list[tuple]) -> None:
         """, rows)
 
 
-def _rebuild_price_state_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[int, dict]:
+def _rebuild_price_state_symbol_batch(symbols: list[tuple[str, str]], window_hours: int) -> tuple[int, dict]:
     if not symbols:
         return 0, {}
 
@@ -133,12 +135,12 @@ def _rebuild_price_state_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[i
         FROM market_research
         WHERE (exchange, symbol) IN ({values_sql})
           AND ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
+            SELECT MAX(ts_close) - (%s || ' hours')::interval
             FROM market_research
           )
         ORDER BY exchange, symbol, timeframe, ts_close
         """,
-        tuple(params),
+        tuple(params + [window_hours]),
     )
 
     history = {}
@@ -198,13 +200,15 @@ def _rebuild_price_state_symbol_batch(symbols: list[tuple[str, str]]) -> tuple[i
 
 
 def rebuild_price_state() -> int:
+    window_hours = int(os.getenv("DERIVED_WINDOW_HOURS", "2"))
+
     execute("""
         DELETE FROM market_price_state
         WHERE ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
+            SELECT MAX(ts_close) - (%s || ' hours')::interval
             FROM market_research
         )
-    """)
+    """, (window_hours,))
 
     symbols = [
         (r["exchange"], r["symbol"])
@@ -212,11 +216,11 @@ def rebuild_price_state() -> int:
             SELECT DISTINCT exchange, symbol
             FROM market_research
             WHERE ts_close >= (
-                SELECT MAX(ts_close) - '24 hours'::interval
+                SELECT MAX(ts_close) - (%s || ' hours')::interval
                 FROM market_research
             )
             ORDER BY exchange, symbol
-        """)
+        """, (window_hours,))
     ]
 
     total_rows = 0
@@ -224,7 +228,7 @@ def rebuild_price_state() -> int:
     batch_size = 25
 
     for i in range(0, len(symbols), batch_size):
-        rows_count, counts = _rebuild_price_state_symbol_batch(symbols[i:i + batch_size])
+        rows_count, counts = _rebuild_price_state_symbol_batch(symbols[i:i + batch_size], window_hours)
         total_rows += rows_count
         for k, v in counts.items():
             total_counts[k] = total_counts.get(k, 0) + v
