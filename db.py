@@ -12,7 +12,7 @@ from logger import log
 def _runtime_ddl_enabled() -> bool:
     return os.getenv("RUN_DDL_MIGRATIONS") == "1"
 
-def _executemany_with_lock_retry(cur, sql: str, rows: list[tuple], batch_size: int = 5000) -> None:
+def _executemany_with_lock_retry(cur, sql: str, rows: list[tuple], batch_size: int = 500) -> None:
     if not rows:
         return
 
@@ -28,7 +28,8 @@ def _executemany_with_lock_retry(cur, sql: str, rows: list[tuple], batch_size: i
                     raise
                 if attempt == 2:
                     raise
-                time.sleep(2 * (attempt + 1))
+                log(f"lock retry: batch={len(batch)} attempt={attempt + 1}")
+                time.sleep(5 * (attempt + 1))
 
 
 def safe_ddl(cur, sql: str) -> None:
