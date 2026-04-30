@@ -884,7 +884,7 @@ def load_quarantine_symbols(min_coverage_pct: float = 95.0) -> set[tuple[str, st
 
 def cleanup_old(days: int) -> None:
     for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
-        execute(f"DELETE FROM {table} WHERE ts_open < NOW() - (%s || ' days')::interval", (days,))
+        execute(f"DELETE FROM {table} WHERE ts_open < NOW() - (%s || \' days\')::interval", (RAW_RETENTION_DAYS,))
 
 def migrate_canonical_ts_close() -> None:
     """
