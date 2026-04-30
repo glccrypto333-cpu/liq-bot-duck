@@ -194,6 +194,7 @@ def _rebuild_market_research_symbol_batch(
     timeframe: str,
     symbols: list[tuple[str, str]],
     coverage: dict[tuple[str, str, str], dict],
+    window_hours: int,
 ) -> tuple[int, int]:
     if not symbols:
         return 0, 0
@@ -213,12 +214,12 @@ def _rebuild_market_research_symbol_batch(
         WHERE timeframe = %s
           AND (exchange, symbol) IN ({values_sql})
           AND ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
+            SELECT MAX(ts_close) - (%s || ' hours')::interval
             FROM bot_aggregates
           )
         ORDER BY exchange, symbol, timeframe, ts_close
         """,
-        tuple(params),
+        tuple(params + [window_hours]),
     )
 
     metric_map: dict[tuple, dict] = {}
@@ -314,7 +315,7 @@ def _rebuild_market_research_symbol_batch(
     return len(out), invalid_data_rows
 
 
-def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str, str, str], dict]) -> tuple[int, int]:
+def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str, str, str], dict], window_hours: int) -> tuple[int, int]:
     symbols = [
         (r["exchange"], r["symbol"])
         for r in fetch(
@@ -323,12 +324,12 @@ def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str,
             FROM bot_aggregates
             WHERE timeframe = %s
               AND ts_close >= (
-                SELECT MAX(ts_close) - '24 hours'::interval
+                SELECT MAX(ts_close) - (%s || ' hours')::interval
                 FROM bot_aggregates
               )
             ORDER BY exchange, symbol
             """,
-            (timeframe,),
+            (timeframe, window_hours),
         )
     ]
 
@@ -338,7 +339,7 @@ def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str,
 
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i:i + batch_size]
-        rows_count, invalid_count = _rebuild_market_research_symbol_batch(timeframe, batch, coverage)
+        rows_count, invalid_count = _rebuild_market_research_symbol_batch(timeframe, batch, coverage, window_hours)
         total_rows += rows_count
         total_invalid += invalid_count
 
@@ -347,6 +348,7 @@ def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str,
 
 def rebuild_market_research() -> int:
     init_research_schema()
+    window_hours = int(os.getenv("DERIVED_WINDOW_HOURS", "2"))
 
     timeframes = [
         r["timeframe"]
@@ -354,11 +356,11 @@ def rebuild_market_research() -> int:
             SELECT DISTINCT timeframe
             FROM bot_aggregates
             WHERE ts_close >= (
-                SELECT MAX(ts_close) - '24 hours'::interval
+                SELECT MAX(ts_close) - (%s || ' hours')::interval
                 FROM bot_aggregates
             )
             ORDER BY timeframe
-        """)
+        """, (window_hours,))
     ]
 
     coverage = _coverage_map()
@@ -366,16 +368,16 @@ def rebuild_market_research() -> int:
     execute("""
         DELETE FROM market_research
         WHERE ts_close >= (
-            SELECT MAX(ts_close) - '24 hours'::interval
+            SELECT MAX(ts_close) - (%s || ' hours')::interval
             FROM bot_aggregates
         )
-    """)
+    """, (window_hours,))
 
     total_rows = 0
     total_invalid = 0
 
     for timeframe in timeframes:
-        rows_count, invalid_count = _rebuild_market_research_timeframe(timeframe, coverage)
+        rows_count, invalid_count = _rebuild_market_research_timeframe(timeframe, coverage, window_hours)
         total_rows += rows_count
         total_invalid += invalid_count
         log(f"market research batch rebuilt: timeframe={timeframe} rows={rows_count} invalid_data={invalid_count}")
