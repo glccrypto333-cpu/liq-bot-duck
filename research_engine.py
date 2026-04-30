@@ -335,7 +335,7 @@ def _rebuild_market_research_timeframe(timeframe: str, coverage: dict[tuple[str,
 
     total_rows = 0
     total_invalid = 0
-    batch_size = 25
+    batch_size = int(os.getenv("DERIVED_BATCH_SIZE", "100"))
 
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i:i + batch_size]

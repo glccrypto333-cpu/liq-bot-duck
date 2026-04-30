@@ -150,7 +150,7 @@ def rebuild_market_silence() -> int:
 
     total_rows = 0
     total_counts = {}
-    batch_size = 25
+    batch_size = int(os.getenv("DERIVED_BATCH_SIZE", "100"))
 
     for i in range(0, len(symbols), batch_size):
         rows_count, counts = _rebuild_market_silence_symbol_batch(symbols[i:i + batch_size], window_hours)
