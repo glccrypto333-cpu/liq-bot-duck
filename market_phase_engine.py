@@ -19,6 +19,7 @@ STAGE3_OI = {"агрессивный набор", "ускорение"}
 
 OK_PRICE = {"сжатие", "спокойный боковик", "широкий боковик", "возврат"}
 BAD_PRICE = {"импульс вверх", "импульс вниз", "расширение вверх", "расширение вниз", "памп", "дамп"}
+HARD_BAD_PRICE = {"импульс вниз", "расширение вниз", "дамп"}
 
 VOLUME_BOOST = {"всплеск объема", "аномальный объем"}
 VOLUME_OK = {"обычный объем", "объем падает", "объем растет", "всплеск объема"}
@@ -159,6 +160,8 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
     price_structure = _v(row, "price_structure")
     volume_structure = _v(row, "volume_structure")
 
+    price_hard_block = price_structure in HARD_BAD_PRICE
+
     stage1_started_at = _v(row, "stage1_started_at")
     stage2_started_at = _v(row, "stage2_started_at")
 
@@ -212,6 +215,7 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
         and oi_structure not in STAGE2_BLOCKED_OI
         and oi_trend_1h in POSITIVE_OI_TRENDS
         and oi_hold_state in REAL_HOLD
+        and not price_hard_block
     )
 
     if stage2_ok:
@@ -219,6 +223,9 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
 
     if prev_phase == 2 and oi_structure in STAGE2_DOWNGRADE_TO_0:
         return 0, f"downgrade_stage2_to_stage0: bad_oi_structure={oi_structure}"
+
+    if prev_phase == 2 and price_hard_block:
+        return 1, f"downgrade_stage2_to_stage1: hard_price_block_possible_squeeze={price_structure}"
 
     if prev_phase == 2 and oi_structure in STAGE2_DOWNGRADE_TO_1:
         return 1, f"downgrade_stage2_to_stage1: weak_oi_structure={oi_structure}"
@@ -402,6 +409,7 @@ def rebuild_market_phase() -> int:
             f"oi_trend_1h={_v(r,'oi_trend_1h')}; "
             f"oi_trend_4h={_v(r,'oi_trend_4h')}; "
             f"price_structure={_v(r,'price_structure')}; "
+            f"price_hard_block={_v(r,'price_structure') in HARD_BAD_PRICE}; "
             f"volume_structure={_v(r,'volume_structure')}; "
             f"volume_hold_state={_v(r,'volume_hold_state')}"
         )
