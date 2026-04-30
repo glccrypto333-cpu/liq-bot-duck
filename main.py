@@ -42,6 +42,7 @@ from market_oi_slope_engine import rebuild_oi_slope
 from market_phase_engine import rebuild_market_phase
 from export_engine import rebuild_exports
 from telegram_bot import start_polling, send_message
+from runtime_mode import runtime_mode_text
 
 
 def _write_runtime_timing_report(timings: list[tuple[str, float]]) -> None:
@@ -275,6 +276,7 @@ def background(bybit_symbols, binance_symbols):
 
 def main():
     log(f"Новая чистая база {APP_VERSION} запущена")
+    log(f"runtime mode: {runtime_mode_text()}")
 
     log("init_db start")
     init_db()
