@@ -23,6 +23,7 @@ from config import (
     BINANCE_COLLECT_WORKERS,
     ИНТЕРВАЛ_ПЕРЕСБОРКИ_ЭКСПОРТА_СЕК,
     AGGREGATES_EVERY_CYCLES,
+    MAX_COLLECT_SECONDS_FOR_AGGREGATES,
 )
 from logger import log
 from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old, migrate_canonical_ts_close, replace_active_universe, replace_request_failures, load_quarantine_symbols
@@ -236,11 +237,14 @@ def background(bybit_symbols, binance_symbols):
         try:
             timings = []
 
-            _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
+            collect_seconds = _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
 
             if os.getenv("SKIP_HEAVY_AGGREGATES") == "1":
                 agg_count = -1
                 log("aggregates skipped: SKIP_HEAVY_AGGREGATES=1")
+            elif collect_seconds > MAX_COLLECT_SECONDS_FOR_AGGREGATES:
+                agg_count = -1
+                log(f"aggregates skipped: collect too slow {collect_seconds:.2f}s > {MAX_COLLECT_SECONDS_FOR_AGGREGATES}s")
             elif cycle_no % max(1, AGGREGATES_EVERY_CYCLES) != 0:
                 agg_count = -1
                 log(f"aggregates skipped: scheduled every {AGGREGATES_EVERY_CYCLES} cycles")
