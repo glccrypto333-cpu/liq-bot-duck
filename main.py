@@ -226,9 +226,17 @@ def background(bybit_symbols, binance_symbols):
                 audit_count = -1
                 log("validation_audit skipped: scheduled every 6 cycles")
 
-            if os.getenv("SKIP_STAGE2_REBUILDS") == "1":
+            auto_skip_stage2 = (
+                os.getenv("SKIP_STAGE2_REBUILDS") == "1"
+                or (
+                    os.getenv("SKIP_HEAVY_AGGREGATES") == "1"
+                    and os.getenv("FORCE_STAGE2_WITH_STALE_AGGREGATES") != "1"
+                )
+            )
+
+            if auto_skip_stage2:
                 research_count = silence_count = price_count = volume_count = oi_slope_count = phase_count = -1
-                log("stage2 rebuilds skipped: SKIP_STAGE2_REBUILDS=1")
+                log("stage2 rebuilds skipped: safe runtime mode")
             else:
                 research_count = _timed_step(timings, "market_research", rebuild_market_research)
                 silence_count = _timed_step(timings, "market_silence", rebuild_market_silence)
