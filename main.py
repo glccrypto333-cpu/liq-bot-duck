@@ -95,12 +95,12 @@ def _collect_binance_symbol(symbol: str):
     failures = []
 
     try:
-        oi_rows.extend(fetch_binance_oi_5m(symbol, 200))
+        oi_rows.extend(fetch_binance_oi_5m(symbol, 24))
     except Exception as exc:
         failures.append(("BINANCE", symbol, "OI", exc))
 
     try:
-        p, v = fetch_binance_kline_5m(symbol, 200)
+        p, v = fetch_binance_kline_5m(symbol, 24)
         price_rows.extend(p)
         volume_rows.extend(v)
     except Exception as exc:
@@ -122,12 +122,12 @@ def collect(symbols_bybit, symbols_binance):
     def collect_bybit_symbol(s: str):
         local_oi, local_price, local_volume = [], [], []
         try:
-            local_oi.extend(fetch_bybit_oi_5m(s, 200))
+            local_oi.extend(fetch_bybit_oi_5m(s, 24))
         except Exception as exc:
             record_failure("BYBIT", s, "OI", exc)
 
         try:
-            p, v = fetch_bybit_kline_5m(s, 200)
+            p, v = fetch_bybit_kline_5m(s, 24)
             local_price.extend(p)
             local_volume.extend(v)
         except Exception as exc:
