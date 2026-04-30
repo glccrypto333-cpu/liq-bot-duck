@@ -367,6 +367,13 @@ def init_db() -> None:
         )
         """)
 
+        run_runtime_ddl = os.getenv("RUN_DDL_MIGRATIONS") == "1"
+        log(f"DDL migrations enabled: {run_runtime_ddl}")
+
+        if not run_runtime_ddl:
+            log("DDL runtime migrations skipped")
+            return
+
         log("DDL deferred: idx_bot_agg_main")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
