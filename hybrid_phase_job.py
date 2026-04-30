@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 from logger import log
+from db import execute
 from aggregation_engine import rebuild_bot_aggregates
 from research_engine import rebuild_market_research
 from market_price_engine import rebuild_price_state
@@ -42,7 +44,9 @@ def main() -> None:
     parser.add_argument("--skip-audit", action="store_true")
     args = parser.parse_args()
 
-    log("hybrid phase job start")
+    timeout_ms = int(os.getenv("HYBRID_STATEMENT_TIMEOUT_MS", "120000"))
+    execute(f"SET statement_timeout = {timeout_ms}")
+    log(f"hybrid phase job start statement_timeout_ms={timeout_ms}")
 
     counts = {
         "bot_aggregates": _step("bot_aggregates", rebuild_bot_aggregates),
