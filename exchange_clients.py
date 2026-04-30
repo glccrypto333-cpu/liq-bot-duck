@@ -2,7 +2,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone, timedelta
 import requests
-from config import BYBIT_BASE, BINANCE_BASE, BINANCE_UNIVERSE_SKIP_TOP
+from config import BYBIT_BASE, BINANCE_BASE, BINANCE_UNIVERSE_SKIP_TOP, BYBIT_UNIVERSE_SKIP_TOP
 
 UA = {"User-Agent": "Mozilla/5.0 MightyDuck/1.0"}
 

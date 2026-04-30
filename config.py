@@ -9,6 +9,7 @@ APP_VERSION = "v3.5.4"
 ЛИМИТ_СИМВОЛОВ_BYBIT = int(os.getenv("LIMIT_SYMBOLS_BYBIT", "0"))
 ЛИМИТ_СИМВОЛОВ_BINANCE = int(os.getenv("LIMIT_SYMBOLS_BINANCE", "0"))
 BINANCE_UNIVERSE_SKIP_TOP = int(os.getenv("BINANCE_UNIVERSE_SKIP_TOP", "50"))
+BYBIT_UNIVERSE_SKIP_TOP = int(os.getenv("BYBIT_UNIVERSE_SKIP_TOP", "50"))
 BINANCE_COLLECT_WORKERS = int(os.getenv("BINANCE_COLLECT_WORKERS", "6"))
 
 QUICK_EXPORT_CANDLES = int(os.getenv("QUICK_EXPORT_CANDLES", "96"))
