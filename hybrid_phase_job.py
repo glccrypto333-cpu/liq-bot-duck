@@ -13,6 +13,7 @@ from market_volume_engine import rebuild_volume_state
 from market_oi_slope_engine import rebuild_oi_slope
 from market_silence_engine import rebuild_market_silence
 from market_phase_engine import rebuild_market_phase
+from market_phase_source import rebuild_market_phase_source
 from phase_audit import main as phase_audit_main
 from phase_snapshot import insert_phase_snapshot
 from cleanup_derived_windows import cleanup_derived_windows
@@ -55,6 +56,7 @@ def main() -> None:
         "market_volume_state": _step("market_volume_state", rebuild_volume_state),
         "market_oi_slope": _step("market_oi_slope", rebuild_oi_slope),
         "market_silence": _step("market_silence", rebuild_market_silence),
+        "market_phase_source": _step("market_phase_source", rebuild_market_phase_source),
         "market_phase": _step("market_phase", rebuild_market_phase),
         "cleanup_derived_windows": _step("cleanup_derived_windows", cleanup_derived_windows),
         "phase_snapshot": _step("phase_snapshot", insert_phase_snapshot),
