@@ -225,12 +225,16 @@ def background(bybit_symbols, binance_symbols):
                 audit_count = -1
                 log("validation_audit skipped: scheduled every 6 cycles")
 
-            research_count = _timed_step(timings, "market_research", rebuild_market_research)
-            silence_count = _timed_step(timings, "market_silence", rebuild_market_silence)
-            price_count = _timed_step(timings, "price_state", rebuild_price_state)
-            volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
-            oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
-            phase_count = _timed_step(timings, "market_phase", rebuild_market_phase)
+            if os.getenv("SKIP_STAGE2_REBUILDS") == "1":
+                research_count = silence_count = price_count = volume_count = oi_slope_count = phase_count = -1
+                log("stage2 rebuilds skipped: SKIP_STAGE2_REBUILDS=1")
+            else:
+                research_count = _timed_step(timings, "market_research", rebuild_market_research)
+                silence_count = _timed_step(timings, "market_silence", rebuild_market_silence)
+                price_count = _timed_step(timings, "price_state", rebuild_price_state)
+                volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
+                oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
+                phase_count = _timed_step(timings, "market_phase", rebuild_market_phase)
 
             _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
 
