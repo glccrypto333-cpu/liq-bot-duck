@@ -50,3 +50,5 @@ BINANCE_BASE = "https://fapi.binance.com"
 )
 
 RAW_RETENTION_DAYS = int(os.getenv("RAW_RETENTION_DAYS", "7"))
+
+AGGREGATES_EVERY_CYCLES = int(os.getenv("AGGREGATES_EVERY_CYCLES", "3"))
