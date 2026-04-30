@@ -489,6 +489,7 @@ def upsert_volume(rows: list[tuple]) -> None:
         """, rows)
 
 def replace_bot_aggregates(rows: list[tuple]) -> None:
+    execute("DELETE FROM bot_aggregates WHERE ts_close < NOW() - INTERVAL '72 hours'")
     execute("DELETE FROM bot_aggregates WHERE ts_close >= NOW() - INTERVAL '24 hours'")
     if not DATABASE_URL or not rows:
         return
