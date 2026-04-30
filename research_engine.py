@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -54,11 +55,13 @@ def init_research_schema() -> None:
         )
         """
     )
-    run_runtime_ddl = __import__("os").getenv("RUN_DDL_MIGRATIONS") == "1"
+    run_runtime_ddl = os.getenv("RUN_DDL_MIGRATIONS") == "1"
     if run_runtime_ddl:
         execute('ALTER TABLE market_research ADD COLUMN IF NOT EXISTS invalid_reason TEXT')
         execute('SELECT 1')  # DDL deferred: idx_market_research_main
         execute('SELECT 1')  # DDL deferred: idx_market_research_state
+    else:
+        log("DDL deferred: market_research runtime migrations skipped")
 
 
 def _score_continuation(oi_delta: float, price_delta: float, volume_delta: float) -> float:
