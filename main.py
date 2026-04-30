@@ -181,6 +181,8 @@ def collect(symbols_bybit, symbols_binance):
     log(
         f"collect ok: oi={len(oi_rows)} price={len(price_rows)} volume={len(volume_rows)} "
         f"request_failures={len(failures)} "
+        f"bybit_symbols={len(bybit_collect_symbols)} "
+        f"bybit_workers={bybit_workers} "
         f"binance_symbols={len(binance_collect_symbols)} "
         f"binance_workers={workers}"
     )
