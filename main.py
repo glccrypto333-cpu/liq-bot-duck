@@ -199,9 +199,6 @@ def _log_db_universe_check() -> None:
             "oi_5m_сырые",
             "price_5m_сырые",
             "volume_5m_сырые",
-            "bot_aggregates",
-            "market_research",
-            "market_oi_slope",
             "active_symbol_universe",
         ]
 
