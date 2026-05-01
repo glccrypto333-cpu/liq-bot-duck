@@ -781,12 +781,55 @@ def _append_quarantine_history(action: str, symbol: str, reason: str) -> None:
             w.writerow([datetime.now(timezone.utc).isoformat(), action, symbol, reason])
 
 
+
+def _build_quarantine_status_text() -> str:
+    data = _read_quarantine()
+
+    code_hits = []
+    for path in Path(".").glob("*.py"):
+        if path.name == "telegram_bot.py":
+            continue
+        text = path.read_text(errors="ignore")
+        if "telegram_quarantine" in text or "_read_quarantine" in text or "quarantine" in text.lower():
+            code_hits.append(path.name)
+
+    mode = "CORE-LINKED" if code_hits else "UI-ONLY"
+
+    lines = [
+        "🧱 Quarantine status",
+        "",
+        f"mode={mode}",
+        f"symbols={len(data)}",
+        f"file={_quarantine_path()}",
+        f"history={_quarantine_history_path()}",
+        "",
+    ]
+
+    if code_hits:
+        lines.append("Core references:")
+        lines.extend(f"- {name}" for name in sorted(set(code_hits)))
+    else:
+        lines.append("Core references: not found")
+        lines.append("Важно: quarantine сейчас не доказан как core-фильтр. UI-only до отдельной интеграции.")
+
+    if data:
+        lines.append("")
+        lines.append("Symbols:")
+        lines.extend(f"{s}: {r}" for s, r in sorted(data.items())[:50])
+
+    return "\n".join(lines)
+
+
 def _handle_quarantine(text: str, chat_id=None) -> None:
     if not _admin_only(chat_id):
         return
 
     parts = text.split(maxsplit=3)
     data = _read_quarantine()
+
+    if len(parts) >= 2 and parts[1] == "status":
+        send_message(_build_quarantine_status_text(), _main_keyboard())
+        return
 
     if len(parts) == 1 or parts[1] == "list":
         if not data:
