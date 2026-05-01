@@ -120,7 +120,25 @@ def _insert_volume_state_rows(rows: list[tuple]) -> None:
             market_state,
             invalid_reason
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, rows)
+
+        ON CONFLICT (exchange, symbol, timeframe, ts_close)
+        DO UPDATE SET
+            calculated_at = EXCLUDED.calculated_at,
+            volume_state = EXCLUDED.volume_state,
+            volume_state_name = EXCLUDED.volume_state_name,
+            volume_structure = EXCLUDED.volume_structure,
+            volume_quality = EXCLUDED.volume_quality,
+            volume_baseline_24h = EXCLUDED.volume_baseline_24h,
+            volume_hold_state = EXCLUDED.volume_hold_state,
+            volume_reason = EXCLUDED.volume_reason,
+            reason = EXCLUDED.reason,
+            volume_delta_pct = EXCLUDED.volume_delta_pct,
+            normalized_volume = EXCLUDED.normalized_volume,
+            volume_percentile = EXCLUDED.volume_percentile,
+            noise_state = EXCLUDED.noise_state,
+            market_state = EXCLUDED.market_state,
+            invalid_reason = EXCLUDED.invalid_reason
+                """, rows)
 
 
 def _rebuild_volume_state_symbol_batch(symbols: list[tuple[str, str]], window_hours: int) -> tuple[int, dict]:
@@ -226,13 +244,10 @@ def _rebuild_volume_state_symbol_batch(symbols: list[tuple[str, str]], window_ho
 def rebuild_volume_state() -> int:
     window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
 
-    execute("""
-        DELETE FROM market_volume_state
-        WHERE ts_close >= (
-            SELECT MAX(ts_close) - (%s || ' hours')::interval
-            FROM market_research
-        )
-    """, (window_hours,))
+    log(
+        f"volume state incremental mode: "
+        f"window_hours={window_hours} delete_before_insert=0"
+    )
 
     symbols = [
         (r["exchange"], r["symbol"])

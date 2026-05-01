@@ -107,7 +107,24 @@ def _insert_price_state_rows(rows: list[tuple]) -> None:
             market_state,
             invalid_reason
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, rows)
+
+        ON CONFLICT (exchange, symbol, timeframe, ts_close)
+        DO UPDATE SET
+            calculated_at = EXCLUDED.calculated_at,
+            price_state = EXCLUDED.price_state,
+            price_state_name = EXCLUDED.price_state_name,
+            price_structure = EXCLUDED.price_structure,
+            price_quality = EXCLUDED.price_quality,
+            price_slope_state = EXCLUDED.price_slope_state,
+            price_trend_24h = EXCLUDED.price_trend_24h,
+            price_range_from_median_pct = EXCLUDED.price_range_from_median_pct,
+            price_reason = EXCLUDED.price_reason,
+            reason = EXCLUDED.reason,
+            price_delta_pct = EXCLUDED.price_delta_pct,
+            range_width_pct = EXCLUDED.range_width_pct,
+            market_state = EXCLUDED.market_state,
+            invalid_reason = EXCLUDED.invalid_reason
+                """, rows)
 
 
 def _rebuild_price_state_symbol_batch(symbols: list[tuple[str, str]], window_hours: int) -> tuple[int, dict]:
@@ -202,13 +219,10 @@ def _rebuild_price_state_symbol_batch(symbols: list[tuple[str, str]], window_hou
 def rebuild_price_state() -> int:
     window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
 
-    execute("""
-        DELETE FROM market_price_state
-        WHERE ts_close >= (
-            SELECT MAX(ts_close) - (%s || ' hours')::interval
-            FROM market_research
-        )
-    """, (window_hours,))
+    log(
+        f"price state incremental mode: "
+        f"window_hours={window_hours} delete_before_insert=0"
+    )
 
     symbols = [
         (r["exchange"], r["symbol"])

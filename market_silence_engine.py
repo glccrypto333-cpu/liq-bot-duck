@@ -69,7 +69,21 @@ def _insert_market_silence_rows(rows: list[tuple]) -> None:
             market_state,
             invalid_reason
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, rows)
+
+        ON CONFLICT (exchange, symbol, timeframe, ts_close)
+        DO UPDATE SET
+            calculated_at = EXCLUDED.calculated_at,
+            stage = EXCLUDED.stage,
+            stage_name = EXCLUDED.stage_name,
+            score = EXCLUDED.score,
+            reason = EXCLUDED.reason,
+            oi_delta_pct = EXCLUDED.oi_delta_pct,
+            price_delta_pct = EXCLUDED.price_delta_pct,
+            volume_delta_pct = EXCLUDED.volume_delta_pct,
+            range_width_pct = EXCLUDED.range_width_pct,
+            market_state = EXCLUDED.market_state,
+            invalid_reason = EXCLUDED.invalid_reason
+                """, rows)
 
 
 def _rebuild_market_silence_symbol_batch(symbols: list[tuple[str, str]], window_hours: int) -> tuple[int, dict]:
@@ -127,13 +141,10 @@ def _rebuild_market_silence_symbol_batch(symbols: list[tuple[str, str]], window_
 def rebuild_market_silence() -> int:
     window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
 
-    execute("""
-        DELETE FROM market_silence
-        WHERE ts_close >= (
-            SELECT MAX(ts_close) - (%s || ' hours')::interval
-            FROM market_research
-        )
-    """, (window_hours,))
+    log(
+        f"market silence incremental mode: "
+        f"window_hours={window_hours} delete_before_insert=0"
+    )
 
     symbols = [
         (r["exchange"], r["symbol"])
