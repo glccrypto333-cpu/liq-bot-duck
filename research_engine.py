@@ -58,10 +58,11 @@ def init_research_schema() -> None:
     run_runtime_ddl = os.getenv("RUN_DDL_MIGRATIONS") == "1"
     if run_runtime_ddl:
         execute('ALTER TABLE market_research ADD COLUMN IF NOT EXISTS invalid_reason TEXT')
-        execute('SELECT 1')  # DDL deferred: idx_market_research_main
-        execute('SELECT 1')  # DDL deferred: idx_market_research_state
+        execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_research_key ON market_research(exchange, symbol, timeframe, ts_close)")
+        execute("CREATE INDEX IF NOT EXISTS idx_market_research_main ON market_research(exchange, symbol, timeframe, ts_close)")
+        execute("CREATE INDEX IF NOT EXISTS idx_market_research_state ON market_research(market_state, timeframe, ts_close)")
     else:
-        log("DDL deferred: market_research runtime migrations skipped")
+        log("DDL deferred: market_research runtime migrations skipped; requires existing ux_market_research_key")
 
 
 def _score_continuation(oi_delta: float, price_delta: float, volume_delta: float) -> float:
@@ -162,6 +163,11 @@ def _insert_market_research_rows(out: list[tuple]) -> None:
     if not out:
         return
 
+    keys = [(r[2], r[3], r[4], r[1]) for r in out]
+    duplicate_rows = len(keys) - len(set(keys))
+    if duplicate_rows > 0:
+        log(f"MARKET_RESEARCH_DUPLICATES_IN_BATCH duplicates={duplicate_rows} rows={len(out)}")
+
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany(
             """
@@ -184,8 +190,26 @@ def _insert_market_research_rows(out: list[tuple]) -> None:
                 invalid_reason
             )
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (exchange, symbol, timeframe, ts_close)
+            DO UPDATE SET
+                calculated_at = EXCLUDED.calculated_at,
+                oi_delta_pct = EXCLUDED.oi_delta_pct,
+                price_delta_pct = EXCLUDED.price_delta_pct,
+                volume_delta_pct = EXCLUDED.volume_delta_pct,
+                oi_velocity = EXCLUDED.oi_velocity,
+                oi_acceleration = EXCLUDED.oi_acceleration,
+                range_width_pct = EXCLUDED.range_width_pct,
+                continuation_score = EXCLUDED.continuation_score,
+                exhaustion_score = EXCLUDED.exhaustion_score,
+                compression_score = EXCLUDED.compression_score,
+                market_state = EXCLUDED.market_state,
+                invalid_reason = EXCLUDED.invalid_reason
             """,
             out,
+        )
+        log(
+            f"MARKET_RESEARCH_UPSERT_DONE "
+            f"rows={len(out)} duplicate_rows={duplicate_rows}"
         )
 
 
@@ -365,13 +389,10 @@ def rebuild_market_research() -> int:
 
     coverage = _coverage_map()
 
-    execute("""
-        DELETE FROM market_research
-        WHERE ts_close >= (
-            SELECT MAX(ts_close) - (%s || ' hours')::interval
-            FROM bot_aggregates
-        )
-    """, (window_hours,))
+    log(
+        f"market research incremental mode: "
+        f"window_hours={window_hours} delete_before_insert=0"
+    )
 
     total_rows = 0
     total_invalid = 0
