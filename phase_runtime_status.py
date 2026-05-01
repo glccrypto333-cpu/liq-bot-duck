@@ -74,6 +74,15 @@ def main() -> None:
             MAX(phase_updated_at),
             EXTRACT(EPOCH FROM (NOW() - MAX(phase_updated_at)))::BIGINT
         FROM market_phase
+
+        UNION ALL
+
+        SELECT
+            'market_phase_source',
+            COUNT(*),
+            MAX(ts_close),
+            EXTRACT(EPOCH FROM (NOW() - MAX(ts_close)))::BIGINT
+        FROM market_phase_source
     """)
 
     print("PHASE_RUNTIME_STATUS")

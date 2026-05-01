@@ -318,6 +318,16 @@ def background(bybit_symbols, binance_symbols):
 def main():
     log(f"Новая чистая база {APP_VERSION} запущена")
     log(f"runtime mode: {runtime_mode_text()}")
+    log(
+        "runtime env: "
+        f"cycle_interval={ИНТЕРВАЛ_ЦИКЛА_СЕК}s "
+        f"skip_heavy={os.getenv('SKIP_HEAVY_AGGREGATES')} "
+        f"skip_stage2={os.getenv('SKIP_STAGE2_REBUILDS')} "
+        f"force_stage2={os.getenv('FORCE_STAGE2_WITH_STALE_AGGREGATES')} "
+        f"derived_window_hours={os.getenv('DERIVED_WINDOW_HOURS')} "
+        f"derived_batch_size={os.getenv('DERIVED_BATCH_SIZE')} "
+        f"derived_retention_hours={os.getenv('DERIVED_RETENTION_HOURS')}"
+    )
 
     log("init_db start")
     init_db()
