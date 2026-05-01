@@ -1,19 +1,82 @@
 from __future__ import annotations
+import os
 import time
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 import requests
 from config import BYBIT_BASE, BINANCE_BASE, BINANCE_UNIVERSE_SKIP_TOP, BYBIT_UNIVERSE_SKIP_TOP
 
 UA = {"User-Agent": "Mozilla/5.0 MightyDuck/1.0"}
 
+_REQUEST_STATS = defaultdict(lambda: {
+    "count": 0,
+    "errors": 0,
+    "timeouts": 0,
+    "retries": 0,
+    "slow": 0,
+    "total_seconds": 0.0,
+    "max_seconds": 0.0,
+})
+
+
+def _endpoint_key(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.replace("api.", "")
+    return f"{host}{parsed.path}"
+
+
+def reset_request_stats() -> None:
+    _REQUEST_STATS.clear()
+
+
+def get_request_stats() -> dict:
+    out = {}
+    for endpoint, stats in _REQUEST_STATS.items():
+        count = int(stats["count"])
+        total = float(stats["total_seconds"])
+        out[endpoint] = {
+            "count": count,
+            "errors": int(stats["errors"]),
+            "timeouts": int(stats["timeouts"]),
+            "retries": int(stats["retries"]),
+            "slow": int(stats["slow"]),
+            "avg_seconds": round(total / count, 4) if count else 0,
+            "max_seconds": round(float(stats["max_seconds"]), 4),
+        }
+    return out
+
+
 def _get(url: str, params: dict | None = None, retries: int = 3):
     last_exc = None
+    endpoint = _endpoint_key(url)
+    slow_threshold = float(os.getenv("REQUEST_SLOW_SECONDS", "3"))
+    timeout_seconds = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
+
     for i in range(retries):
+        started = time.time()
         try:
-            r = requests.get(url, params=params, headers=UA, timeout=20)
+            r = requests.get(url, params=params, headers=UA, timeout=timeout_seconds)
+            elapsed = time.time() - started
+
+            stats = _REQUEST_STATS[endpoint]
+            stats["count"] += 1
+            stats["total_seconds"] += elapsed
+            stats["max_seconds"] = max(float(stats["max_seconds"]), elapsed)
+            if elapsed >= slow_threshold:
+                stats["slow"] += 1
+
             r.raise_for_status()
             return r.json()
         except Exception as exc:
+            elapsed = time.time() - started
+            stats = _REQUEST_STATS[endpoint]
+            stats["errors"] += 1
+            stats["max_seconds"] = max(float(stats["max_seconds"]), elapsed)
+            if i > 0:
+                stats["retries"] += 1
+            if "timeout" in type(exc).__name__.lower() or "timeout" in str(exc).lower():
+                stats["timeouts"] += 1
             last_exc = exc
             time.sleep(1 + i)
     raise last_exc

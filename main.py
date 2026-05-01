@@ -35,6 +35,8 @@ from exchange_clients import (
     fetch_binance_oi_5m,
     fetch_bybit_kline_5m,
     fetch_binance_kline_5m,
+    get_request_stats,
+    reset_request_stats,
 )
 from aggregation_engine import rebuild_bot_aggregates
 from audit_engine import rebuild_all
@@ -115,6 +117,7 @@ def _collect_binance_symbol(symbol: str):
 
 def collect(symbols_bybit, symbols_binance):
     collect_started = time.time()
+    reset_request_stats()
     oi_rows, price_rows, volume_rows = [], [], []
     failures = []
     now = datetime.now(timezone.utc)
@@ -263,11 +266,33 @@ def collect(symbols_bybit, symbols_binance):
             f"worker_pressure={worker_pressure}"
         )
 
+    request_stats = get_request_stats()
+    slow_request_total = sum(int(v.get("slow", 0)) for v in request_stats.values())
+    timeout_total = sum(int(v.get("timeouts", 0)) for v in request_stats.values())
+    retry_total = sum(int(v.get("retries", 0)) for v in request_stats.values())
+    request_error_total = sum(int(v.get("errors", 0)) for v in request_stats.values())
+
+    top_slow_endpoints = sorted(
+        request_stats.items(),
+        key=lambda x: (x[1].get("slow", 0), x[1].get("max_seconds", 0)),
+        reverse=True
+    )[:5]
+
     if collect_reserve_health != "ok":
         log(
             f"COLLECT_RESERVE_{collect_reserve_health.upper()} "
             f"reserve_seconds={collect_reserve_seconds:.2f} "
             f"target={collect_target_seconds:.2f}s"
+        )
+
+    if slow_request_total or timeout_total or retry_total:
+        log(
+            f"REQUEST_LATENCY "
+            f"slow_requests={slow_request_total} "
+            f"timeouts={timeout_total} "
+            f"retries={retry_total} "
+            f"errors={request_error_total} "
+            f"top_slow={top_slow_endpoints}"
         )
 
     log(
@@ -292,6 +317,10 @@ def collect(symbols_bybit, symbols_binance):
         f"bybit_seconds_per_symbol={bybit_seconds_per_symbol} "
         f"binance_seconds_per_symbol={binance_seconds_per_symbol} "
         f"worker_pressure={worker_pressure} "
+        f"slow_requests={slow_request_total} "
+        f"request_timeouts={timeout_total} "
+        f"request_retries={retry_total} "
+        f"request_errors={request_error_total} "
         f"collect_health={collect_health}"
     )
 
