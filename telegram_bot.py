@@ -69,8 +69,8 @@ def _top_oi_keyboard() -> dict:
 
 
 def _downloads_keyboard() -> dict:
-    files = _download_files()
-    keyboard = [[f"/download {name}"] for name in files]
+    buttons = [f"/download {alias}" for alias, _ in _download_files()]
+    keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     keyboard.append(["⬅️ Назад"])
     return {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": False}
 
@@ -388,15 +388,23 @@ def _exchange_code(exchange) -> str:
     return "BY" if str(exchange).upper() == "BYBIT" else "BN"
 
 
+def _html_escape(v) -> str:
+    return (
+        str(v or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 def _symbol_links(symbol: str, exchange=None) -> str:
-    sym = str(symbol).upper()
+    sym = _html_escape(str(symbol).upper())
     ex_code = _exchange_code(exchange)
     cg = f"https://www.coinglass.com/tv/Binance_{sym}"
     by = f"https://www.bybit.com/trade/usdt/{sym}"
     bn = f"https://www.binance.com/en/futures/{sym}"
     ex_url = by if ex_code == "BY" else bn
-    return f"🔗 [CG]({cg}) | [{ex_code}]({ex_url}) | [`{sym}`]({ex_url})"
-
+    return f'🔗 <a href="{cg}">CG</a> | <a href="{ex_url}">{ex_code}</a> | <code>{sym}</code>'
 
 
 def _short_ts(value) -> str:
@@ -532,61 +540,65 @@ def _build_stage3_text() -> str:
 
 
 def _build_top_oi_text(timeframe: str | None = None) -> str:
-    params = ()
-    tf_filter = ""
-    if timeframe:
-        tf_filter = "AND timeframe = %s"
-        params = (timeframe,)
+    timeframe = _tf_sql(timeframe)
+
+    where = ""
+    params = []
+
+    if timeframe in {"15м", "30м", "1ч"}:
+        tf_aliases = {
+            "15м": ["15м", "15m"],
+            "30м": ["30м", "30m"],
+            "1ч": ["1ч", "1h"],
+        }[timeframe]
+        where = "WHERE timeframe = ANY(%s)"
+        params.append(tf_aliases)
+
+    elif timeframe == "4ч":
+        where = "WHERE oi_trend_4h IS NOT NULL AND oi_trend_4h <> ''"
+
+    elif timeframe == "24ч":
+        where = "WHERE oi_trend_24h IS NOT NULL AND oi_trend_24h <> ''"
 
     rows = _safe_rows(f"""
-        SELECT exchange, symbol, timeframe, stage, stage_name,
-               oi_structure, oi_priority, oi_hold_state,
-               oi_trend_15m, oi_trend_30m, oi_trend_1h, oi_trend_4h, oi_trend_24h,
-               oi_delta_pct, oi_acceleration, price_delta_pct, volume_delta_pct, ts_close
+        SELECT *
         FROM market_oi_slope
-        WHERE ts_close >= (SELECT MAX(ts_close) FROM market_oi_slope) - INTERVAL '90 minutes'
-          AND stage >= 1
-          {tf_filter}
+        {where}
         ORDER BY ABS(oi_delta_pct) DESC, ABS(oi_acceleration) DESC, oi_priority ASC
         LIMIT 30
-    """, params)
+    """, tuple(params))
 
     latest = _safe_rows("SELECT MAX(ts_close) AS latest FROM market_oi_slope")
     latest_ts = latest[0].get("latest") if latest else None
 
-    timeframe = _tf_sql(timeframe)
     title = f"📈 ТОП OI {timeframe}" if timeframe else "📈 ТОП OI"
-    if not rows:
-        return f"{title}\n\nНет свежих строк в market_oi_slope."
 
-    lines = [title, _health_banner_for_table("market_oi_slope", "ts_close"), f"latest_ts={_short_ts(latest_ts)}", ""]
+    if not rows:
+        return f"{title}\n\nНет строк в market_oi_slope для этого фильтра."
+
+    lines = [
+        title,
+        _health_banner_for_table("market_oi_slope", "ts_close"),
+        f"latest_ts={_short_ts(latest_ts)}",
+        "",
+    ]
+
     for r in rows:
         ex = r.get("exchange")
+        symbol = r.get("symbol")
+        tf = r.get("timeframe")
+
         lines.extend([
-            f"{r.get('symbol')} [{r.get('timeframe')}]",
-            _symbol_links(r.get("symbol"), ex),
+            f"{symbol} [{tf}]",
+            _symbol_links(symbol, ex),
             f"stage={r.get('stage')} {r.get('stage_name')} | OI={_fmt_pct(r.get('oi_delta_pct'))} | acc={_fmt_pct(r.get('oi_acceleration'))}",
             f"structure={r.get('oi_structure')} | priority={r.get('oi_priority')} | hold={r.get('oi_hold_state')}",
-            f"trend 15m={r.get('oi_trend_15m')} | 30m={r.get('oi_trend_30m')} | 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')} | 24h={r.get('oi_trend_24h')}",
-            f"phase card: /coin {r.get('symbol')}",
+            f"trend 15м={r.get('oi_trend_15m')} | 30м={r.get('oi_trend_30m')} | 1ч={r.get('oi_trend_1h')} | 4ч={r.get('oi_trend_4h')} | 24ч={r.get('oi_trend_24h')}",
+            f"/coin {symbol}",
             "",
         ])
+
     return "\n".join(lines)
-
-
-
-def _latest_metric_row(table: str, symbol: str, exchange: str, timeframe: str) -> dict:
-    ts_col = "phase_updated_at" if table == "market_phase" else "ts_close"
-    rows = _safe_rows(f"""
-        SELECT *
-        FROM {table}
-        WHERE symbol = %s
-          AND exchange = %s
-          AND timeframe = %s
-        ORDER BY {ts_col} DESC
-        LIMIT 1
-    """, (symbol, exchange, timeframe))
-    return rows[0] if rows else {}
 
 
 def _build_coin_card(symbol: str) -> str:
@@ -770,22 +782,30 @@ def _save_feedback(text: str) -> str:
 
     return f"✅ Feedback snapshot сохранён: {symbol}, rows={written}"
 
-def _download_files() -> list[str]:
+def _download_files() -> list[tuple[str, str]]:
     return [
-        "market_research_bundle.zip",
-        "runtime_reports.zip",
-        "storage_manifest.txt",
-        "runtime_health_report.txt",
-        "runtime_timing_report.txt",
-        "request_failure_report.csv",
-        "gap_report.csv",
-        "active_universe_report.csv",
-        "telegram_feedback.csv",
-        "telegram_quarantine.csv",
-        "telegram_quarantine_history.csv",
-        "telegram_stage3_alert_history.csv",
-        "telegram_pending_reset_stage3.json",
+        ("bundle", "market_research_bundle.zip"),
+        ("reports", "runtime_reports.zip"),
+        ("manifest", "storage_manifest.txt"),
+        ("health", "runtime_health_report.txt"),
+        ("timing", "runtime_timing_report.txt"),
+        ("failures", "request_failure_report.csv"),
+        ("gaps", "gap_report.csv"),
+        ("universe", "active_universe_report.csv"),
+        ("feedback", "telegram_feedback.csv"),
+        ("quarantine", "telegram_quarantine.csv"),
+        ("q_history", "telegram_quarantine_history.csv"),
+        ("stage3_alerts", "telegram_stage3_alert_history.csv"),
+        ("pending_reset", "telegram_pending_reset_stage3.json"),
     ]
+
+
+def _download_name_map() -> dict[str, str]:
+    out = {}
+    for alias, filename in _download_files():
+        out[alias] = filename
+        out[filename] = filename
+    return out
 
 
 def _file_status(path: Path, stale_minutes: int = 60) -> dict:
@@ -815,25 +835,7 @@ def _file_status(path: Path, stale_minutes: int = 60) -> dict:
 
 
 def _build_downloads_text() -> str:
-    files = _download_files()
-
-    lines = [
-        "⬇️ Скачать",
-        "",
-        "Статус готовых файлов. Rebuild через Telegram не запускается.",
-        "",
-    ]
-
-    for name in files:
-        path = ПАПКА_ДАННЫХ / name
-        h = _file_status(path)
-        lines.append(
-            f"{h['status']} | {name} | size={h['size']} | rows={h['rows']} | "
-            f"latest={_short_ts(h['mtime'])} | age_min={h['age_min']}"
-        )
-
-    lines.extend(["", "Файл: /download filename"])
-    return "\n".join(lines)
+    return "⬇️ Скачать файлы\n\nВыбери файл кнопкой ниже."
 
 
 def _send_download(name: str) -> None:
