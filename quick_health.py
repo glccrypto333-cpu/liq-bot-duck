@@ -58,3 +58,66 @@ SELECT
     (SELECT MAX(ts_close) FROM market_oi_slope) AS oi_slope_latest
 """):
     print(dict(r))
+
+
+print("\n=== RUNTIME REPORTS ===")
+from pathlib import Path
+import json
+
+reports = Path("runtime_reports")
+
+def read_json(name):
+    path = reports / name
+    if not path.exists():
+        print(f"{name}: missing")
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        print(f"{name}: ok")
+        return data
+    except Exception as exc:
+        print(f"{name}: bad_json {type(exc).__name__}: {exc}")
+        return {}
+
+runtime = read_json("runtime_health.json")
+cycle = read_json("cycle_status.json")
+
+if runtime:
+    keys = [
+        "rss_health",
+        "watchdog_health",
+        "collect_seconds",
+        "collect_reserve_seconds",
+        "collect_reserve_health",
+        "runtime_alert_count",
+        "runtime_alerts",
+        "snapshot_health",
+    ]
+    for k in keys:
+        print(f"{k}: {runtime.get(k)}")
+
+if cycle:
+    keys = [
+        "cycle_health",
+        "cycle_elapsed_seconds",
+        "cycle_sleep_seconds",
+        "cycle_reserve_pct",
+        "cycle_latency_class",
+        "overrun_streak",
+    ]
+    for k in keys:
+        print(f"{k}: {cycle.get(k)}")
+
+health_flags = [
+    runtime.get("rss_health"),
+    runtime.get("watchdog_health"),
+    runtime.get("collect_reserve_health"),
+    runtime.get("snapshot_health"),
+    cycle.get("cycle_health"),
+]
+
+bad = [x for x in health_flags if x and x not in {"ok", "healthy"}]
+if bad:
+    print(f"RUNTIME_VERDICT: DEGRADED flags={bad}")
+else:
+    print("RUNTIME_VERDICT: OK")
