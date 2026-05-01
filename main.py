@@ -48,7 +48,7 @@ from market_oi_slope_engine import rebuild_oi_slope
 from market_phase_engine import rebuild_market_phase
 from market_phase_source import rebuild_market_phase_source
 from export_engine import rebuild_exports
-from telegram_bot import start_polling, send_panel_message
+from telegram_bot import start_polling, send_panel_message, check_stage3_alerts
 from runtime_mode import runtime_mode_text
 
 
@@ -504,6 +504,7 @@ def background(bybit_symbols, binance_symbols):
                     "WATCHDOG_MARKET_PHASE_SECONDS",
                     20,
                 )
+                stage3_alert_count = _timed_step(timings, "stage3_alerts", check_stage3_alerts)
 
             _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
 

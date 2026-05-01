@@ -710,6 +710,7 @@ def _build_downloads_text() -> str:
         "telegram_feedback.csv",
         "telegram_quarantine.csv",
         "telegram_quarantine_history.csv",
+        "telegram_stage3_alert_history.csv",
     ]
     lines = ["⬇️ Скачать", "", "Только готовые файлы. Rebuild не запускается.", ""]
     for name in files:
@@ -831,6 +832,138 @@ def _handle_stage3_reset(text: str, chat_id=None) -> None:
             log(f"telegram reset_stage3 error: {exc}")
 
     send_message(f"✅ Stage3 reset done: {symbol.upper()} {timeframe}, rows={total}", _main_keyboard())
+
+
+
+
+def _stage3_alert_history_path() -> Path:
+    return ПАПКА_ДАННЫХ / "telegram_stage3_alert_history.csv"
+
+
+def _read_stage3_alerted_keys() -> set[str]:
+    path = _stage3_alert_history_path()
+    if not path.exists():
+        return set()
+
+    keys = set()
+    with path.open("r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            key = row.get("alert_key")
+            if key:
+                keys.add(key)
+    return keys
+
+
+def _append_stage3_alert_history(row: dict, alert_key: str) -> None:
+    path = _stage3_alert_history_path()
+    new_file = not path.exists()
+
+    header = [
+        "created_at_utc",
+        "alert_key",
+        "exchange",
+        "symbol",
+        "timeframe",
+        "phase",
+        "phase_name",
+        "phase_status",
+        "priority",
+        "confidence",
+        "phase_updated_at",
+        "oi_structure",
+        "oi_priority",
+        "oi_hold_state",
+        "price_structure",
+        "price_quality",
+        "volume_structure",
+        "volume_quality",
+        "transition_reason",
+    ]
+
+    with _csv_lock:
+        with path.open("a", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(header)
+
+            w.writerow([
+                datetime.now(timezone.utc).isoformat(),
+                alert_key,
+                row.get("exchange"),
+                row.get("symbol"),
+                row.get("timeframe"),
+                row.get("phase"),
+                row.get("phase_name"),
+                row.get("phase_status"),
+                row.get("priority"),
+                row.get("confidence"),
+                row.get("phase_updated_at"),
+                row.get("oi_structure"),
+                row.get("oi_priority"),
+                row.get("oi_hold_state"),
+                row.get("price_structure"),
+                row.get("price_quality"),
+                row.get("volume_structure"),
+                row.get("volume_quality"),
+                row.get("transition_reason"),
+            ])
+
+
+def _build_stage3_alert_text(r: dict) -> str:
+    symbol = r.get("symbol")
+    timeframe = r.get("timeframe")
+    ex = r.get("exchange")
+    link = "BY" if ex == "BYBIT" else "BN"
+
+    return "\n".join([
+        "🥇 NEW STAGE 3",
+        "",
+        f"{symbol} [{timeframe}]",
+        f"🔗 CG | {link}",
+        f"`{symbol}`",
+        f"phase={r.get('phase')} {r.get('phase_name')} | status={r.get('phase_status')} | prio={r.get('priority')} | conf={r.get('confidence')}",
+        f"updated={_short_ts(r.get('phase_updated_at'))}",
+        f"OI: {r.get('oi_structure')} | p={r.get('oi_priority')} | hold={r.get('oi_hold_state')} | 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')}",
+        f"PRICE: {r.get('price_structure')} | {r.get('price_quality')} | slope={r.get('price_slope_state')}",
+        f"VOL: {r.get('volume_structure')} | {r.get('volume_quality')} | hold={r.get('volume_hold_state')}",
+        f"transition={r.get('transition_reason')}",
+        "",
+        f"Card: /coin {symbol}",
+        f"Feedback: /feedback {symbol} текст",
+        f"Reset: /reset_stage3 {symbol} {timeframe} reason",
+    ])
+
+
+def check_stage3_alerts() -> int:
+    alerted = _read_stage3_alerted_keys()
+
+    rows = _safe_rows("""
+        SELECT *
+        FROM market_phase
+        WHERE phase = 3
+        ORDER BY phase_updated_at DESC
+        LIMIT 50
+    """)
+
+    sent = 0
+
+    for r in rows:
+        key = "|".join([
+            str(r.get("exchange")),
+            str(r.get("symbol")),
+            str(r.get("timeframe")),
+            str(r.get("phase_started_at") or r.get("phase_updated_at")),
+        ])
+
+        if key in alerted:
+            continue
+
+        send_message(_build_stage3_alert_text(r), _main_keyboard())
+        _append_stage3_alert_history(r, key)
+        sent += 1
+
+    return sent
+
 
 
 def _handle(text: str, chat_id=None) -> None:
