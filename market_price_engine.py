@@ -216,8 +216,23 @@ def _rebuild_price_state_symbol_batch(symbols: list[tuple[str, str]], window_hou
     return len(out), counts
 
 
+
+def _ensure_incremental_key() -> None:
+    execute("""
+        DELETE FROM market_price_state a
+        USING market_price_state b
+        WHERE a.exchange = b.exchange
+          AND a.symbol = b.symbol
+          AND a.timeframe = b.timeframe
+          AND a.ts_close = b.ts_close
+          AND a.ctid < b.ctid
+    """)
+    execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_price_state_key ON market_price_state(exchange, symbol, timeframe, ts_close)")
+
+
 def rebuild_price_state() -> int:
     window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
+    _ensure_incremental_key()
 
     log(
         f"price state incremental mode: "

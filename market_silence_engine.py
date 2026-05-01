@@ -138,8 +138,23 @@ def _rebuild_market_silence_symbol_batch(symbols: list[tuple[str, str]], window_
     return len(out), counts
 
 
+
+def _ensure_incremental_key() -> None:
+    execute("""
+        DELETE FROM market_silence a
+        USING market_silence b
+        WHERE a.exchange = b.exchange
+          AND a.symbol = b.symbol
+          AND a.timeframe = b.timeframe
+          AND a.ts_close = b.ts_close
+          AND a.ctid < b.ctid
+    """)
+    execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_silence_key ON market_silence(exchange, symbol, timeframe, ts_close)")
+
+
 def rebuild_market_silence() -> int:
     window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
+    _ensure_incremental_key()
 
     log(
         f"market silence incremental mode: "

@@ -62,7 +62,19 @@ def init_research_schema() -> None:
         execute("CREATE INDEX IF NOT EXISTS idx_market_research_main ON market_research(exchange, symbol, timeframe, ts_close)")
         execute("CREATE INDEX IF NOT EXISTS idx_market_research_state ON market_research(market_state, timeframe, ts_close)")
     else:
-        log("DDL deferred: market_research runtime migrations skipped; requires existing ux_market_research_key")
+        log("DDL deferred: market_research runtime migrations skipped; ensuring incremental key anyway")
+
+    execute("""
+        DELETE FROM market_research a
+        USING market_research b
+        WHERE a.exchange = b.exchange
+          AND a.symbol = b.symbol
+          AND a.timeframe = b.timeframe
+          AND a.ts_close = b.ts_close
+          AND a.ctid < b.ctid
+    """)
+
+    execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_research_key ON market_research(exchange, symbol, timeframe, ts_close)")
 
 
 def _score_continuation(oi_delta: float, price_delta: float, volume_delta: float) -> float:

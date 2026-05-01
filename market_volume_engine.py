@@ -241,8 +241,23 @@ def _rebuild_volume_state_symbol_batch(symbols: list[tuple[str, str]], window_ho
     return len(out), counts
 
 
+
+def _ensure_incremental_key() -> None:
+    execute("""
+        DELETE FROM market_volume_state a
+        USING market_volume_state b
+        WHERE a.exchange = b.exchange
+          AND a.symbol = b.symbol
+          AND a.timeframe = b.timeframe
+          AND a.ts_close = b.ts_close
+          AND a.ctid < b.ctid
+    """)
+    execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_volume_state_key ON market_volume_state(exchange, symbol, timeframe, ts_close)")
+
+
 def rebuild_volume_state() -> int:
     window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
+    _ensure_incremental_key()
 
     log(
         f"volume state incremental mode: "
