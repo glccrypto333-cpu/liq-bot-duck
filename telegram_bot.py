@@ -24,15 +24,55 @@ _csv_lock = threading.Lock()
 def _main_keyboard() -> dict:
     return {
         "keyboard": [
-            ["📊 Статус", "⚙️ Фазы"],
-            ["🥉 Stage 1", "🥈 Stage 2", "🥇 Stage 3"],
-            ["📈 ТОП OI", "🪙 Coin"],
-            ["⬇️ Скачать", "🧱 Quarantine"],
-            ["🧭 Runtime", "❓ Помощь"],
+            ["⚙️ Фазы", "📈 Топ ОИ"],
+            ["⬇️ Скачать", "🧱 Карантин"],
+            ["❓ Помощь"],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
+
+
+def _phases_keyboard() -> dict:
+    return {
+        "keyboard": [
+            ["🥉 Фаза 1", "🥈 Фаза 2"],
+            ["🥇 Фаза 3", "🧯 Сброс фазы 3"],
+            ["⬅️ Назад"],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+
+def _stage3_reset_keyboard() -> dict:
+    return {
+        "keyboard": [
+            ["Сбросить по тикеру", "Сбросить все"],
+            ["⬅️ Назад"],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+
+def _top_oi_keyboard() -> dict:
+    return {
+        "keyboard": [
+            ["15м", "30м"],
+            ["4ч", "24ч"],
+            ["⬅️ Назад"],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+
+def _downloads_keyboard() -> dict:
+    files = _download_files()
+    keyboard = [[f"/download {name}"] for name in files]
+    keyboard.append(["⬅️ Назад"])
+    return {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": False}
 
 
 def _safe_tg_text(text: str, limit: int = 3900) -> str:
@@ -264,22 +304,30 @@ def _build_backup_text() -> str:
 
 
 def _build_help_text() -> str:
-    return (
-        "🦆 Commands\n\n"
-        "/panel — главная панель\n"
-        "/status — короткий статус\n"
-        "/runtime — runtime/cycle/watchdog\n"
-        "/exports — состояние export файлов\n"
-        "/reports — runtime reports zip\n"
-        "/bundle — quick bundle\n"
-        "/manifest — storage manifest\n"
-        "/health — runtime health report\n"
-        "/failures — request failures\n"
-        "/gaps — gap report\n"
-        "/active_universe — active universe\n"
-        "/backup — backup policy/status\n"
-        "/ping — pong"
-    )
+    return "\n".join([
+        "❓ Помощь",
+        "",
+        "Главные разделы:",
+        "⚙️ Фазы — Фаза 1 / Фаза 2 / Фаза 3 / Сброс фазы 3",
+        "📈 Топ ОИ — 15м / 30м / 4ч / 24ч",
+        "⬇️ Скачать — файлы проекта по отдельности",
+        "🧱 Карантин — list / add / remove / history / status",
+        "",
+        "Команды:",
+        "/phases",
+        "/phase1 /phase2 /phase3",
+        "/top_oi 15м | 30м | 4ч | 24ч",
+        "/coin SYMBOL",
+        "/feedback SYMBOL текст",
+        "/feedback SYMBOL TF текст",
+        "/reset_stage3 SYMBOL TF reason",
+        "/confirm_reset SYMBOL TF",
+        "/cancel_reset",
+        "/download filename",
+        "/health",
+        "",
+        "Правило: списки фаз показывают только монеты. Метрики открываются через /coin.",
+    ])
 
 
 def _is_admin_chat(chat_id: str | int | None = None) -> bool:
@@ -307,6 +355,48 @@ def _admin_only(chat_id=None) -> bool:
         send_message("⛔ Admin-only команда.", _main_keyboard())
         return False
     return True
+
+
+
+def _tf_norm(value) -> str | None:
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    aliases = {
+        "15m": "15м", "15м": "15м",
+        "30m": "30м", "30м": "30м",
+        "1h": "1ч", "1ч": "1ч",
+        "4h": "4ч", "4ч": "4ч",
+        "24h": "24ч", "24ч": "24ч",
+    }
+    return aliases.get(v, v)
+
+
+def _tf_sql(value) -> str | None:
+    v = _tf_norm(value)
+    aliases = {
+        "15м": "15м",
+        "30м": "30м",
+        "1ч": "1ч",
+        "4ч": "4ч",
+        "24ч": "24ч",
+    }
+    return aliases.get(v, v)
+
+
+def _exchange_code(exchange) -> str:
+    return "BY" if str(exchange).upper() == "BYBIT" else "BN"
+
+
+def _symbol_links(symbol: str, exchange=None) -> str:
+    sym = str(symbol).upper()
+    ex_code = _exchange_code(exchange)
+    cg = f"https://www.coinglass.com/tv/Binance_{sym}"
+    by = f"https://www.bybit.com/trade/usdt/{sym}"
+    bn = f"https://www.binance.com/en/futures/{sym}"
+    ex_url = by if ex_code == "BY" else bn
+    return f"🔗 [CG]({cg}) | [{ex_code}]({ex_url}) | [`{sym}`]({ex_url})"
+
 
 
 def _short_ts(value) -> str:
@@ -393,62 +483,47 @@ def _tf_rank_sql() -> str:
 def _build_phases_text(phase: int | None = None) -> str:
     if phase is None:
         rows = _safe_rows("""
-            SELECT phase, phase_name, timeframe, COUNT(*) AS cnt, MAX(phase_updated_at) AS latest
+            SELECT phase, timeframe, COUNT(*) AS cnt, MAX(phase_updated_at) AS latest
             FROM market_phase
             WHERE phase > 0
-            GROUP BY phase, phase_name, timeframe
+            GROUP BY phase, timeframe
             ORDER BY phase DESC,
-                     CASE timeframe WHEN '4h' THEN 1 WHEN '1h' THEN 2 WHEN '30m' THEN 3 WHEN '15m' THEN 4 ELSE 9 END,
-                     cnt DESC
-            LIMIT 60
+                     CASE timeframe WHEN '4ч' THEN 1 WHEN '4h' THEN 1 WHEN '1ч' THEN 2 WHEN '1h' THEN 2 WHEN '30м' THEN 3 WHEN '30m' THEN 3 WHEN '15м' THEN 4 WHEN '15m' THEN 4 ELSE 9 END
         """)
         if not rows:
             return "⚙️ Фазы\n\nАктивных фаз нет."
 
-        lines = ["⚙️ Фазы — зеркало market_phase", ""]
+        lines = ["⚙️ Фазы", ""]
         for r in rows:
             lines.append(
                 f"phase={r.get('phase')} | {r.get('timeframe')} | cnt={r.get('cnt')} | latest={_short_ts(r.get('latest'))}"
             )
-        lines.append("")
-        lines.append("/phase1 /phase2 /phase3")
+        lines.extend(["", "Открыть: Фаза 1 / Фаза 2 / Фаза 3"])
         return "\n".join(lines)
 
     rows = _safe_rows("""
-        SELECT exchange, symbol, timeframe, phase, phase_name, phase_status, priority,
-               confidence, phase_updated_at, oi_structure, oi_priority, oi_hold_state,
-               oi_trend_1h, oi_trend_4h, oi_trend_24h,
-               price_structure, price_quality, price_slope_state,
-               volume_structure, volume_quality, volume_hold_state,
-               transition_reason
+        SELECT *
         FROM market_phase
         WHERE phase = %s
-        ORDER BY CASE timeframe WHEN '4h' THEN 1 WHEN '1h' THEN 2 WHEN '30m' THEN 3 WHEN '15m' THEN 4 ELSE 9 END,
+        ORDER BY CASE timeframe WHEN '4ч' THEN 1 WHEN '4h' THEN 1 WHEN '1ч' THEN 2 WHEN '1h' THEN 2 WHEN '30м' THEN 3 WHEN '30m' THEN 3 WHEN '15м' THEN 4 WHEN '15m' THEN 4 ELSE 9 END,
                  priority ASC,
                  phase_updated_at DESC
-        LIMIT 40
+        LIMIT 80
     """, (phase,))
 
-    title = f"🥉 Stage {phase}" if phase == 1 else (f"🥈 Stage {phase}" if phase == 2 else f"🥇 Stage {phase}")
+    title = f"Фаза {phase}"
     if not rows:
         return f"{title}\n\nСейчас монет в фазе нет."
 
-    lines = [f"{title} — текущая голова бота", ""]
+    lines = [title, "Метрики скрыты в карточке: /coin SYMBOL", ""]
     for r in rows:
+        symbol = r.get("symbol")
+        tf = r.get("timeframe")
         ex = r.get("exchange")
-        link = "BY" if ex == "BYBIT" else "BN"
-        lines.extend([
-            f"{r.get('symbol')} [{r.get('timeframe')}]",
-            f"🔗 CG | {link}",
-            f"`{r.get('symbol')}`",
-            f"phase={r.get('phase')} | status={r.get('phase_status')} | prio={r.get('priority')} | conf={r.get('confidence')}",
-            f"OI: {r.get('oi_structure')} | p={r.get('oi_priority')} | hold={r.get('oi_hold_state')} | 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')}",
-            f"PRICE: {r.get('price_structure')} | {r.get('price_quality')} | slope={r.get('price_slope_state')}",
-            f"VOL: {r.get('volume_structure')} | {r.get('volume_quality')} | hold={r.get('volume_hold_state')}",
-            f"Card: /coin {r.get('symbol')}",
-            f"Feedback: /feedback {r.get('symbol')} текст",
-            "",
-        ])
+        lines.append(f"{symbol} [{tf}]")
+        lines.append(f"{_symbol_links(symbol, ex)} | /coin {symbol} | /feedback {symbol} текст")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -479,6 +554,7 @@ def _build_top_oi_text(timeframe: str | None = None) -> str:
     latest = _safe_rows("SELECT MAX(ts_close) AS latest FROM market_oi_slope")
     latest_ts = latest[0].get("latest") if latest else None
 
+    timeframe = _tf_sql(timeframe)
     title = f"📈 ТОП OI {timeframe}" if timeframe else "📈 ТОП OI"
     if not rows:
         return f"{title}\n\nНет свежих строк в market_oi_slope."
@@ -486,11 +562,9 @@ def _build_top_oi_text(timeframe: str | None = None) -> str:
     lines = [title, _health_banner_for_table("market_oi_slope", "ts_close"), f"latest_ts={_short_ts(latest_ts)}", ""]
     for r in rows:
         ex = r.get("exchange")
-        link = "BY" if ex == "BYBIT" else "BN"
         lines.extend([
             f"{r.get('symbol')} [{r.get('timeframe')}]",
-            f"🔗 CG | {link}",
-            f"`{r.get('symbol')}`",
+            _symbol_links(r.get("symbol"), ex),
             f"stage={r.get('stage')} {r.get('stage_name')} | OI={_fmt_pct(r.get('oi_delta_pct'))} | acc={_fmt_pct(r.get('oi_acceleration'))}",
             f"structure={r.get('oi_structure')} | priority={r.get('oi_priority')} | hold={r.get('oi_hold_state')}",
             f"trend 15m={r.get('oi_trend_15m')} | 30m={r.get('oi_trend_30m')} | 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')} | 24h={r.get('oi_trend_24h')}",
@@ -554,7 +628,7 @@ def _build_coin_card(symbol: str) -> str:
         for r in phase_rows:
             ex = r.get("exchange")
             tf = r.get("timeframe")
-            link = "BY" if ex == "BYBIT" else "BN"
+            link = _exchange_code(ex)
 
             price = _latest_metric_row("market_price_state", symbol, ex, tf)
             volume = _latest_metric_row("market_volume_state", symbol, ex, tf)
@@ -563,8 +637,7 @@ def _build_coin_card(symbol: str) -> str:
             lines.extend([
                 "",
                 f"{symbol} [{tf}]",
-                f"🔗 CG | {link}",
-                f"`{symbol}`",
+                _symbol_links(symbol, ex),
                 f"phase={r.get('phase')} {r.get('phase_name')} | status={r.get('phase_status')} | prio={r.get('priority')} | conf={r.get('confidence')}",
                 f"updated={_short_ts(r.get('phase_updated_at'))}",
                 f"OI: structure={r.get('oi_structure')} | priority={r.get('oi_priority')} | hold={r.get('oi_hold_state')}",
@@ -697,6 +770,24 @@ def _save_feedback(text: str) -> str:
 
     return f"✅ Feedback snapshot сохранён: {symbol}, rows={written}"
 
+def _download_files() -> list[str]:
+    return [
+        "market_research_bundle.zip",
+        "runtime_reports.zip",
+        "storage_manifest.txt",
+        "runtime_health_report.txt",
+        "runtime_timing_report.txt",
+        "request_failure_report.csv",
+        "gap_report.csv",
+        "active_universe_report.csv",
+        "telegram_feedback.csv",
+        "telegram_quarantine.csv",
+        "telegram_quarantine_history.csv",
+        "telegram_stage3_alert_history.csv",
+        "telegram_pending_reset_stage3.json",
+    ]
+
+
 def _file_status(path: Path, stale_minutes: int = 60) -> dict:
     if not path.exists():
         return {"status": "MISSING", "size": 0, "rows": 0, "age_min": None, "mtime": None}
@@ -724,26 +815,12 @@ def _file_status(path: Path, stale_minutes: int = 60) -> dict:
 
 
 def _build_downloads_text() -> str:
-    files = [
-        "market_research_bundle.zip",
-        "runtime_reports.zip",
-        "storage_manifest.txt",
-        "runtime_health_report.txt",
-        "runtime_timing_report.txt",
-        "request_failure_report.csv",
-        "gap_report.csv",
-        "active_universe_report.csv",
-        "telegram_feedback.csv",
-        "telegram_quarantine.csv",
-        "telegram_quarantine_history.csv",
-        "telegram_stage3_alert_history.csv",
-        "telegram_pending_reset_stage3.json",
-    ]
+    files = _download_files()
 
     lines = [
-        "⬇️ Downloads / Snapshots",
+        "⬇️ Скачать",
         "",
-        "Telegram не запускает rebuild. Только статус готовых файлов.",
+        "Статус готовых файлов. Rebuild через Telegram не запускается.",
         "",
     ]
 
@@ -755,12 +832,7 @@ def _build_downloads_text() -> str:
             f"latest={_short_ts(h['mtime'])} | age_min={h['age_min']}"
         )
 
-    lines.extend([
-        "",
-        "Скачать: /download filename",
-        "Статусы: OK / EMPTY / STALE / MISSING",
-    ])
-
+    lines.extend(["", "Файл: /download filename"])
     return "\n".join(lines)
 
 
@@ -1100,7 +1172,7 @@ def _build_stage3_alert_text(r: dict) -> str:
     symbol = r.get("symbol")
     timeframe = r.get("timeframe")
     ex = r.get("exchange")
-    link = "BY" if ex == "BYBIT" else "BN"
+    link = _exchange_code(ex)
 
     return "\n".join([
         "🥇 NEW STAGE 3",
@@ -1169,19 +1241,38 @@ def _handle(text: str, chat_id=None) -> None:
         send_message(_build_status_text(), _main_keyboard())
 
     elif text in {"/phases", "⚙️ Фазы"}:
-        send_message(_build_phases_text(), _main_keyboard())
+        send_message(_build_phases_text(), _phases_keyboard())
 
-    elif text in {"/phase1", "🥉 Stage 1"}:
-        send_message(_build_phases_text(1), _main_keyboard())
+    elif text in {"/phase1", "🥉 Stage 1", "🥉 Фаза 1"}:
+        send_message(_build_phases_text(1), _phases_keyboard())
 
-    elif text in {"/phase2", "🥈 Stage 2"}:
-        send_message(_build_phases_text(2), _main_keyboard())
+    elif text in {"/phase2", "🥈 Stage 2", "🥈 Фаза 2"}:
+        send_message(_build_phases_text(2), _phases_keyboard())
 
-    elif text in {"/phase3", "🥇 Stage 3"}:
-        send_message(_build_stage3_text(), _main_keyboard())
+    elif text in {"/phase3", "🥇 Stage 3", "🥇 Фаза 3"}:
+        send_message(_build_stage3_text(), _phases_keyboard())
 
-    elif text in {"/top_oi", "📈 ТОП OI"}:
-        send_message(_build_top_oi_text(), _main_keyboard())
+    elif text in {"/top_oi", "📈 ТОП OI", "📈 Топ ОИ"}:
+        send_message(_build_top_oi_text(), _top_oi_keyboard())
+
+
+    elif text in {"⬅️ Назад", "/menu"}:
+        send_message("Главное меню", _main_keyboard())
+
+    elif text == "🧯 Сброс фазы 3":
+        send_message("Сброс фазы 3", _stage3_reset_keyboard())
+
+    elif text == "Сбросить по тикеру":
+        send_message("Формат: /reset_stage3 SYMBOL TF reason", _stage3_reset_keyboard())
+
+    elif text == "Сбросить все":
+        send_message("Массовый reset пока не исполняется из кнопки. Используй точечно: /reset_stage3 SYMBOL TF reason", _stage3_reset_keyboard())
+
+    elif text in {"15м", "30м", "4ч", "24ч"}:
+        send_message(_build_top_oi_text(text), _top_oi_keyboard())
+
+    elif text in {"🧱 Карантин", "🧱 Quarantine", "/quarantine"}:
+        send_message(_build_quarantine_status_text(), _main_keyboard())
 
     elif text.startswith("/top_oi "):
         send_message(
@@ -1202,7 +1293,7 @@ def _handle(text: str, chat_id=None) -> None:
         send_message(_build_exports_text(), _main_keyboard())
 
     elif text in {"/downloads", "⬇️ Скачать"}:
-        send_message(_build_downloads_text(), _main_keyboard())
+        send_message(_build_downloads_text(), _downloads_keyboard())
 
     elif text.startswith("/download "):
         _send_download(text.split(maxsplit=1)[1].strip())
