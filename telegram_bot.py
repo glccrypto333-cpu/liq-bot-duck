@@ -4,43 +4,49 @@ import time
 import threading
 import zipfile
 import json
+from datetime import datetime, timezone
+import csv
 from pathlib import Path
 import requests
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ПАПКА_ДАННЫХ, APP_VERSION
-from export_engine import rebuild_exports
 from logger import log
+from db import fetch
+from reset_stage3 import reset_stage3
 
 BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 _polling_started = False
 _offset = 0
 _export_lock = threading.Lock()
+_csv_lock = threading.Lock()
 
 
-def _panel_keyboard() -> dict:
+def _main_keyboard() -> dict:
     return {
-        "inline_keyboard": [
-            [
-                {"text": "Панель", "callback_data": "panel"},
-                {"text": "Runtime", "callback_data": "runtime"},
-            ],
-            [
-                {"text": "Exports", "callback_data": "exports"},
-                {"text": "Reports", "callback_data": "reports"},
-            ],
-            [
-                {"text": "Bundle", "callback_data": "bundle"},
-                {"text": "Backup", "callback_data": "backup"},
-            ],
-        ]
+        "keyboard": [
+            ["📊 Статус", "⚙️ Фазы"],
+            ["🥉 Stage 1", "🥈 Stage 2", "🥇 Stage 3"],
+            ["📈 ТОП OI", "🪙 Coin"],
+            ["⬇️ Скачать", "🧱 Quarantine"],
+            ["🧭 Runtime", "❓ Помощь"],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
     }
+
+
+def _safe_tg_text(text: str, limit: int = 3900) -> str:
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit - 80] + "\n\n... truncated. Use download/report for full output."
 
 
 def send_message(text: str, reply_markup: dict | None = None) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": _safe_tg_text(text)}
     if reply_markup:
         payload["reply_markup"] = reply_markup
 
@@ -55,20 +61,7 @@ def send_message(text: str, reply_markup: dict | None = None) -> None:
 
 
 def send_panel_message(text: str) -> None:
-    send_message(text, _panel_keyboard())
-
-
-def answer_callback(callback_id: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not callback_id:
-        return
-    try:
-        requests.post(
-            f"{BASE}/answerCallbackQuery",
-            json={"callback_query_id": callback_id},
-            timeout=20,
-        )
-    except Exception as exc:
-        log(f"telegram callback answer error: {exc}")
+    send_message(text, _main_keyboard())
 
 
 def send_document(path: Path, caption: str | None = None) -> None:
@@ -182,13 +175,6 @@ def _build_status_text() -> str:
     )
 
 
-def _ensure_quick_exports() -> None:
-    if _quick_export_is_fresh():
-        return
-
-    rebuild_exports("quick")
-
-
 def _read_json_file(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -228,9 +214,7 @@ def _build_control_panel_text() -> str:
         f"sleep={cycle.get('cycle_sleep_seconds', 'n/a')}s\n"
         f"reserve_pct={cycle.get('cycle_reserve_pct', 'n/a')}\n"
         f"overrun_streak={cycle.get('overrun_streak', 'n/a')}\n\n"
-        f"Commands:\n"
-        f"/status /runtime /exports /reports\n"
-        f"/bundle /manifest /backup /help"
+        f"Управление: кнопки снизу"
     )
 
 
@@ -264,13 +248,6 @@ def _build_exports_text() -> str:
 
     lines = ["📦 Exports", ""]
     lines.extend(_fmt_file(path) for path in files)
-    lines.extend([
-        "",
-        "Commands:",
-        "/export_quick",
-        "/export_research_7d",
-        "/export_research_30d",
-    ])
     return "\n".join(lines)
 
 
@@ -305,110 +282,412 @@ def _build_help_text() -> str:
     )
 
 
-def _rebuild_exports_locked(mode: str):
-    if not _export_lock.acquire(blocking=False):
-        send_message("Export уже выполняется. Повтори команду позже.")
-        return None
+def _is_admin_chat(chat_id: str | int | None = None) -> bool:
+    if not TELEGRAM_CHAT_ID:
+        return False
+    if chat_id is None:
+        return True
+    return str(chat_id) == str(TELEGRAM_CHAT_ID)
 
+
+def _is_admin() -> bool:
+    return _is_admin_chat()
+
+
+def _safe_rows(sql: str, params: tuple = ()) -> list[dict]:
     try:
-        return rebuild_exports(mode)
-    finally:
-        _export_lock.release()
+        return fetch(sql, params) or []
+    except Exception as exc:
+        log(f"telegram db fetch error: {exc}")
+        return []
 
 
-def _handle(text: str) -> None:
-    if text in {"/start", "/help"}:
-        send_message(_build_control_panel_text(), _panel_keyboard())
+def _admin_only(chat_id=None) -> bool:
+    if not _is_admin_chat(chat_id):
+        send_message("⛔ Admin-only команда.", _main_keyboard())
+        return False
+    return True
+
+
+def _short_ts(value) -> str:
+    return str(value or "n/a").replace("+00:00", " UTC")
+
+
+def _build_phases_text(phase: int | None = None) -> str:
+    where = "WHERE phase = %s" if phase is not None else ""
+    params = (phase,) if phase is not None else ()
+    rows = _safe_rows(f"""
+        SELECT phase, phase_name, timeframe, COUNT(*) AS cnt, MAX(phase_updated_at) AS latest
+        FROM market_phase
+        {where}
+        GROUP BY phase, phase_name, timeframe
+        ORDER BY phase DESC, timeframe, cnt DESC
+        LIMIT 40
+    """, params)
+
+    title = "⚙️ Фазы" if phase is None else f"Stage {phase}"
+    if not rows:
+        return f"{title}\n\nНет данных."
+
+    lines = [title, ""]
+    for r in rows:
+        lines.append(
+            f"{r.get('timeframe')} | phase={r.get('phase')} | {r.get('phase_name')} | cnt={r.get('cnt')} | latest={_short_ts(r.get('latest'))}"
+        )
+    return "\n".join(lines)
+
+
+def _build_stage3_text() -> str:
+    rows = _safe_rows("""
+        SELECT exchange, symbol, timeframe, phase_name, priority, phase_updated_at,
+               oi_structure, oi_priority, oi_hold_state, oi_trend_1h, oi_trend_4h
+        FROM market_phase
+        WHERE phase = 3
+        ORDER BY priority ASC, phase_updated_at DESC
+        LIMIT 30
+    """)
+
+    if not rows:
+        return "🥇 Stage 3\n\nАктивных Stage 3 нет."
+
+    lines = ["🥇 Stage 3 alerts", ""]
+    for r in rows:
+        lines.append(
+            f"{r.get('exchange')} {r.get('symbol')} {r.get('timeframe')} | "
+            f"prio={r.get('priority')} | {r.get('oi_structure')} | "
+            f"{r.get('oi_hold_state')} | 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')}"
+        )
+    lines.append("")
+    lines.append("Reset: /reset_stage3 SYMBOL TIMEFRAME reason")
+    return "\n".join(lines)
+
+
+def _build_top_oi_text() -> str:
+    rows = _safe_rows("""
+        SELECT exchange, symbol, timeframe, stage, stage_name, oi_delta_pct,
+               oi_acceleration, price_delta_pct, volume_delta_pct, ts_close
+        FROM market_oi_slope
+        WHERE ts_close >= NOW() - INTERVAL '90 minutes'
+          AND stage >= 1
+        ORDER BY stage DESC, ABS(oi_delta_pct) DESC, ABS(oi_acceleration) DESC
+        LIMIT 25
+    """)
+
+    if not rows:
+        return "📈 ТОП OI\n\nНет свежих сигналов."
+
+    lines = ["📈 ТОП OI", ""]
+    for r in rows:
+        lines.append(
+            f"{r.get('exchange')} {r.get('symbol')} {r.get('timeframe')} | "
+            f"{r.get('stage_name')} | OI={_fmt_pct(r.get('oi_delta_pct'))} | "
+            f"acc={r.get('oi_acceleration')} | price={_fmt_pct(r.get('price_delta_pct'))}"
+        )
+    return "\n".join(lines)
+
+
+def _build_coin_card(symbol: str) -> str:
+    symbol = symbol.upper().strip()
+    rows = _safe_rows("""
+        SELECT exchange, symbol, timeframe, phase, phase_name, priority, phase_updated_at,
+               oi_structure, oi_priority, oi_hold_state, oi_trend_1h, oi_trend_4h, oi_trend_24h
+        FROM market_phase
+        WHERE symbol = %s
+        ORDER BY phase DESC, priority ASC, phase_updated_at DESC
+        LIMIT 12
+    """, (symbol,))
+
+    oi = _safe_rows("""
+        SELECT exchange, symbol, timeframe, stage, stage_name, reason,
+               oi_delta_pct, oi_acceleration, price_delta_pct, volume_delta_pct, ts_close
+        FROM market_oi_slope
+        WHERE symbol = %s
+        ORDER BY ts_close DESC
+        LIMIT 8
+    """, (symbol,))
+
+    if not rows and not oi:
+        return f"🪙 {symbol}\n\nНет данных. Формат: /coin BTCUSDT"
+
+    lines = [f"🪙 {symbol}", ""]
+    if rows:
+        lines.append("Phases:")
+        for r in rows:
+            lines.append(
+                f"{r.get('exchange')} {r.get('timeframe')} | phase={r.get('phase')} {r.get('phase_name')} | "
+                f"{r.get('oi_structure')} | hold={r.get('oi_hold_state')} | prio={r.get('priority')}"
+            )
+
+    if oi:
+        lines.append("")
+        lines.append("OI:")
+        for r in oi:
+            lines.append(
+                f"{r.get('exchange')} {r.get('timeframe')} | {r.get('stage_name')} | "
+                f"OI={_fmt_pct(r.get('oi_delta_pct'))} | acc={r.get('oi_acceleration')} | "
+                f"price={_fmt_pct(r.get('price_delta_pct'))}"
+            )
+
+    lines.append("")
+    lines.append("Feedback: /feedback SYMBOL текст")
+    return "\n".join(lines)
+
+
+def _feedback_path() -> Path:
+    return ПАПКА_ДАННЫХ / "telegram_feedback.csv"
+
+
+def _save_feedback(text: str) -> str:
+    parts = text.split(maxsplit=2)
+    if len(parts) < 3:
+        return "Формат: /feedback SYMBOL текст"
+
+    _, symbol, comment = parts
+    path = _feedback_path()
+    new_file = not path.exists()
+
+    with _csv_lock:
+        with path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["created_at_utc", "symbol", "comment"])
+            w.writerow([datetime.now(timezone.utc).isoformat(), symbol.upper(), comment])
+
+    return f"✅ Feedback сохранён: {symbol.upper()}"
+
+
+def _build_downloads_text() -> str:
+    files = [
+        "market_research_bundle.zip",
+        "runtime_reports.zip",
+        "storage_manifest.txt",
+        "runtime_health_report.txt",
+        "runtime_timing_report.txt",
+        "request_failure_report.csv",
+        "gap_report.csv",
+        "active_universe_report.csv",
+        "telegram_feedback.csv",
+        "telegram_quarantine.csv",
+        "telegram_quarantine_history.csv",
+    ]
+    lines = ["⬇️ Скачать", "", "Только готовые файлы. Rebuild не запускается.", ""]
+    for name in files:
+        path = ПАПКА_ДАННЫХ / name
+        lines.append(_fmt_file(path))
+    return "\n".join(lines)
+
+
+def _send_download(name: str) -> None:
+    allowed = {
+        "bundle": "market_research_bundle.zip",
+        "reports": "runtime_reports.zip",
+        "manifest": "storage_manifest.txt",
+        "health": "runtime_health_report.txt",
+        "timing": "runtime_timing_report.txt",
+        "failures": "request_failure_report.csv",
+        "gaps": "gap_report.csv",
+        "active": "active_universe_report.csv",
+        "feedback": "telegram_feedback.csv",
+        "quarantine": "telegram_quarantine.csv",
+    }
+    filename = allowed.get(name)
+    if not filename:
+        send_message("Формат: /download bundle|reports|manifest|health|timing|failures|gaps|active|feedback|quarantine", _main_keyboard())
+        return
+    send_document(ПАПКА_ДАННЫХ / filename, filename)
+
+
+def _quarantine_path() -> Path:
+    return ПАПКА_ДАННЫХ / "telegram_quarantine.csv"
+
+
+def _quarantine_history_path() -> Path:
+    return ПАПКА_ДАННЫХ / "telegram_quarantine_history.csv"
+
+
+def _read_quarantine() -> dict[str, str]:
+    path = _quarantine_path()
+    data = {}
+    if not path.exists():
+        return data
+    with path.open("r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            data[row["symbol"]] = row.get("reason", "")
+    return data
+
+
+def _write_quarantine(data: dict[str, str]) -> None:
+    path = _quarantine_path()
+    with _csv_lock:
+        with path.open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["symbol", "reason", "updated_at_utc"])
+            now = datetime.now(timezone.utc).isoformat()
+            for symbol, reason in sorted(data.items()):
+                w.writerow([symbol, reason, now])
+
+
+def _append_quarantine_history(action: str, symbol: str, reason: str) -> None:
+    path = _quarantine_history_path()
+    new_file = not path.exists()
+    with _csv_lock:
+        with path.open("a", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["created_at_utc", "action", "symbol", "reason"])
+            w.writerow([datetime.now(timezone.utc).isoformat(), action, symbol, reason])
+
+
+def _handle_quarantine(text: str, chat_id=None) -> None:
+    if not _admin_only():
+        return
+
+    parts = text.split(maxsplit=3)
+    data = _read_quarantine()
+
+    if len(parts) == 1 or parts[1] == "list":
+        if not data:
+            send_message("🧱 Quarantine\n\nСписок пуст.", _main_keyboard())
+            return
+        send_message("🧱 Quarantine\n\n" + "\n".join(f"{s}: {r}" for s, r in sorted(data.items())), _main_keyboard())
+        return
+
+    action = parts[1]
+    symbol = parts[2].upper() if len(parts) >= 3 else ""
+    reason = parts[3] if len(parts) >= 4 else ""
+
+    if action == "add" and symbol:
+        data[symbol] = reason or "manual"
+        _write_quarantine(data)
+        _append_quarantine_history("add", symbol, data[symbol])
+        send_message(f"✅ Quarantine add: {symbol}", _main_keyboard())
+    elif action == "remove" and symbol:
+        old = data.pop(symbol, "")
+        _write_quarantine(data)
+        _append_quarantine_history("remove", symbol, old)
+        send_message(f"✅ Quarantine remove: {symbol}", _main_keyboard())
+    elif action == "history":
+        send_document(_quarantine_history_path(), "quarantine history")
+    else:
+        send_message("Формат: /quarantine list | add SYMBOL reason | remove SYMBOL | history", _main_keyboard())
+
+
+def _handle_stage3_reset(text: str, chat_id=None) -> None:
+    if not _admin_only():
+        return
+
+    parts = text.split(maxsplit=3)
+    if len(parts) < 4:
+        send_message("Формат: /reset_stage3 SYMBOL TIMEFRAME reason", _main_keyboard())
+        return
+
+    _, symbol, timeframe, reason = parts
+    total = 0
+    for exchange in ("BYBIT", "BINANCE"):
+        try:
+            total += reset_stage3(exchange, symbol.upper(), timeframe, reason, dry_run=False)
+        except Exception as exc:
+            log(f"telegram reset_stage3 error: {exc}")
+
+    send_message(f"✅ Stage3 reset done: {symbol.upper()} {timeframe}, rows={total}", _main_keyboard())
+
+
+def _handle(text: str, chat_id=None) -> None:
+    text = text.strip()
+
+    if text in {"/start", "/help", "❓ Помощь"}:
+        send_message(_build_help_text(), _main_keyboard())
 
     elif text in {"/panel", "/control"}:
-        send_message(_build_control_panel_text(), _panel_keyboard())
+        send_message(_build_control_panel_text(), _main_keyboard())
 
-    elif text == "/runtime":
-        send_message(_build_runtime_text())
+    elif text in {"/runtime", "🧭 Runtime"}:
+        send_message(_build_runtime_text(), _main_keyboard())
 
-    elif text == "/exports":
-        send_message(_build_exports_text())
+    elif text in {"/status", "📊 Статус"}:
+        send_message(_build_status_text(), _main_keyboard())
 
-    elif text == "/backup":
-        send_message(_build_backup_text())
+    elif text in {"/phases", "⚙️ Фазы"}:
+        send_message(_build_phases_text(), _main_keyboard())
 
-    elif text == "/ping":
-        send_message("pong")
+    elif text in {"/phase1", "🥉 Stage 1"}:
+        send_message(_build_phases_text(1), _main_keyboard())
 
-    elif text == "/status":
-        send_message(_build_status_text())
+    elif text in {"/phase2", "🥈 Stage 2"}:
+        send_message(_build_phases_text(2), _main_keyboard())
 
-    elif text == "/manifest":
-        _ensure_quick_exports()
-        send_document(ПАПКА_ДАННЫХ / "storage_manifest.txt", "manifest")
+    elif text in {"/phase3", "🥇 Stage 3"}:
+        send_message(_build_stage3_text(), _main_keyboard())
 
-    elif text == "/bundle":
+    elif text in {"/top_oi", "📈 ТОП OI"}:
+        send_message(_build_top_oi_text(), _main_keyboard())
+
+    elif text in {"/coin", "🪙 Coin"}:
+        send_message("Формат: /coin BTCUSDT", _main_keyboard())
+
+    elif text.startswith("/coin "):
+        send_message(_build_coin_card(text.split(maxsplit=1)[1]), _main_keyboard())
+
+    elif text.startswith("/feedback "):
+        send_message(_save_feedback(text), _main_keyboard())
+
+    elif text in {"/exports", "📦 Exports"}:
+        send_message(_build_exports_text(), _main_keyboard())
+
+    elif text in {"/downloads", "⬇️ Скачать"}:
+        send_message(_build_downloads_text(), _main_keyboard())
+
+    elif text.startswith("/download "):
+        _send_download(text.split(maxsplit=1)[1].strip())
+
+    elif text in {"/reports", "📄 Reports"}:
+        send_document(_build_runtime_reports_zip(), "runtime reports bundle")
+
+    elif text in {"/bundle"}:
         send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "quick bundle")
 
+    elif text in {"/backup", "🔒 Backup"}:
+        send_message(_build_backup_text(), _main_keyboard())
+
+    elif text in {"/quarantine", "🧱 Quarantine"} or text.startswith("/quarantine "):
+        _handle_quarantine(text, chat_id)
+
+    elif text.startswith("/reset_stage3 "):
+        _handle_stage3_reset(text, chat_id)
+
+    elif text == "/ping":
+        send_message("pong", _main_keyboard())
+
+    elif text == "/manifest":
+        send_document(ПАПКА_ДАННЫХ / "storage_manifest.txt", "manifest")
+
     elif text == "/audit_report":
-        _ensure_quick_exports()
         send_document(ПАПКА_ДАННЫХ / "audit_report.txt", "audit report")
 
     elif text == "/research_report":
-        _ensure_quick_exports()
         send_document(ПАПКА_ДАННЫХ / "research_report.txt", "research report")
-
-    elif text == "/reports":
-        send_document(_build_runtime_reports_zip(), "runtime reports bundle")
 
     elif text == "/timing":
         send_document(ПАПКА_ДАННЫХ / "runtime_timing_report.txt", "runtime timing report")
 
     elif text == "/health":
-        _ensure_quick_exports()
         send_document(ПАПКА_ДАННЫХ / "runtime_health_report.txt", "runtime health report")
 
     elif text == "/failures":
-        _ensure_quick_exports()
         send_document(ПАПКА_ДАННЫХ / "request_failure_report.csv", "request failures")
 
     elif text == "/gaps":
-        _ensure_quick_exports()
         send_document(ПАПКА_ДАННЫХ / "gap_report.csv", "gap report")
 
     elif text == "/active_universe":
-        _ensure_quick_exports()
         send_document(ПАПКА_ДАННЫХ / "active_universe_report.csv", "active universe")
 
     elif text == "/export_quick":
-        path = _rebuild_exports_locked("quick")
-        if path:
-            send_document(path, "quick bundle")
+        send_message("⛔ Rebuild через Telegram отключён. Используй /download bundle.", _main_keyboard())
 
-    elif text == "/export_research_7d":
-        send_message("Готовлю research 7d bundle...")
-        path = _rebuild_exports_locked("research_7d")
-        if path:
-            send_document(path, "research 7d bundle")
+    elif text in {"/export_research_7d", "/export_research_30d"}:
+        send_message("⛔ Heavy export через Telegram отключён. Только готовые файлы через /downloads.", _main_keyboard())
 
-    elif text == "/export_research_30d":
-        send_message("Готовлю research 30d bundle...")
-        path = _rebuild_exports_locked("research_30d")
-        if path:
-            send_document(path, "research 30d bundle")
-
-
-
-def _handle_callback(callback_id: str, data: str) -> None:
-    answer_callback(callback_id)
-
-    if data == "panel":
-        send_message(_build_control_panel_text(), _panel_keyboard())
-    elif data == "runtime":
-        send_message(_build_runtime_text(), _panel_keyboard())
-    elif data == "exports":
-        send_message(_build_exports_text(), _panel_keyboard())
-    elif data == "reports":
-        send_document(_build_runtime_reports_zip(), "runtime reports bundle")
-    elif data == "bundle":
-        send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "quick bundle")
-    elif data == "backup":
-        send_message(_build_backup_text(), _panel_keyboard())
 
 def _reset() -> None:
     global _offset
@@ -442,18 +721,13 @@ def _loop() -> None:
 
             for item in response.json().get("result", []):
                 _offset = item["update_id"]
-                callback = item.get("callback_query") or {}
-                if callback:
-                    _handle_callback(
-                        callback.get("id", ""),
-                        callback.get("data", ""),
-                    )
-                    continue
 
-                text = (item.get("message", {}) or {}).get("text", "")
+                message = item.get("message", {}) or {}
+                text = message.get("text", "")
+                chat_id = (message.get("chat", {}) or {}).get("id")
 
                 if text:
-                    _handle(text.strip())
+                    _handle(text.strip(), chat_id)
         except Exception as exc:
             log(f"telegram polling error: {exc}")
             time.sleep(10 if "409" in str(exc) else 5)
