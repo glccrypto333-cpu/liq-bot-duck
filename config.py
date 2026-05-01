@@ -30,12 +30,22 @@ BYBIT_BASE = "https://api.bybit.com"
 BINANCE_BASE = "https://fapi.binance.com"
 
 КОМАНДЫ = (
-    "/ping\n"
-    "/status\n"
-    "/bundle\n"
-    "/reports\n"
-    "/export_research_7d\n"
-    "/export_research_30d"
+    {"command": "panel", "description": "Главная панель"},
+    {"command": "status", "description": "Короткий статус"},
+    {"command": "runtime", "description": "Runtime / cycle / watchdog"},
+    {"command": "exports", "description": "Состояние export файлов"},
+    {"command": "reports", "description": "Runtime reports zip"},
+    {"command": "bundle", "description": "Quick bundle"},
+    {"command": "manifest", "description": "Storage manifest"},
+    {"command": "health", "description": "Runtime health report"},
+    {"command": "failures", "description": "Request failures"},
+    {"command": "gaps", "description": "Gap report"},
+    {"command": "active_universe", "description": "Active universe"},
+    {"command": "backup", "description": "Backup policy/status"},
+    {"command": "export_quick", "description": "Rebuild quick export"},
+    {"command": "export_research_7d", "description": "Research 7d bundle"},
+    {"command": "export_research_30d", "description": "Research 30d bundle"},
+    {"command": "ping", "description": "Ping"},
 )
 
 СТАРТОВОЕ_СООБЩЕНИЕ = (

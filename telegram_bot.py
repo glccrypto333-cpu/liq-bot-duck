@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import threading
 import zipfile
+import json
 from pathlib import Path
 import requests
 
@@ -13,6 +14,7 @@ from logger import log
 BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 _polling_started = False
 _offset = 0
+_export_lock = threading.Lock()
 
 
 def send_message(text: str) -> None:
@@ -147,8 +149,150 @@ def _ensure_quick_exports() -> None:
     rebuild_exports("quick")
 
 
+def _read_json_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(errors="ignore"))
+    except Exception:
+        return {}
+
+
+def _fmt_file(path: Path) -> str:
+    if not path.exists():
+        return f"{path.name}: missing"
+    age = int(time.time() - path.stat().st_mtime)
+    size_mb = path.stat().st_size / 1024 / 1024
+    return f"{path.name}: {size_mb:.2f} MB, age={age}s"
+
+
+def _runtime_snapshot() -> tuple[dict, dict]:
+    runtime = _read_json_file(Path("runtime_reports/runtime_health.json"))
+    cycle = _read_json_file(Path("runtime_reports/cycle_status.json"))
+    return runtime, cycle
+
+
+def _build_control_panel_text() -> str:
+    runtime, cycle = _runtime_snapshot()
+
+    return (
+        f"🥇 Mighty Duck Control Panel / {APP_VERSION}\n\n"
+        f"Runtime:\n"
+        f"rss_health={runtime.get('rss_health', 'n/a')}\n"
+        f"watchdog_health={runtime.get('watchdog_health', 'n/a')}\n"
+        f"collect_reserve_health={runtime.get('collect_reserve_health', 'n/a')}\n"
+        f"runtime_alert_count={runtime.get('runtime_alert_count', 'n/a')}\n\n"
+        f"Cycle:\n"
+        f"cycle_health={cycle.get('cycle_health', 'n/a')}\n"
+        f"elapsed={cycle.get('cycle_elapsed_seconds', 'n/a')}s\n"
+        f"sleep={cycle.get('cycle_sleep_seconds', 'n/a')}s\n"
+        f"reserve_pct={cycle.get('cycle_reserve_pct', 'n/a')}\n"
+        f"overrun_streak={cycle.get('overrun_streak', 'n/a')}\n\n"
+        f"Commands:\n"
+        f"/status /runtime /exports /reports\n"
+        f"/bundle /manifest /backup /help"
+    )
+
+
+def _build_runtime_text() -> str:
+    runtime, cycle = _runtime_snapshot()
+    alerts = runtime.get("runtime_alerts", [])
+
+    return (
+        f"⚙️ Runtime\n\n"
+        f"rss={runtime.get('rss_mb', 'n/a')} MB / {runtime.get('rss_health', 'n/a')}\n"
+        f"watchdog={runtime.get('watchdog_health', 'n/a')}\n"
+        f"collect={runtime.get('collect_seconds', 'n/a')}s\n"
+        f"collect_reserve={runtime.get('collect_reserve_seconds', 'n/a')}s "
+        f"({runtime.get('collect_reserve_health', 'n/a')})\n"
+        f"cycle={cycle.get('cycle_elapsed_seconds', 'n/a')}s / {cycle.get('cycle_health', 'n/a')}\n"
+        f"sleep={cycle.get('cycle_sleep_seconds', 'n/a')}s\n"
+        f"alerts={alerts}"
+    )
+
+
+def _build_exports_text() -> str:
+    files = [
+        ПАПКА_ДАННЫХ / "market_research_bundle.zip",
+        ПАПКА_ДАННЫХ / "market_research_bundle_quick.zip",
+        ПАПКА_ДАННЫХ / "audit_report.txt",
+        ПАПКА_ДАННЫХ / "research_report.txt",
+        ПАПКА_ДАННЫХ / "storage_manifest.txt",
+        ПАПКА_ДАННЫХ / "runtime_health_report.txt",
+        ПАПКА_ДАННЫХ / "request_failure_report.csv",
+    ]
+
+    lines = ["📦 Exports", ""]
+    lines.extend(_fmt_file(path) for path in files)
+    lines.extend([
+        "",
+        "Commands:",
+        "/export_quick",
+        "/export_research_7d",
+        "/export_research_30d",
+    ])
+    return "\n".join(lines)
+
+
+def _build_backup_text() -> str:
+    return (
+        "🧱 Backup / DB\n\n"
+        "Telegram отдаёт лёгкие runtime/export файлы.\n"
+        "Тяжёлый backup БД делаем отдельно через Postgres/Railway backup или pg_dump.\n\n"
+        "Current files:\n"
+        f"{_fmt_file(ПАПКА_ДАННЫХ / 'market_research_bundle.zip')}\n"
+        f"{_fmt_file(ПАПКА_ДАННЫХ / 'storage_manifest.txt')}\n\n"
+        "Next stage: отдельный безопасный backup/export контур без нагрузки на runtime loop."
+    )
+
+
+def _build_help_text() -> str:
+    return (
+        "🦆 Commands\n\n"
+        "/panel — главная панель\n"
+        "/status — короткий статус\n"
+        "/runtime — runtime/cycle/watchdog\n"
+        "/exports — состояние export файлов\n"
+        "/reports — runtime reports zip\n"
+        "/bundle — quick bundle\n"
+        "/manifest — storage manifest\n"
+        "/health — runtime health report\n"
+        "/failures — request failures\n"
+        "/gaps — gap report\n"
+        "/active_universe — active universe\n"
+        "/backup — backup policy/status\n"
+        "/ping — pong"
+    )
+
+
+def _rebuild_exports_locked(mode: str):
+    if not _export_lock.acquire(blocking=False):
+        send_message("Export уже выполняется. Повтори команду позже.")
+        return None
+
+    try:
+        return rebuild_exports(mode)
+    finally:
+        _export_lock.release()
+
+
 def _handle(text: str) -> None:
-    if text == "/ping":
+    if text in {"/start", "/help"}:
+        send_message(_build_help_text())
+
+    elif text in {"/panel", "/control"}:
+        send_message(_build_control_panel_text())
+
+    elif text == "/runtime":
+        send_message(_build_runtime_text())
+
+    elif text == "/exports":
+        send_message(_build_exports_text())
+
+    elif text == "/backup":
+        send_message(_build_backup_text())
+
+    elif text == "/ping":
         send_message("pong")
 
     elif text == "/status":
@@ -192,15 +336,21 @@ def _handle(text: str) -> None:
         send_document(ПАПКА_ДАННЫХ / "active_universe_report.csv", "active universe")
 
     elif text == "/export_quick":
-        send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "quick bundle")
+        path = _rebuild_exports_locked("quick")
+        if path:
+            send_document(path, "quick bundle")
 
     elif text == "/export_research_7d":
         send_message("Готовлю research 7d bundle...")
-        send_document(rebuild_exports("research_7d"), "research 7d bundle")
+        path = _rebuild_exports_locked("research_7d")
+        if path:
+            send_document(path, "research 7d bundle")
 
     elif text == "/export_research_30d":
         send_message("Готовлю research 30d bundle...")
-        send_document(rebuild_exports("research_30d"), "research 30d bundle")
+        path = _rebuild_exports_locked("research_30d")
+        if path:
+            send_document(path, "research 30d bundle")
 
 
 def _reset() -> None:
