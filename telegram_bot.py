@@ -479,9 +479,7 @@ def _build_coin_card(symbol: str) -> str:
     """, (symbol,))
 
     if not phase_rows and not oi_rows:
-        return f"🪙 {symbol}
-
-Нет данных. Формат: /coin BTCUSDT"
+        return f"🪙 {symbol}\n\nНет данных. Формат: /coin BTCUSDT"
 
     lines = [f"🪙 {symbol}", ""]
 
@@ -521,8 +519,7 @@ def _build_coin_card(symbol: str) -> str:
                 f"{r.get('oi_structure')} | hold={r.get('oi_hold_state')}"
             )
 
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 
 def _feedback_path() -> Path:
