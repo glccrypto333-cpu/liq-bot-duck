@@ -5,7 +5,7 @@ import os
 import time
 
 from logger import log
-from db import execute
+from db import execute, fetch
 from aggregation_engine import rebuild_bot_aggregates
 from research_engine import rebuild_market_research
 from market_price_engine import rebuild_price_state
@@ -49,24 +49,32 @@ def main() -> None:
     execute(f"SET statement_timeout = {timeout_ms}")
     log(f"hybrid phase job start statement_timeout_ms={timeout_ms}")
 
-    counts = {
-        "bot_aggregates": _step("bot_aggregates", rebuild_bot_aggregates),
-        "market_research": _step("market_research", rebuild_market_research),
-        "market_price_state": _step("market_price_state", rebuild_price_state),
-        "market_volume_state": _step("market_volume_state", rebuild_volume_state),
-        "market_oi_slope": _step("market_oi_slope", rebuild_oi_slope),
-        "market_silence": _step("market_silence", rebuild_market_silence),
-        "market_phase_source": _step("market_phase_source", rebuild_market_phase_source),
-        "market_phase": _step("market_phase", rebuild_market_phase),
-        "cleanup_derived_windows": _step("cleanup_derived_windows", cleanup_derived_windows),
-        "phase_snapshot": _step("phase_snapshot", insert_phase_snapshot),
-    }
+    if not _acquire_lock():
+        log("hybrid phase job skipped: advisory lock busy")
+        print("HYBRID_PHASE_JOB_SKIPPED_LOCK_BUSY")
+        return
 
-    if not args.skip_audit:
-        phase_audit_main()
+    try:
+        counts = {
+            "bot_aggregates": _step("bot_aggregates", rebuild_bot_aggregates),
+            "market_research": _step("market_research", rebuild_market_research),
+            "market_price_state": _step("market_price_state", rebuild_price_state),
+            "market_volume_state": _step("market_volume_state", rebuild_volume_state),
+            "market_silence": _step("market_silence", rebuild_market_silence),
+            "market_oi_slope": _step("market_oi_slope", rebuild_oi_slope),
+            "market_phase_source": _step("market_phase_source", rebuild_market_phase_source),
+            "market_phase": _step("market_phase", rebuild_market_phase),
+            "cleanup_derived_windows": _step("cleanup_derived_windows", cleanup_derived_windows),
+            "phase_snapshot": _step("phase_snapshot", insert_phase_snapshot),
+        }
 
-    log(f"hybrid phase job done: {counts}")
-    print("HYBRID_PHASE_JOB_OK")
+        if not args.skip_audit:
+            phase_audit_main()
+
+        log(f"hybrid phase job done: {counts}")
+        print("HYBRID_PHASE_JOB_OK")
+    finally:
+        _release_lock()
 
 
 if __name__ == "__main__":
