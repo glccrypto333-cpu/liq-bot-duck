@@ -367,6 +367,7 @@ def background(bybit_symbols, binance_symbols):
                 "rss_mb": round(rss_mb, 2),
                 "rss_health": rss_health,
                 "cycle_timing": timing_text,
+                "cycle_health": "pending",
                 "bybit_symbols": len(bybit_symbols),
                 "binance_symbols": len(binance_symbols),
                 "bybit_workers": BYBIT_COLLECT_WORKERS,
@@ -445,10 +446,36 @@ def background(bybit_symbols, binance_symbols):
             background._overrun_streak = 0
 
         sleep_seconds = max(0, ИНТЕРВАЛ_ЦИКЛА_СЕК - elapsed)
+
+        cycle_health = "ok"
+        if elapsed > ИНТЕРВАЛ_ЦИКЛА_СЕК:
+            cycle_health = "overrun"
+        elif sleep_seconds < float(os.getenv("CYCLE_SLEEP_WARNING_SECONDS", "30")):
+            cycle_health = "tight"
+
         log(
             f"cycle schedule: target={ИНТЕРВАЛ_ЦИКЛА_СЕК}s "
-            f"elapsed={elapsed:.2f}s sleep={sleep_seconds:.2f}s"
+            f"elapsed={elapsed:.2f}s sleep={sleep_seconds:.2f}s "
+            f"cycle_health={cycle_health}"
         )
+
+        Path("runtime_reports").mkdir(exist_ok=True)
+        cycle_status = {
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "cycle_target_seconds": ИНТЕРВАЛ_ЦИКЛА_СЕК,
+            "cycle_elapsed_seconds": round(elapsed, 2),
+            "cycle_sleep_seconds": round(sleep_seconds, 2),
+            "cycle_health": cycle_health,
+            "overrun_streak": getattr(background, "_overrun_streak", 0),
+        }
+
+        Path("runtime_reports/cycle_status.txt").write_text(
+            "\n".join([f"{k}={v}" for k, v in cycle_status.items()]) + "\n"
+        )
+        Path("runtime_reports/cycle_status.json").write_text(
+            json.dumps(cycle_status, ensure_ascii=False, indent=2) + "\n"
+        )
+
         time.sleep(sleep_seconds)
 
 
