@@ -671,6 +671,12 @@ def _handle(text: str, chat_id=None) -> None:
         send_message(_build_top_oi_text(), _main_keyboard())
 
     elif text.startswith("/top_oi "):
+        send_message(
+            _build_top_oi_text(text.split(maxsplit=1)[1].strip()),
+            _main_keyboard()
+        )
+
+    elif text.startswith("/top_oi "):
         send_message(_build_top_oi_text(text.split(maxsplit=1)[1].strip()), _main_keyboard())
 
     elif text in {"/coin", "🪙 Coin"}:
