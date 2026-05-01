@@ -313,76 +313,124 @@ def _short_ts(value) -> str:
     return str(value or "n/a").replace("+00:00", " UTC")
 
 
+def _fmt_pct(value) -> str:
+    try:
+        return f"{float(value):.2f}%"
+    except Exception:
+        return "n/a"
+
+
+def _tf_rank_sql() -> str:
+    return "CASE timeframe WHEN '4h' THEN 1 WHEN '1h' THEN 2 WHEN '30m' THEN 3 WHEN '15m' THEN 4 ELSE 9 END"
+
+
 def _build_phases_text(phase: int | None = None) -> str:
-    where = "WHERE phase = %s" if phase is not None else ""
-    params = (phase,) if phase is not None else ()
-    rows = _safe_rows(f"""
-        SELECT phase, phase_name, timeframe, COUNT(*) AS cnt, MAX(phase_updated_at) AS latest
+    if phase is None:
+        rows = _safe_rows("""
+            SELECT phase, phase_name, timeframe, COUNT(*) AS cnt, MAX(phase_updated_at) AS latest
+            FROM market_phase
+            WHERE phase > 0
+            GROUP BY phase, phase_name, timeframe
+            ORDER BY phase DESC,
+                     CASE timeframe WHEN '4h' THEN 1 WHEN '1h' THEN 2 WHEN '30m' THEN 3 WHEN '15m' THEN 4 ELSE 9 END,
+                     cnt DESC
+            LIMIT 60
+        """)
+        if not rows:
+            return "⚙️ Фазы\n\nАктивных фаз нет."
+
+        lines = ["⚙️ Фазы — зеркало market_phase", ""]
+        for r in rows:
+            lines.append(
+                f"phase={r.get('phase')} | {r.get('timeframe')} | cnt={r.get('cnt')} | latest={_short_ts(r.get('latest'))}"
+            )
+        lines.append("")
+        lines.append("/phase1 /phase2 /phase3")
+        return "\n".join(lines)
+
+    rows = _safe_rows("""
+        SELECT exchange, symbol, timeframe, phase, phase_name, phase_status, priority,
+               confidence, phase_updated_at, oi_structure, oi_priority, oi_hold_state,
+               oi_trend_1h, oi_trend_4h, oi_trend_24h,
+               price_structure, price_quality, price_slope_state,
+               volume_structure, volume_quality, volume_hold_state,
+               transition_reason
         FROM market_phase
-        {where}
-        GROUP BY phase, phase_name, timeframe
-        ORDER BY phase DESC, timeframe, cnt DESC
+        WHERE phase = %s
+        ORDER BY CASE timeframe WHEN '4h' THEN 1 WHEN '1h' THEN 2 WHEN '30m' THEN 3 WHEN '15m' THEN 4 ELSE 9 END,
+                 priority ASC,
+                 phase_updated_at DESC
         LIMIT 40
-    """, params)
+    """, (phase,))
 
-    title = "⚙️ Фазы" if phase is None else f"Stage {phase}"
+    title = f"🥉 Stage {phase}" if phase == 1 else (f"🥈 Stage {phase}" if phase == 2 else f"🥇 Stage {phase}")
     if not rows:
-        return f"{title}\n\nНет данных."
+        return f"{title}\n\nСейчас монет в фазе нет."
 
-    lines = [title, ""]
+    lines = [f"{title} — текущая голова бота", ""]
     for r in rows:
-        lines.append(
-            f"{r.get('timeframe')} | phase={r.get('phase')} | {r.get('phase_name')} | cnt={r.get('cnt')} | latest={_short_ts(r.get('latest'))}"
-        )
+        ex = r.get("exchange")
+        link = "BY" if ex == "BYBIT" else "BN"
+        lines.extend([
+            f"{r.get('symbol')} [{r.get('timeframe')}]",
+            f"🔗 CG | {link}",
+            f"`{r.get('symbol')}`",
+            f"phase={r.get('phase')} | status={r.get('phase_status')} | prio={r.get('priority')} | conf={r.get('confidence')}",
+            f"OI: {r.get('oi_structure')} | p={r.get('oi_priority')} | hold={r.get('oi_hold_state')} | 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')}",
+            f"PRICE: {r.get('price_structure')} | {r.get('price_quality')} | slope={r.get('price_slope_state')}",
+            f"VOL: {r.get('volume_structure')} | {r.get('volume_quality')} | hold={r.get('volume_hold_state')}",
+            f"Card: /coin {r.get('symbol')}",
+            f"Feedback: /feedback {r.get('symbol')} текст",
+            "",
+        ])
     return "\n".join(lines)
 
 
 def _build_stage3_text() -> str:
-    rows = _safe_rows("""
-        SELECT exchange, symbol, timeframe, phase_name, priority, phase_updated_at,
-               oi_structure, oi_priority, oi_hold_state, oi_trend_1h, oi_trend_4h
-        FROM market_phase
-        WHERE phase = 3
-        ORDER BY priority ASC, phase_updated_at DESC
-        LIMIT 30
-    """)
-
-    if not rows:
-        return "🥇 Stage 3\n\nАктивных Stage 3 нет."
-
-    lines = ["🥇 Stage 3 alerts", ""]
-    for r in rows:
-        lines.append(
-            f"{r.get('exchange')} {r.get('symbol')} {r.get('timeframe')} | "
-            f"prio={r.get('priority')} | {r.get('oi_structure')} | "
-            f"{r.get('oi_hold_state')} | 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')}"
-        )
-    lines.append("")
-    lines.append("Reset: /reset_stage3 SYMBOL TIMEFRAME reason")
-    return "\n".join(lines)
+    return _build_phases_text(3)
 
 
-def _build_top_oi_text() -> str:
-    rows = _safe_rows("""
-        SELECT exchange, symbol, timeframe, stage, stage_name, oi_delta_pct,
-               oi_acceleration, price_delta_pct, volume_delta_pct, ts_close
+def _build_top_oi_text(timeframe: str | None = None) -> str:
+    params = ()
+    tf_filter = ""
+    if timeframe:
+        tf_filter = "AND timeframe = %s"
+        params = (timeframe,)
+
+    rows = _safe_rows(f"""
+        SELECT exchange, symbol, timeframe, stage, stage_name,
+               oi_structure, oi_priority, oi_hold_state,
+               oi_trend_15m, oi_trend_30m, oi_trend_1h, oi_trend_4h, oi_trend_24h,
+               oi_delta_pct, oi_acceleration, price_delta_pct, volume_delta_pct, ts_close
         FROM market_oi_slope
-        WHERE ts_close >= NOW() - INTERVAL '90 minutes'
+        WHERE ts_close >= (SELECT MAX(ts_close) FROM market_oi_slope) - INTERVAL '90 minutes'
           AND stage >= 1
-        ORDER BY stage DESC, ABS(oi_delta_pct) DESC, ABS(oi_acceleration) DESC
-        LIMIT 25
-    """)
+          {tf_filter}
+        ORDER BY ABS(oi_delta_pct) DESC, ABS(oi_acceleration) DESC, oi_priority ASC
+        LIMIT 30
+    """, params)
 
+    latest = _safe_rows("SELECT MAX(ts_close) AS latest FROM market_oi_slope")
+    latest_ts = latest[0].get("latest") if latest else None
+
+    title = f"📈 ТОП OI {timeframe}" if timeframe else "📈 ТОП OI"
     if not rows:
-        return "📈 ТОП OI\n\nНет свежих сигналов."
+        return f"{title}\n\nНет свежих строк в market_oi_slope."
 
-    lines = ["📈 ТОП OI", ""]
+    lines = [title, f"latest_ts={_short_ts(latest_ts)}", ""]
     for r in rows:
-        lines.append(
-            f"{r.get('exchange')} {r.get('symbol')} {r.get('timeframe')} | "
-            f"{r.get('stage_name')} | OI={_fmt_pct(r.get('oi_delta_pct'))} | "
-            f"acc={r.get('oi_acceleration')} | price={_fmt_pct(r.get('price_delta_pct'))}"
-        )
+        ex = r.get("exchange")
+        link = "BY" if ex == "BYBIT" else "BN"
+        lines.extend([
+            f"{r.get('symbol')} [{r.get('timeframe')}]",
+            f"🔗 CG | {link}",
+            f"`{r.get('symbol')}`",
+            f"stage={r.get('stage')} {r.get('stage_name')} | OI={_fmt_pct(r.get('oi_delta_pct'))} | acc={_fmt_pct(r.get('oi_acceleration'))}",
+            f"structure={r.get('oi_structure')} | priority={r.get('oi_priority')} | hold={r.get('oi_hold_state')}",
+            f"trend 15m={r.get('oi_trend_15m')} | 30m={r.get('oi_trend_30m')} | 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')} | 24h={r.get('oi_trend_24h')}",
+            f"phase card: /coin {r.get('symbol')}",
+            "",
+        ])
     return "\n".join(lines)
 
 
@@ -539,7 +587,7 @@ def _append_quarantine_history(action: str, symbol: str, reason: str) -> None:
 
 
 def _handle_quarantine(text: str, chat_id=None) -> None:
-    if not _admin_only():
+    if not _admin_only(chat_id):
         return
 
     parts = text.split(maxsplit=3)
@@ -573,7 +621,7 @@ def _handle_quarantine(text: str, chat_id=None) -> None:
 
 
 def _handle_stage3_reset(text: str, chat_id=None) -> None:
-    if not _admin_only():
+    if not _admin_only(chat_id):
         return
 
     parts = text.split(maxsplit=3)
@@ -621,6 +669,9 @@ def _handle(text: str, chat_id=None) -> None:
 
     elif text in {"/top_oi", "📈 ТОП OI"}:
         send_message(_build_top_oi_text(), _main_keyboard())
+
+    elif text.startswith("/top_oi "):
+        send_message(_build_top_oi_text(text.split(maxsplit=1)[1].strip()), _main_keyboard())
 
     elif text in {"/coin", "🪙 Coin"}:
         send_message("Формат: /coin BTCUSDT", _main_keyboard())

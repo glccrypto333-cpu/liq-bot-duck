@@ -51,7 +51,7 @@ def reset_stage3(exchange: str, symbol: str, timeframe: str, reason: str, dry_ru
         SET
             phase = 0,
             phase_name = 'stage_0_no_interest',
-            status = 'cooling',
+            phase_status = 'cooling',
             priority = 'P4',
             phase_updated_at = %s,
             phase_started_at = %s,
