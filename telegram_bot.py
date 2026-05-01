@@ -434,55 +434,100 @@ def _build_top_oi_text(timeframe: str | None = None) -> str:
     return "\n".join(lines)
 
 
+
+def _latest_metric_row(table: str, symbol: str, exchange: str, timeframe: str) -> dict:
+    ts_col = "phase_updated_at" if table == "market_phase" else "ts_close"
+    rows = _safe_rows(f"""
+        SELECT *
+        FROM {table}
+        WHERE symbol = %s
+          AND exchange = %s
+          AND timeframe = %s
+        ORDER BY {ts_col} DESC
+        LIMIT 1
+    """, (symbol, exchange, timeframe))
+    return rows[0] if rows else {}
+
+
 def _build_coin_card(symbol: str) -> str:
     symbol = symbol.upper().strip()
-    rows = _safe_rows("""
-        SELECT exchange, symbol, timeframe, phase, phase_name, priority, phase_updated_at,
-               oi_structure, oi_priority, oi_hold_state, oi_trend_1h, oi_trend_4h, oi_trend_24h
+
+    phase_rows = _safe_rows("""
+        SELECT *
         FROM market_phase
         WHERE symbol = %s
-        ORDER BY phase DESC, priority ASC, phase_updated_at DESC
-        LIMIT 12
+        ORDER BY
+            phase DESC,
+            CASE timeframe
+                WHEN '4h' THEN 1
+                WHEN '1h' THEN 2
+                WHEN '30m' THEN 3
+                WHEN '15m' THEN 4
+                ELSE 9
+            END,
+            priority ASC,
+            phase_updated_at DESC
+        LIMIT 20
     """, (symbol,))
 
-    oi = _safe_rows("""
-        SELECT exchange, symbol, timeframe, stage, stage_name, reason,
-               oi_delta_pct, oi_acceleration, price_delta_pct, volume_delta_pct, ts_close
+    oi_rows = _safe_rows("""
+        SELECT DISTINCT ON (exchange, symbol, timeframe)
+            *
         FROM market_oi_slope
         WHERE symbol = %s
-        ORDER BY ts_close DESC
-        LIMIT 8
+        ORDER BY exchange, symbol, timeframe, ts_close DESC
     """, (symbol,))
 
-    if not rows and not oi:
-        return f"🪙 {symbol}\n\nНет данных. Формат: /coin BTCUSDT"
+    if not phase_rows and not oi_rows:
+        return f"🪙 {symbol}
+
+Нет данных. Формат: /coin BTCUSDT"
 
     lines = [f"🪙 {symbol}", ""]
-    if rows:
-        lines.append("Phases:")
-        for r in rows:
+
+    if phase_rows:
+        lines.append("PHASE / HYBRID:")
+        for r in phase_rows:
+            ex = r.get("exchange")
+            tf = r.get("timeframe")
+            link = "BY" if ex == "BYBIT" else "BN"
+
+            price = _latest_metric_row("market_price_state", symbol, ex, tf)
+            volume = _latest_metric_row("market_volume_state", symbol, ex, tf)
+            oi = _latest_metric_row("market_oi_slope", symbol, ex, tf)
+
+            lines.extend([
+                "",
+                f"{symbol} [{tf}]",
+                f"🔗 CG | {link}",
+                f"`{symbol}`",
+                f"phase={r.get('phase')} {r.get('phase_name')} | status={r.get('phase_status')} | prio={r.get('priority')} | conf={r.get('confidence')}",
+                f"updated={_short_ts(r.get('phase_updated_at'))}",
+                f"OI: structure={r.get('oi_structure')} | priority={r.get('oi_priority')} | hold={r.get('oi_hold_state')}",
+                f"OI trends: 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')} | 24h={r.get('oi_trend_24h')}",
+                f"OI slope: stage={oi.get('stage')} {oi.get('stage_name')} | delta={_fmt_pct(oi.get('oi_delta_pct'))} | acc={_fmt_pct(oi.get('oi_acceleration'))}",
+                f"PRICE: structure={r.get('price_structure')} | quality={r.get('price_quality')} | slope={r.get('price_slope_state')} | delta={_fmt_pct(price.get('price_delta_pct'))} | range={_fmt_pct(price.get('range_width_pct'))}",
+                f"VOLUME: structure={r.get('volume_structure')} | quality={r.get('volume_quality')} | hold={r.get('volume_hold_state')} | norm={volume.get('normalized_volume')} | pct={volume.get('volume_percentile')}",
+                f"transition={r.get('transition_reason')}",
+                f"Feedback: /feedback {symbol} текст",
+            ])
+
+    if oi_rows:
+        lines.extend(["", "LATEST OI ENGINE:"])
+        for r in oi_rows[:8]:
             lines.append(
-                f"{r.get('exchange')} {r.get('timeframe')} | phase={r.get('phase')} {r.get('phase_name')} | "
-                f"{r.get('oi_structure')} | hold={r.get('oi_hold_state')} | prio={r.get('priority')}"
+                f"{r.get('exchange')} {r.get('timeframe')} | stage={r.get('stage')} {r.get('stage_name')} | "
+                f"OI={_fmt_pct(r.get('oi_delta_pct'))} | acc={_fmt_pct(r.get('oi_acceleration'))} | "
+                f"{r.get('oi_structure')} | hold={r.get('oi_hold_state')}"
             )
 
-    if oi:
-        lines.append("")
-        lines.append("OI:")
-        for r in oi:
-            lines.append(
-                f"{r.get('exchange')} {r.get('timeframe')} | {r.get('stage_name')} | "
-                f"OI={_fmt_pct(r.get('oi_delta_pct'))} | acc={r.get('oi_acceleration')} | "
-                f"price={_fmt_pct(r.get('price_delta_pct'))}"
-            )
-
-    lines.append("")
-    lines.append("Feedback: /feedback SYMBOL текст")
-    return "\n".join(lines)
+    return "
+".join(lines)
 
 
 def _feedback_path() -> Path:
     return ПАПКА_ДАННЫХ / "telegram_feedback.csv"
+
 
 
 def _save_feedback(text: str) -> str:
@@ -491,18 +536,103 @@ def _save_feedback(text: str) -> str:
         return "Формат: /feedback SYMBOL текст"
 
     _, symbol, comment = parts
+    symbol = symbol.upper().strip()
+
+    phase_rows = _safe_rows("""
+        SELECT *
+        FROM market_phase
+        WHERE symbol = %s
+        ORDER BY phase DESC, priority ASC, phase_updated_at DESC
+        LIMIT 20
+    """, (symbol,))
+
+    if not phase_rows:
+        return f"Нет phase snapshot для {symbol}. Комментарий не сохранён."
+
     path = _feedback_path()
     new_file = not path.exists()
+
+    header = [
+        "created_at_utc",
+        "symbol",
+        "exchange",
+        "timeframe",
+        "phase",
+        "phase_name",
+        "phase_status",
+        "priority",
+        "confidence",
+        "phase_updated_at",
+        "oi_structure",
+        "oi_priority",
+        "oi_hold_state",
+        "oi_trend_1h",
+        "oi_trend_4h",
+        "oi_trend_24h",
+        "price_structure",
+        "price_quality",
+        "price_slope_state",
+        "volume_structure",
+        "volume_quality",
+        "volume_hold_state",
+        "transition_reason",
+        "full_reason",
+        "latest_oi_json",
+        "latest_price_json",
+        "latest_volume_json",
+        "user_comment",
+    ]
+
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
 
     with _csv_lock:
         with path.open("a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if new_file:
-                w.writerow(["created_at_utc", "symbol", "comment"])
-            w.writerow([datetime.now(timezone.utc).isoformat(), symbol.upper(), comment])
+                w.writerow(header)
 
-    return f"✅ Feedback сохранён: {symbol.upper()}"
+            for r in phase_rows:
+                ex = r.get("exchange")
+                tf = r.get("timeframe")
 
+                oi = _latest_metric_row("market_oi_slope", symbol, ex, tf)
+                price = _latest_metric_row("market_price_state", symbol, ex, tf)
+                volume = _latest_metric_row("market_volume_state", symbol, ex, tf)
+
+                w.writerow([
+                    now,
+                    symbol,
+                    ex,
+                    tf,
+                    r.get("phase"),
+                    r.get("phase_name"),
+                    r.get("phase_status"),
+                    r.get("priority"),
+                    r.get("confidence"),
+                    r.get("phase_updated_at"),
+                    r.get("oi_structure"),
+                    r.get("oi_priority"),
+                    r.get("oi_hold_state"),
+                    r.get("oi_trend_1h"),
+                    r.get("oi_trend_4h"),
+                    r.get("oi_trend_24h"),
+                    r.get("price_structure"),
+                    r.get("price_quality"),
+                    r.get("price_slope_state"),
+                    r.get("volume_structure"),
+                    r.get("volume_quality"),
+                    r.get("volume_hold_state"),
+                    r.get("transition_reason"),
+                    r.get("reason"),
+                    json.dumps(oi, ensure_ascii=False, default=str),
+                    json.dumps(price, ensure_ascii=False, default=str),
+                    json.dumps(volume, ensure_ascii=False, default=str),
+                    comment,
+                ])
+                written += 1
+
+    return f"✅ Feedback snapshot сохранён: {symbol}, rows={written}"
 
 def _build_downloads_text() -> str:
     files = [
@@ -675,9 +805,6 @@ def _handle(text: str, chat_id=None) -> None:
             _build_top_oi_text(text.split(maxsplit=1)[1].strip()),
             _main_keyboard()
         )
-
-    elif text.startswith("/top_oi "):
-        send_message(_build_top_oi_text(text.split(maxsplit=1)[1].strip()), _main_keyboard())
 
     elif text in {"/coin", "🪙 Coin"}:
         send_message("Формат: /coin BTCUSDT", _main_keyboard())
