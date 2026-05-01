@@ -43,6 +43,7 @@ from market_price_engine import rebuild_price_state
 from market_volume_engine import rebuild_volume_state
 from market_oi_slope_engine import rebuild_oi_slope
 from market_phase_engine import rebuild_market_phase
+from market_phase_source import rebuild_market_phase_source
 from export_engine import rebuild_exports
 from telegram_bot import start_polling, send_message
 from runtime_mode import runtime_mode_text
@@ -263,7 +264,7 @@ def background(bybit_symbols, binance_symbols):
             )
 
             if auto_skip_stage2:
-                research_count = silence_count = price_count = volume_count = oi_slope_count = phase_count = -1
+                research_count = silence_count = price_count = volume_count = oi_slope_count = phase_source_count = phase_count = -1
                 log("stage2 rebuilds skipped: safe runtime mode")
             else:
                 research_count = _timed_step(timings, "market_research", rebuild_market_research)
@@ -271,6 +272,7 @@ def background(bybit_symbols, binance_symbols):
                 price_count = _timed_step(timings, "price_state", rebuild_price_state)
                 volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
                 oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
+                phase_source_count = _timed_step(timings, "market_phase_source", rebuild_market_phase_source)
                 phase_count = _timed_step(timings, "market_phase", rebuild_market_phase)
 
             _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
