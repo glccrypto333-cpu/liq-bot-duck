@@ -923,11 +923,36 @@ def load_quarantine_symbols(min_coverage_pct: float = 95.0) -> set[tuple[str, st
     return {(r["exchange"], r["symbol"]) for r in rows}
 
 def cleanup_old(days: int) -> None:
-    for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
-        execute(f"DELETE FROM {table} WHERE ts_open < NOW() - (%s || ' days')::interval", (RAW_RETENTION_DAYS,))
+    raw_days = int(days or RAW_RETENTION_DAYS)
 
-    execute("DELETE FROM bot_aggregates WHERE ts_close < NOW() - INTERVAL '72 hours'")
-    execute("DELETE FROM market_research WHERE ts_close < NOW() - INTERVAL '72 hours'")
+    for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
+        rows = execute(
+            f"DELETE FROM {table} WHERE ts_open < NOW() - (%s || ' days')::interval",
+            (raw_days,),
+        )
+        print(f"RAW_CLEANUP_TABLE table={table} rows_deleted={int(rows or 0)} retention_days={raw_days}")
+
+    derived_hours = int(os.getenv("DERIVED_RETENTION_HOURS", "72"))
+    derived_tables = [
+        "bot_aggregates",
+        "market_research",
+        "market_price_state",
+        "market_volume_state",
+        "market_oi_slope",
+        "market_silence",
+        "market_phase_source",
+        "market_oi_slope_staging",
+    ]
+
+    for table in derived_tables:
+        try:
+            rows = execute(
+                f"DELETE FROM {table} WHERE ts_close < NOW() - (%s || ' hours')::interval",
+                (derived_hours,),
+            )
+            print(f"DERIVED_CLEANUP_TABLE table={table} rows_deleted={int(rows or 0)} retention_hours={derived_hours}")
+        except Exception as e:
+            print(f"DERIVED_CLEANUP_TABLE_ERROR table={table} error={type(e).__name__}: {e}")
 
 def migrate_canonical_ts_close() -> None:
     """
