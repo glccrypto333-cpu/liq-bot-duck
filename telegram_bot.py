@@ -313,6 +313,72 @@ def _short_ts(value) -> str:
     return str(value or "n/a").replace("+00:00", " UTC")
 
 
+def _table_health(table: str, ts_col: str, stale_minutes: int = 15) -> dict:
+    rows = _safe_rows(f"""
+        SELECT
+            COUNT(*) AS rows,
+            MAX({ts_col}) AS latest,
+            EXTRACT(EPOCH FROM (NOW() - MAX({ts_col}))) / 60.0 AS age_minutes
+        FROM {table}
+    """)
+
+    if not rows:
+        return {"table": table, "status": "ERROR", "rows": 0, "latest": None, "age_minutes": None}
+
+    r = rows[0]
+    count = int(r.get("rows") or 0)
+    latest = r.get("latest")
+    age = r.get("age_minutes")
+
+    if count <= 0:
+        status = "EMPTY"
+    elif latest is None:
+        status = "EMPTY"
+    elif float(age or 999999) > stale_minutes:
+        status = "STALE"
+    else:
+        status = "OK"
+
+    return {
+        "table": table,
+        "status": status,
+        "rows": count,
+        "latest": latest,
+        "age_minutes": round(float(age or 0), 1) if age is not None else None,
+    }
+
+
+def _build_health_text() -> str:
+    checks = [
+        ("market_phase", "phase_updated_at", 10),
+        ("market_oi_slope", "ts_close", 10),
+        ("market_price_state", "ts_close", 10),
+        ("market_volume_state", "ts_close", 10),
+        ("market_phase_source", "ts_close", 10),
+    ]
+
+    lines = ["🩺 Health — core tables", ""]
+
+    for table, ts_col, stale_min in checks:
+        h = _table_health(table, ts_col, stale_min)
+        lines.append(
+            f"{h['status']} | {h['table']} | rows={h['rows']} | "
+            f"latest={_short_ts(h['latest'])} | age_min={h['age_minutes']}"
+        )
+
+    lines.append("")
+    lines.append("OK <= 10m | STALE > 10m | EMPTY rows=0 | ERROR query failed")
+    return "\n".join(lines)
+
+
+def _health_banner_for_table(table: str, ts_col: str, stale_minutes: int = 10) -> str:
+    h = _table_health(table, ts_col, stale_minutes)
+    return (
+        f"health={h['status']} | rows={h['rows']} | "
+        f"latest={_short_ts(h['latest'])} | age_min={h['age_minutes']}"
+    )
+
+
 def _fmt_pct(value) -> str:
     try:
         return f"{float(value):.2f}%"
@@ -417,7 +483,7 @@ def _build_top_oi_text(timeframe: str | None = None) -> str:
     if not rows:
         return f"{title}\n\nНет свежих строк в market_oi_slope."
 
-    lines = [title, f"latest_ts={_short_ts(latest_ts)}", ""]
+    lines = [title, _health_banner_for_table("market_oi_slope", "ts_close"), f"latest_ts={_short_ts(latest_ts)}", ""]
     for r in rows:
         ex = r.get("exchange")
         link = "BY" if ex == "BYBIT" else "BN"
@@ -852,7 +918,7 @@ def _handle(text: str, chat_id=None) -> None:
         send_document(ПАПКА_ДАННЫХ / "runtime_timing_report.txt", "runtime timing report")
 
     elif text == "/health":
-        send_document(ПАПКА_ДАННЫХ / "runtime_health_report.txt", "runtime health report")
+        send_message(_build_health_text(), _main_keyboard())
 
     elif text == "/failures":
         send_document(ПАПКА_ДАННЫХ / "request_failure_report.csv", "request failures")
