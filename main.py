@@ -296,7 +296,7 @@ def background(bybit_symbols, binance_symbols):
 
             _write_runtime_timing_report(timings)
 
-            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count} phase={phase_count}")
+            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count} phase_source={phase_source_count} phase={phase_count}")
             _log_db_universe_check()
 
         except Exception as exc:
@@ -304,6 +304,9 @@ def background(bybit_symbols, binance_symbols):
             log(traceback.format_exc())
 
         elapsed = time.time() - cycle_started
+        if elapsed > ИНТЕРВАЛ_ЦИКЛА_СЕК:
+            log(f"CYCLE_OVERRUN elapsed={elapsed:.2f}s target={ИНТЕРВАЛ_ЦИКЛА_СЕК}s overrun={(elapsed - ИНТЕРВАЛ_ЦИКЛА_СЕК):.2f}s")
+
         sleep_seconds = max(0, ИНТЕРВАЛ_ЦИКЛА_СЕК - elapsed)
         log(
             f"cycle schedule: target={ИНТЕРВАЛ_ЦИКЛА_СЕК}s "
