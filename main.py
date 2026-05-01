@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 import os
+import json
 import sys
 import resource
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -338,15 +339,83 @@ def background(bybit_symbols, binance_symbols):
 
             timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
             log(f"cycle timing: {timing_text}")
+            rss_mb = _runtime_memory_mb()
+            rss_health = "ok"
+            if rss_mb >= float(os.getenv("RSS_CRITICAL_MB", "512")):
+                rss_health = "critical"
+            elif rss_mb >= float(os.getenv("RSS_WARNING_MB", "256")):
+                rss_health = "warning"
+
+            if rss_health != "ok":
+                log(f"RSS_{rss_health.upper()} memory_max_rss_mb={rss_mb:.2f}")
+
             log(
                 f"cycle resource: pid={os.getpid()} "
-                f"memory_max_rss_mb={_runtime_memory_mb():.2f} "
+                f"memory_max_rss_mb={rss_mb:.2f} "
+                f"rss_health={rss_health} "
                 f"bybit_symbols={len(bybit_symbols)} bybit_workers={BYBIT_COLLECT_WORKERS} "
                 f"binance_symbols={len(binance_symbols)} "
                 f"binance_workers={BINANCE_COLLECT_WORKERS}"
             )
 
+            Path("runtime_reports").mkdir(exist_ok=True)
             _write_runtime_timing_report(timings)
+            runtime_health = {
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "app_version": APP_VERSION,
+                "pid": os.getpid(),
+                "rss_mb": round(rss_mb, 2),
+                "rss_health": rss_health,
+                "cycle_timing": timing_text,
+                "bybit_symbols": len(bybit_symbols),
+                "binance_symbols": len(binance_symbols),
+                "bybit_workers": BYBIT_COLLECT_WORKERS,
+                "binance_workers": BINANCE_COLLECT_WORKERS,
+                "skip_heavy": os.getenv("SKIP_HEAVY_AGGREGATES"),
+                "skip_stage2": os.getenv("SKIP_STAGE2_REBUILDS"),
+                "force_stage2": os.getenv("FORCE_STAGE2_WITH_STALE_AGGREGATES"),
+                "derived_window_hours": os.getenv("DERIVED_WINDOW_HOURS"),
+                "derived_batch_size": os.getenv("DERIVED_BATCH_SIZE"),
+                "derived_retention_hours": os.getenv("DERIVED_RETENTION_HOURS"),
+            }
+
+            Path("runtime_reports/runtime_health.txt").write_text(
+                "\n".join([f"{k}={v}" for k, v in runtime_health.items()]) + "\n"
+            )
+            runtime_health_json_path = Path("runtime_reports/runtime_health.json")
+
+            snapshot_health = "ok"
+            runtime_health["snapshot_health"] = snapshot_health
+            runtime_health["snapshot_size"] = 0
+
+            payload = json.dumps(runtime_health, ensure_ascii=False, indent=2) + "\n"
+            runtime_health_json_path.write_text(payload)
+
+            snapshot_size = runtime_health_json_path.stat().st_size
+            if snapshot_size <= 32:
+                snapshot_health = "critical"
+                log(f"RUNTIME_SNAPSHOT_CORRUPTED size={snapshot_size}")
+
+            runtime_health["snapshot_size"] = snapshot_size
+            runtime_health["snapshot_health"] = snapshot_health
+
+            runtime_health_json_path.write_text(
+                json.dumps(runtime_health, ensure_ascii=False, indent=2) + "\n"
+            )
+
+            Path("runtime_reports/snapshot_status.txt").write_text(
+                "\n".join([
+                    f"snapshot_health={snapshot_health}",
+                    f"snapshot_size={snapshot_size}",
+                    f"updated_at_utc={runtime_health['updated_at_utc']}",
+                ]) + "\n"
+            )
+
+            if snapshot_health != "ok":
+                log(
+                    f"RUNTIME_SNAPSHOT_{snapshot_health.upper()} "
+                    f"size={snapshot_size}"
+                )
 
             log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count} phase_source={phase_source_count} phase={phase_count}")
             _log_db_universe_check()
@@ -356,8 +425,24 @@ def background(bybit_symbols, binance_symbols):
             log(traceback.format_exc())
 
         elapsed = time.time() - cycle_started
+
+        if not hasattr(background, "_overrun_streak"):
+            background._overrun_streak = 0
+
         if elapsed > ИНТЕРВАЛ_ЦИКЛА_СЕК:
-            log(f"CYCLE_OVERRUN elapsed={elapsed:.2f}s target={ИНТЕРВАЛ_ЦИКЛА_СЕК}s overrun={(elapsed - ИНТЕРВАЛ_ЦИКЛА_СЕК):.2f}s")
+            background._overrun_streak += 1
+            log(
+                f"CYCLE_OVERRUN "
+                f"elapsed={elapsed:.2f}s "
+                f"target={ИНТЕРВАЛ_ЦИКЛА_СЕК}s "
+                f"overrun={(elapsed - ИНТЕРВАЛ_ЦИКЛА_СЕК):.2f}s "
+                f"streak={background._overrun_streak}"
+            )
+
+            if background._overrun_streak >= 3:
+                log(f"CYCLE_OVERRUN_CRITICAL streak={background._overrun_streak}")
+        else:
+            background._overrun_streak = 0
 
         sleep_seconds = max(0, ИНТЕРВАЛ_ЦИКЛА_СЕК - elapsed)
         log(
