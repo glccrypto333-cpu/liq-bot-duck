@@ -53,13 +53,7 @@ def init_market_phase_source() -> None:
 def rebuild_market_phase_source() -> int:
     init_market_phase_source()
 
-    execute("""
-        DELETE FROM market_phase_source
-        WHERE ts_close >= (
-            SELECT MAX(ts_close) - (%s || ' hours')::interval
-            FROM market_research
-        )
-    """, (WINDOW_HOURS,))
+    print(f"MARKET_PHASE_SOURCE_INCREMENTAL window_hours={WINDOW_HOURS} delete_before_insert=0")
 
     execute("""
         INSERT INTO market_phase_source (

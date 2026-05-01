@@ -671,7 +671,18 @@ def replace_market_phase(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
         print("replace_market_phase skipped: empty rows, old table preserved")
         return
-    execute("DELETE FROM market_phase")
+
+    execute("""
+        DELETE FROM market_phase a
+        USING market_phase b
+        WHERE a.exchange = b.exchange
+          AND a.symbol = b.symbol
+          AND a.timeframe = b.timeframe
+          AND a.ctid < b.ctid
+    """)
+
+    execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_phase_key ON market_phase(exchange, symbol, timeframe)")
+
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
         INSERT INTO market_phase(
@@ -686,6 +697,34 @@ def replace_market_phase(rows: list[tuple]) -> None:
             volume_structure, volume_quality, volume_hold_state,
             transition_reason, reason
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (exchange, symbol, timeframe)
+        DO UPDATE SET
+            calculated_at = EXCLUDED.calculated_at,
+            phase = EXCLUDED.phase,
+            phase_name = EXCLUDED.phase_name,
+            phase_status = EXCLUDED.phase_status,
+            priority = EXCLUDED.priority,
+            phase_started_at = EXCLUDED.phase_started_at,
+            phase_updated_at = EXCLUDED.phase_updated_at,
+            stage1_started_at = EXCLUDED.stage1_started_at,
+            stage2_started_at = EXCLUDED.stage2_started_at,
+            stage3_started_at = EXCLUDED.stage3_started_at,
+            manual_reset_required = EXCLUDED.manual_reset_required,
+            confidence = EXCLUDED.confidence,
+            oi_structure = EXCLUDED.oi_structure,
+            oi_priority = EXCLUDED.oi_priority,
+            oi_hold_state = EXCLUDED.oi_hold_state,
+            oi_trend_1h = EXCLUDED.oi_trend_1h,
+            oi_trend_4h = EXCLUDED.oi_trend_4h,
+            oi_trend_24h = EXCLUDED.oi_trend_24h,
+            price_structure = EXCLUDED.price_structure,
+            price_quality = EXCLUDED.price_quality,
+            price_slope_state = EXCLUDED.price_slope_state,
+            volume_structure = EXCLUDED.volume_structure,
+            volume_quality = EXCLUDED.volume_quality,
+            volume_hold_state = EXCLUDED.volume_hold_state,
+            transition_reason = EXCLUDED.transition_reason,
+            reason = EXCLUDED.reason
         """, rows)
 
 

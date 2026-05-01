@@ -140,7 +140,30 @@ def _insert_oi_slope_rows(rows: list[tuple]) -> None:
             oi_reason, reason, oi_delta_pct, oi_acceleration, oi_prev_avg,
             price_delta_pct, volume_delta_pct, range_width_pct, silence_stage
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, rows)
+
+        ON CONFLICT (exchange, symbol, timeframe, ts_close)
+        DO UPDATE SET
+            calculated_at = EXCLUDED.calculated_at,
+            stage = EXCLUDED.stage,
+            stage_name = EXCLUDED.stage_name,
+            oi_structure = EXCLUDED.oi_structure,
+            oi_priority = EXCLUDED.oi_priority,
+            oi_hold_state = EXCLUDED.oi_hold_state,
+            oi_trend_15m = EXCLUDED.oi_trend_15m,
+            oi_trend_30m = EXCLUDED.oi_trend_30m,
+            oi_trend_1h = EXCLUDED.oi_trend_1h,
+            oi_trend_4h = EXCLUDED.oi_trend_4h,
+            oi_trend_24h = EXCLUDED.oi_trend_24h,
+            oi_reason = EXCLUDED.oi_reason,
+            reason = EXCLUDED.reason,
+            oi_delta_pct = EXCLUDED.oi_delta_pct,
+            oi_acceleration = EXCLUDED.oi_acceleration,
+            oi_prev_avg = EXCLUDED.oi_prev_avg,
+            price_delta_pct = EXCLUDED.price_delta_pct,
+            volume_delta_pct = EXCLUDED.volume_delta_pct,
+            range_width_pct = EXCLUDED.range_width_pct,
+            silence_stage = EXCLUDED.silence_stage
+                """, rows)
 
 
 def _rebuild_oi_slope_symbol_batch(symbols: list[tuple[str, str]], window_hours: int) -> tuple[int, dict]:
@@ -256,16 +279,28 @@ def _rebuild_oi_slope_symbol_batch(symbols: list[tuple[str, str]], window_hours:
     return len(out), counts
 
 
+
+def _ensure_incremental_key() -> None:
+    execute("""
+        DELETE FROM market_oi_slope a
+        USING market_oi_slope b
+        WHERE a.exchange = b.exchange
+          AND a.symbol = b.symbol
+          AND a.timeframe = b.timeframe
+          AND a.ts_close = b.ts_close
+          AND a.ctid < b.ctid
+    """)
+    execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_oi_slope_key ON market_oi_slope(exchange, symbol, timeframe, ts_close)")
+
+
 def rebuild_oi_slope() -> int:
     window_hours = max(1, int(os.getenv("DERIVED_WINDOW_HOURS", "2")))
 
-    execute("""
-        DELETE FROM market_oi_slope
-        WHERE ts_close >= (
-            SELECT MAX(ts_close) - (%s || ' hours')::interval
-            FROM market_research
-        )
-    """, (window_hours,))
+    _ensure_incremental_key()
+    log(
+        f"oi slope incremental mode: "
+        f"window_hours={window_hours} delete_before_insert=0"
+    )
 
     symbols = [
         (r["exchange"], r["symbol"])
