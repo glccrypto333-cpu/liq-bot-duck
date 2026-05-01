@@ -4,7 +4,7 @@ import os
 import json
 import sys
 import resource
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import threading
 import traceback
 from pathlib import Path
@@ -278,6 +278,84 @@ def _log_db_universe_check() -> None:
         log(f"db universe check error: {type(exc).__name__}: {exc}")
 
 
+def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_timeout: int):
+    timeout_seconds = float(os.getenv(timeout_env, str(default_timeout)))
+    started = time.time()
+
+    if not hasattr(_timed_watchdog_step, "_timeout_streaks"):
+        _timed_watchdog_step._timeout_streaks = {}
+
+    if not hasattr(_timed_watchdog_step, "_inflight"):
+        _timed_watchdog_step._inflight = set()
+
+    if name in _timed_watchdog_step._inflight:
+        elapsed = time.time() - started
+        timings.append((name, elapsed))
+        log(
+            f"WATCHDOG_INFLIGHT_SKIP "
+            f"step={name} elapsed={elapsed:.2f}s "
+            f"degraded=1"
+        )
+        return -3
+
+    _timed_watchdog_step._inflight.add(name)
+
+    def _run_and_release():
+        try:
+            return func()
+        finally:
+            _timed_watchdog_step._inflight.discard(name)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_run_and_release)
+
+    try:
+        result = future.result(timeout=timeout_seconds)
+        elapsed = time.time() - started
+        timings.append((name, elapsed))
+        _timed_watchdog_step._timeout_streaks[name] = 0
+        log(
+            f"step resource: {name}={elapsed:.2f}s "
+            f"watchdog=ok timeout={timeout_seconds}s "
+            f"watchdog_streak=0 "
+            f"memory_max_rss_mb={_runtime_memory_mb():.2f}"
+        )
+        executor.shutdown(wait=True, cancel_futures=False)
+        return result
+
+    except TimeoutError:
+        elapsed = time.time() - started
+        timings.append((name, elapsed))
+        future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+        streak = _timed_watchdog_step._timeout_streaks.get(name, 0) + 1
+        _timed_watchdog_step._timeout_streaks[name] = streak
+
+        log(
+            f"WATCHDOG_TIMEOUT "
+            f"step={name} elapsed={elapsed:.2f}s "
+            f"timeout={timeout_seconds}s degraded=1 "
+            f"watchdog_streak={streak}"
+        )
+
+        if streak >= int(os.getenv("WATCHDOG_CRITICAL_STREAK", "3")):
+            log(
+                f"WATCHDOG_CRITICAL "
+                f"step={name} streak={streak} "
+                f"timeout={timeout_seconds}s"
+            )
+
+        return -2
+
+    except Exception as exc:
+        elapsed = time.time() - started
+        timings.append((name, elapsed))
+        executor.shutdown(wait=False, cancel_futures=True)
+        log(f"WATCHDOG_ERROR step={name} error={type(exc).__name__}: {exc}")
+        raise
+
+
 def background(bybit_symbols, binance_symbols):
     last_export = 0.0
     cycle_no = 0
@@ -301,7 +379,13 @@ def background(bybit_symbols, binance_symbols):
                 agg_count = -1
                 log(f"aggregates skipped: scheduled every {AGGREGATES_EVERY_CYCLES} cycles")
             else:
-                agg_count = _timed_step(timings, "aggregates", rebuild_bot_aggregates)
+                agg_count = _timed_watchdog_step(
+                    timings,
+                    "aggregates",
+                    rebuild_bot_aggregates,
+                    "WATCHDOG_AGGREGATES_SECONDS",
+                    90,
+                )
             if os.getenv("ENABLE_RUNTIME_VALIDATION_AUDIT") == "1":
                 audit_count = _timed_step(timings, "validation_audit", rebuild_all)
             else:
@@ -320,13 +404,25 @@ def background(bybit_symbols, binance_symbols):
                 research_count = silence_count = price_count = volume_count = oi_slope_count = phase_source_count = phase_count = -1
                 log("stage2 rebuilds skipped: safe runtime mode")
             else:
-                research_count = _timed_step(timings, "market_research", rebuild_market_research)
+                research_count = _timed_watchdog_step(
+                    timings,
+                    "market_research",
+                    rebuild_market_research,
+                    "WATCHDOG_MARKET_RESEARCH_SECONDS",
+                    45,
+                )
                 silence_count = _timed_step(timings, "market_silence", rebuild_market_silence)
                 price_count = _timed_step(timings, "price_state", rebuild_price_state)
                 volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
                 oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
                 phase_source_count = _timed_step(timings, "market_phase_source", rebuild_market_phase_source)
-                phase_count = _timed_step(timings, "market_phase", rebuild_market_phase)
+                phase_count = _timed_watchdog_step(
+                    timings,
+                    "market_phase",
+                    rebuild_market_phase,
+                    "WATCHDOG_MARKET_PHASE_SECONDS",
+                    20,
+                )
 
             _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
 
@@ -360,12 +456,28 @@ def background(bybit_symbols, binance_symbols):
 
             Path("runtime_reports").mkdir(exist_ok=True)
             _write_runtime_timing_report(timings)
+            watchdog_streaks = dict(getattr(_timed_watchdog_step, "_timeout_streaks", {}))
+            watchdog_health = "critical" if any(
+                streak >= int(os.getenv("WATCHDOG_CRITICAL_STREAK", "3"))
+                for streak in watchdog_streaks.values()
+            ) else ("degraded" if any(streak > 0 for streak in watchdog_streaks.values()) else "ok")
+
+            Path("runtime_reports/watchdog_status.txt").write_text(
+                "\n".join([
+                    f"watchdog_health={watchdog_health}",
+                    f"watchdog_streaks={watchdog_streaks}",
+                    f"updated_at_utc={datetime.now(timezone.utc).isoformat()}",
+                ]) + "\n"
+            )
+
             runtime_health = {
                 "updated_at_utc": datetime.now(timezone.utc).isoformat(),
                 "app_version": APP_VERSION,
                 "pid": os.getpid(),
                 "rss_mb": round(rss_mb, 2),
                 "rss_health": rss_health,
+                "watchdog_health": watchdog_health,
+                "watchdog_streaks": watchdog_streaks,
                 "cycle_timing": timing_text,
                 "cycle_health": "pending",
                 "bybit_symbols": len(bybit_symbols),
