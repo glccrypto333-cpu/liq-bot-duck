@@ -195,12 +195,42 @@ def collect(symbols_bybit, symbols_binance):
     upsert_volume(volume_rows)
     replace_request_failures(failures)
 
+    failure_types = {}
+
+    for _, exchange, symbol, data_type, error_type, _ in failures:
+        key = f"{exchange}:{data_type}:{error_type}"
+        failure_types[key] = failure_types.get(key, 0) + 1
+
+    failure_health = "ok"
+    if len(failures) >= 50:
+        failure_health = "critical"
+    elif len(failures) >= 10:
+        failure_health = "warning"
+
+    if failures:
+        top_failures = sorted(
+            failure_types.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:5]
+
+        log(
+            f"REQUEST_FAILURES "
+            f"count={len(failures)} "
+            f"failure_health={failure_health} "
+            f"top={top_failures}"
+        )
+
+    if failure_health != "ok":
+        log(f"REQUEST_FAILURE_{failure_health.upper()} count={len(failures)}")
+
     if collect_health != "ok":
         log(f"COLLECT_{collect_health.upper()} elapsed={collect_seconds:.2f}s slow_side={slow_side}")
 
     log(
         f"collect ok: oi={len(oi_rows)} price={len(price_rows)} volume={len(volume_rows)} "
         f"request_failures={len(failures)} "
+        f"failure_health={failure_health} "
         f"bybit_symbols={len(bybit_collect_symbols)} "
         f"bybit_workers={bybit_workers} "
         f"bybit_seconds={bybit_seconds:.2f} "
