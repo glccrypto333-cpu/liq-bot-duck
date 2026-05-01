@@ -711,6 +711,7 @@ def _build_downloads_text() -> str:
         "telegram_quarantine.csv",
         "telegram_quarantine_history.csv",
         "telegram_stage3_alert_history.csv",
+        "telegram_pending_reset_stage3.json",
     ]
     lines = ["⬇️ Скачать", "", "Только готовые файлы. Rebuild не запускается.", ""]
     for name in files:
@@ -814,6 +815,37 @@ def _handle_quarantine(text: str, chat_id=None) -> None:
         send_message("Формат: /quarantine list | add SYMBOL reason | remove SYMBOL | history", _main_keyboard())
 
 
+
+def _pending_reset_path() -> Path:
+    return ПАПКА_ДАННЫХ / "telegram_pending_reset_stage3.json"
+
+
+def _save_pending_reset(symbol: str, timeframe: str, reason: str) -> None:
+    payload = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol.upper(),
+        "timeframe": timeframe,
+        "reason": reason,
+    }
+    _pending_reset_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _load_pending_reset() -> dict:
+    path = _pending_reset_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(errors="ignore"))
+    except Exception:
+        return {}
+
+
+def _clear_pending_reset() -> None:
+    path = _pending_reset_path()
+    if path.exists():
+        path.unlink()
+
+
 def _handle_stage3_reset(text: str, chat_id=None) -> None:
     if not _admin_only(chat_id):
         return
@@ -824,14 +856,82 @@ def _handle_stage3_reset(text: str, chat_id=None) -> None:
         return
 
     _, symbol, timeframe, reason = parts
+    symbol = symbol.upper().strip()
+    timeframe = timeframe.strip()
+
+    _save_pending_reset(symbol, timeframe, reason)
+
+    send_message(
+        "\n".join([
+            "⚠️ Pending Stage3 reset создан",
+            "",
+            f"symbol={symbol}",
+            f"timeframe={timeframe}",
+            f"reason={reason}",
+            "",
+            f"Подтвердить: /confirm_reset {symbol} {timeframe}",
+            "Отменить: /cancel_reset",
+        ]),
+        _main_keyboard(),
+    )
+
+
+def _handle_confirm_reset(text: str, chat_id=None) -> None:
+    if not _admin_only(chat_id):
+        return
+
+    pending = _load_pending_reset()
+    if not pending:
+        send_message("Нет pending reset.", _main_keyboard())
+        return
+
+    parts = text.split(maxsplit=2)
+    if len(parts) < 3:
+        send_message("Формат: /confirm_reset SYMBOL TIMEFRAME", _main_keyboard())
+        return
+
+    _, symbol, timeframe = parts
+    symbol = symbol.upper().strip()
+    timeframe = timeframe.strip()
+
+    if symbol != pending.get("symbol") or timeframe != pending.get("timeframe"):
+        send_message(
+            f"Pending не совпадает. Сейчас pending: {pending.get('symbol')} {pending.get('timeframe')}",
+            _main_keyboard(),
+        )
+        return
+
     total = 0
+    reason = pending.get("reason") or "confirmed_reset"
+
     for exchange in ("BYBIT", "BINANCE"):
         try:
-            total += reset_stage3(exchange, symbol.upper(), timeframe, reason, dry_run=False)
+            total += reset_stage3(exchange, symbol, timeframe, reason, dry_run=False)
         except Exception as exc:
-            log(f"telegram reset_stage3 error: {exc}")
+            log(f"telegram confirm_reset error: {exc}")
 
-    send_message(f"✅ Stage3 reset done: {symbol.upper()} {timeframe}, rows={total}", _main_keyboard())
+    _clear_pending_reset()
+
+    send_message(
+        f"✅ Stage3 reset confirmed: {symbol} {timeframe}, rows={total}",
+        _main_keyboard(),
+    )
+
+
+def _handle_cancel_reset(text: str, chat_id=None) -> None:
+    if not _admin_only(chat_id):
+        return
+
+    pending = _load_pending_reset()
+    _clear_pending_reset()
+
+    if pending:
+        send_message(
+            f"✅ Pending reset отменён: {pending.get('symbol')} {pending.get('timeframe')}",
+            _main_keyboard(),
+        )
+    else:
+        send_message("Pending reset не найден.", _main_keyboard())
 
 
 
@@ -1034,6 +1134,12 @@ def _handle(text: str, chat_id=None) -> None:
 
     elif text.startswith("/reset_stage3 "):
         _handle_stage3_reset(text, chat_id)
+
+    elif text.startswith("/confirm_reset "):
+        _handle_confirm_reset(text, chat_id)
+
+    elif text == "/cancel_reset":
+        _handle_cancel_reset(text, chat_id)
 
     elif text == "/ping":
         send_message("pong", _main_keyboard())
