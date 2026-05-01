@@ -185,11 +185,22 @@ def collect(symbols_bybit, symbols_binance):
     binance_seconds = time.time() - binance_started
     collect_seconds = time.time() - collect_started
     slow_side = "bybit" if bybit_seconds > binance_seconds else "binance"
+    slow_side_delta_seconds = abs(bybit_seconds - binance_seconds)
+    collect_target_seconds = float(os.getenv("COLLECT_TARGET_SECONDS", "90"))
+    collect_critical_seconds = float(os.getenv("COLLECT_CRITICAL_SECONDS", "120"))
+    collect_reserve_seconds = max(0.0, collect_target_seconds - collect_seconds)
+
     collect_health = "ok"
-    if collect_seconds > 120:
+    if collect_seconds > collect_critical_seconds:
         collect_health = "critical"
-    elif collect_seconds > 90:
+    elif collect_seconds > collect_target_seconds:
         collect_health = "slow"
+
+    collect_reserve_health = "ok"
+    if collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_CRITICAL_SECONDS", "5")):
+        collect_reserve_health = "critical"
+    elif collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_WARNING_SECONDS", "15")):
+        collect_reserve_health = "warning"
 
     upsert_oi(oi_rows)
     upsert_price(price_rows)
@@ -226,7 +237,20 @@ def collect(symbols_bybit, symbols_binance):
         log(f"REQUEST_FAILURE_{failure_health.upper()} count={len(failures)}")
 
     if collect_health != "ok":
-        log(f"COLLECT_{collect_health.upper()} elapsed={collect_seconds:.2f}s slow_side={slow_side}")
+        log(
+            f"COLLECT_{collect_health.upper()} "
+            f"elapsed={collect_seconds:.2f}s "
+            f"target={collect_target_seconds:.2f}s "
+            f"slow_side={slow_side} "
+            f"slow_side_delta_seconds={slow_side_delta_seconds:.2f}"
+        )
+
+    if collect_reserve_health != "ok":
+        log(
+            f"COLLECT_RESERVE_{collect_reserve_health.upper()} "
+            f"reserve_seconds={collect_reserve_seconds:.2f} "
+            f"target={collect_target_seconds:.2f}s"
+        )
 
     log(
         f"collect ok: oi={len(oi_rows)} price={len(price_rows)} volume={len(volume_rows)} "
@@ -239,7 +263,11 @@ def collect(symbols_bybit, symbols_binance):
         f"binance_workers={workers} "
         f"binance_seconds={binance_seconds:.2f} "
         f"collect_seconds={collect_seconds:.2f} "
+        f"collect_target_seconds={collect_target_seconds:.2f} "
+        f"collect_reserve_seconds={collect_reserve_seconds:.2f} "
+        f"collect_reserve_health={collect_reserve_health} "
         f"slow_side={slow_side} "
+        f"slow_side_delta_seconds={slow_side_delta_seconds:.2f} "
         f"collect_health={collect_health}"
     )
 
@@ -470,6 +498,23 @@ def background(bybit_symbols, binance_symbols):
                 ]) + "\n"
             )
 
+            collect_seconds = next((seconds for name, seconds in timings if name == "collect"), 0.0)
+            collect_target_seconds = float(os.getenv("COLLECT_TARGET_SECONDS", "90"))
+            collect_reserve_seconds = max(0.0, collect_target_seconds - collect_seconds)
+            collect_reserve_health = "ok"
+            if collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_CRITICAL_SECONDS", "5")):
+                collect_reserve_health = "critical"
+            elif collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_WARNING_SECONDS", "15")):
+                collect_reserve_health = "warning"
+
+            runtime_alerts = []
+            if rss_health != "ok":
+                runtime_alerts.append(f"rss_{rss_health}")
+            if watchdog_health != "ok":
+                runtime_alerts.append(f"watchdog_{watchdog_health}")
+            if collect_reserve_health != "ok":
+                runtime_alerts.append(f"collect_reserve_{collect_reserve_health}")
+
             runtime_health = {
                 "updated_at_utc": datetime.now(timezone.utc).isoformat(),
                 "app_version": APP_VERSION,
@@ -479,6 +524,12 @@ def background(bybit_symbols, binance_symbols):
                 "watchdog_health": watchdog_health,
                 "watchdog_streaks": watchdog_streaks,
                 "cycle_timing": timing_text,
+                "collect_seconds": round(collect_seconds, 2),
+                "collect_target_seconds": round(collect_target_seconds, 2),
+                "collect_reserve_seconds": round(collect_reserve_seconds, 2),
+                "collect_reserve_health": collect_reserve_health,
+                "runtime_alerts": runtime_alerts,
+                "runtime_alert_count": len(runtime_alerts),
                 "cycle_health": "pending",
                 "bybit_symbols": len(bybit_symbols),
                 "binance_symbols": len(binance_symbols),
@@ -577,6 +628,7 @@ def background(bybit_symbols, binance_symbols):
             "cycle_target_seconds": ИНТЕРВАЛ_ЦИКЛА_СЕК,
             "cycle_elapsed_seconds": round(elapsed, 2),
             "cycle_sleep_seconds": round(sleep_seconds, 2),
+            "cycle_reserve_pct": round((sleep_seconds / ИНТЕРВАЛ_ЦИКЛА_СЕК) * 100, 2) if ИНТЕРВАЛ_ЦИКЛА_СЕК else 0,
             "cycle_health": cycle_health,
             "overrun_streak": getattr(background, "_overrun_streak", 0),
         }
