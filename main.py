@@ -190,6 +190,21 @@ def collect(symbols_bybit, symbols_binance):
     collect_critical_seconds = float(os.getenv("COLLECT_CRITICAL_SECONDS", "120"))
     collect_reserve_seconds = max(0.0, collect_target_seconds - collect_seconds)
 
+    bybit_symbols_per_second = round(len(bybit_collect_symbols) / bybit_seconds, 2) if bybit_seconds > 0 else 0
+    binance_symbols_per_second = round(len(binance_collect_symbols) / binance_seconds, 2) if binance_seconds > 0 else 0
+    collect_symbols_total = len(bybit_collect_symbols) + len(binance_collect_symbols)
+    collect_symbols_per_second = round(collect_symbols_total / collect_seconds, 2) if collect_seconds > 0 else 0
+    bybit_seconds_per_symbol = round(bybit_seconds / len(bybit_collect_symbols), 4) if bybit_collect_symbols else 0
+    binance_seconds_per_symbol = round(binance_seconds / len(binance_collect_symbols), 4) if binance_collect_symbols else 0
+
+    worker_pressure = "ok"
+    if collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_CRITICAL_SECONDS", "5")):
+        worker_pressure = "critical"
+    elif collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_WARNING_SECONDS", "15")):
+        worker_pressure = "warning"
+    elif slow_side_delta_seconds >= float(os.getenv("SLOW_SIDE_DELTA_WARNING_SECONDS", "10")):
+        worker_pressure = "imbalanced"
+
     collect_health = "ok"
     if collect_seconds > collect_critical_seconds:
         collect_health = "critical"
@@ -242,7 +257,10 @@ def collect(symbols_bybit, symbols_binance):
             f"elapsed={collect_seconds:.2f}s "
             f"target={collect_target_seconds:.2f}s "
             f"slow_side={slow_side} "
-            f"slow_side_delta_seconds={slow_side_delta_seconds:.2f}"
+            f"slow_side_delta_seconds={slow_side_delta_seconds:.2f} "
+            f"bybit_sps={bybit_symbols_per_second} "
+            f"binance_sps={binance_symbols_per_second} "
+            f"worker_pressure={worker_pressure}"
         )
 
     if collect_reserve_health != "ok":
@@ -268,6 +286,12 @@ def collect(symbols_bybit, symbols_binance):
         f"collect_reserve_health={collect_reserve_health} "
         f"slow_side={slow_side} "
         f"slow_side_delta_seconds={slow_side_delta_seconds:.2f} "
+        f"bybit_symbols_per_second={bybit_symbols_per_second} "
+        f"binance_symbols_per_second={binance_symbols_per_second} "
+        f"collect_symbols_per_second={collect_symbols_per_second} "
+        f"bybit_seconds_per_symbol={bybit_seconds_per_symbol} "
+        f"binance_seconds_per_symbol={binance_seconds_per_symbol} "
+        f"worker_pressure={worker_pressure} "
         f"collect_health={collect_health}"
     )
 
@@ -501,6 +525,7 @@ def background(bybit_symbols, binance_symbols):
             collect_seconds = next((seconds for name, seconds in timings if name == "collect"), 0.0)
             collect_target_seconds = float(os.getenv("COLLECT_TARGET_SECONDS", "90"))
             collect_reserve_seconds = max(0.0, collect_target_seconds - collect_seconds)
+            collect_reserve_pct = round((collect_reserve_seconds / collect_target_seconds) * 100, 2) if collect_target_seconds else 0
             collect_reserve_health = "ok"
             if collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_CRITICAL_SECONDS", "5")):
                 collect_reserve_health = "critical"
@@ -527,6 +552,7 @@ def background(bybit_symbols, binance_symbols):
                 "collect_seconds": round(collect_seconds, 2),
                 "collect_target_seconds": round(collect_target_seconds, 2),
                 "collect_reserve_seconds": round(collect_reserve_seconds, 2),
+                "collect_reserve_pct": collect_reserve_pct,
                 "collect_reserve_health": collect_reserve_health,
                 "runtime_alerts": runtime_alerts,
                 "runtime_alert_count": len(runtime_alerts),
@@ -616,6 +642,13 @@ def background(bybit_symbols, binance_symbols):
         elif sleep_seconds < float(os.getenv("CYCLE_SLEEP_WARNING_SECONDS", "30")):
             cycle_health = "tight"
 
+        cycle_reserve_pct = round((sleep_seconds / ИНТЕРВАЛ_ЦИКЛА_СЕК) * 100, 2) if ИНТЕРВАЛ_ЦИКЛА_СЕК else 0
+        cycle_latency_class = "healthy"
+        if cycle_health == "overrun":
+            cycle_latency_class = "overrun"
+        elif cycle_reserve_pct < float(os.getenv("CYCLE_RESERVE_WARNING_PCT", "20")):
+            cycle_latency_class = "thin_reserve"
+
         log(
             f"cycle schedule: target={ИНТЕРВАЛ_ЦИКЛА_СЕК}s "
             f"elapsed={elapsed:.2f}s sleep={sleep_seconds:.2f}s "
@@ -628,7 +661,8 @@ def background(bybit_symbols, binance_symbols):
             "cycle_target_seconds": ИНТЕРВАЛ_ЦИКЛА_СЕК,
             "cycle_elapsed_seconds": round(elapsed, 2),
             "cycle_sleep_seconds": round(sleep_seconds, 2),
-            "cycle_reserve_pct": round((sleep_seconds / ИНТЕРВАЛ_ЦИКЛА_СЕК) * 100, 2) if ИНТЕРВАЛ_ЦИКЛА_СЕК else 0,
+            "cycle_reserve_pct": cycle_reserve_pct,
+            "cycle_latency_class": cycle_latency_class,
             "cycle_health": cycle_health,
             "overrun_streak": getattr(background, "_overrun_streak", 0),
         }
