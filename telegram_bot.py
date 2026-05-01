@@ -697,6 +697,32 @@ def _save_feedback(text: str) -> str:
 
     return f"✅ Feedback snapshot сохранён: {symbol}, rows={written}"
 
+def _file_status(path: Path, stale_minutes: int = 60) -> dict:
+    if not path.exists():
+        return {"status": "MISSING", "size": 0, "rows": 0, "age_min": None, "mtime": None}
+
+    size = path.stat().st_size
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    age_min = round((datetime.now(timezone.utc) - mtime).total_seconds() / 60.0, 1)
+
+    if size <= 0:
+        status = "EMPTY"
+    elif age_min > stale_minutes:
+        status = "STALE"
+    else:
+        status = "OK"
+
+    rows = 0
+    if path.suffix.lower() in {".csv", ".txt"}:
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                rows = max(sum(1 for _ in f) - 1, 0) if path.suffix.lower() == ".csv" else sum(1 for _ in f)
+        except Exception:
+            rows = -1
+
+    return {"status": status, "size": size, "rows": rows, "age_min": age_min, "mtime": mtime}
+
+
 def _build_downloads_text() -> str:
     files = [
         "market_research_bundle.zip",
@@ -713,10 +739,28 @@ def _build_downloads_text() -> str:
         "telegram_stage3_alert_history.csv",
         "telegram_pending_reset_stage3.json",
     ]
-    lines = ["⬇️ Скачать", "", "Только готовые файлы. Rebuild не запускается.", ""]
+
+    lines = [
+        "⬇️ Downloads / Snapshots",
+        "",
+        "Telegram не запускает rebuild. Только статус готовых файлов.",
+        "",
+    ]
+
     for name in files:
         path = ПАПКА_ДАННЫХ / name
-        lines.append(_fmt_file(path))
+        h = _file_status(path)
+        lines.append(
+            f"{h['status']} | {name} | size={h['size']} | rows={h['rows']} | "
+            f"latest={_short_ts(h['mtime'])} | age_min={h['age_min']}"
+        )
+
+    lines.extend([
+        "",
+        "Скачать: /download filename",
+        "Статусы: OK / EMPTY / STALE / MISSING",
+    ])
+
     return "\n".join(lines)
 
 
