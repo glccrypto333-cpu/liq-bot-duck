@@ -17,18 +17,58 @@ _offset = 0
 _export_lock = threading.Lock()
 
 
-def send_message(text: str) -> None:
+def _panel_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Панель", "callback_data": "panel"},
+                {"text": "Runtime", "callback_data": "runtime"},
+            ],
+            [
+                {"text": "Exports", "callback_data": "exports"},
+                {"text": "Reports", "callback_data": "reports"},
+            ],
+            [
+                {"text": "Bundle", "callback_data": "bundle"},
+                {"text": "Backup", "callback_data": "backup"},
+            ],
+        ]
+    }
+
+
+def send_message(text: str, reply_markup: dict | None = None) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     try:
         requests.post(
             f"{BASE}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            json=payload,
             timeout=30,
         )
     except Exception as exc:
         log(f"telegram send error: {exc}")
+
+
+def send_panel_message(text: str) -> None:
+    send_message(text, _panel_keyboard())
+
+
+def answer_callback(callback_id: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not callback_id:
+        return
+    try:
+        requests.post(
+            f"{BASE}/answerCallbackQuery",
+            json={"callback_query_id": callback_id},
+            timeout=20,
+        )
+    except Exception as exc:
+        log(f"telegram callback answer error: {exc}")
 
 
 def send_document(path: Path, caption: str | None = None) -> None:
@@ -278,10 +318,10 @@ def _rebuild_exports_locked(mode: str):
 
 def _handle(text: str) -> None:
     if text in {"/start", "/help"}:
-        send_message(_build_help_text())
+        send_message(_build_control_panel_text(), _panel_keyboard())
 
     elif text in {"/panel", "/control"}:
-        send_message(_build_control_panel_text())
+        send_message(_build_control_panel_text(), _panel_keyboard())
 
     elif text == "/runtime":
         send_message(_build_runtime_text())
@@ -353,6 +393,23 @@ def _handle(text: str) -> None:
             send_document(path, "research 30d bundle")
 
 
+
+def _handle_callback(callback_id: str, data: str) -> None:
+    answer_callback(callback_id)
+
+    if data == "panel":
+        send_message(_build_control_panel_text(), _panel_keyboard())
+    elif data == "runtime":
+        send_message(_build_runtime_text(), _panel_keyboard())
+    elif data == "exports":
+        send_message(_build_exports_text(), _panel_keyboard())
+    elif data == "reports":
+        send_document(_build_runtime_reports_zip(), "runtime reports bundle")
+    elif data == "bundle":
+        send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "quick bundle")
+    elif data == "backup":
+        send_message(_build_backup_text(), _panel_keyboard())
+
 def _reset() -> None:
     global _offset
 
@@ -385,6 +442,14 @@ def _loop() -> None:
 
             for item in response.json().get("result", []):
                 _offset = item["update_id"]
+                callback = item.get("callback_query") or {}
+                if callback:
+                    _handle_callback(
+                        callback.get("id", ""),
+                        callback.get("data", ""),
+                    )
+                    continue
+
                 text = (item.get("message", {}) or {}).get("text", "")
 
                 if text:

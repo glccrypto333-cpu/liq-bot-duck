@@ -48,7 +48,7 @@ from market_oi_slope_engine import rebuild_oi_slope
 from market_phase_engine import rebuild_market_phase
 from market_phase_source import rebuild_market_phase_source
 from export_engine import rebuild_exports
-from telegram_bot import start_polling, send_message
+from telegram_bot import start_polling, send_panel_message
 from runtime_mode import runtime_mode_text
 
 
@@ -728,11 +728,11 @@ def main():
     start_polling()
     log("Telegram polling стартовал")
 
-    send_message(
+    send_panel_message(
         СТАРТОВОЕ_СООБЩЕНИЕ.format(
             version=APP_VERSION,
             retention=ДНЕЙ_ХРАНЕНИЯ,
-            commands=КОМАНДЫ,
+            started_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         )
     )
     log("Telegram OK")
