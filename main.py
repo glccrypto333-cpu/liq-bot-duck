@@ -113,6 +113,7 @@ def _collect_binance_symbol(symbol: str):
 
 
 def collect(symbols_bybit, symbols_binance):
+    collect_started = time.time()
     oi_rows, price_rows, volume_rows = [], [], []
     failures = []
     now = datetime.now(timezone.utc)
@@ -181,12 +182,21 @@ def collect(symbols_bybit, symbols_binance):
                 record_failure(exchange, symbol, data_type, exc)
 
     binance_seconds = time.time() - binance_started
+    collect_seconds = time.time() - collect_started
     slow_side = "bybit" if bybit_seconds > binance_seconds else "binance"
+    collect_health = "ok"
+    if collect_seconds > 120:
+        collect_health = "critical"
+    elif collect_seconds > 90:
+        collect_health = "slow"
 
     upsert_oi(oi_rows)
     upsert_price(price_rows)
     upsert_volume(volume_rows)
     replace_request_failures(failures)
+
+    if collect_health != "ok":
+        log(f"COLLECT_{collect_health.upper()} elapsed={collect_seconds:.2f}s slow_side={slow_side}")
 
     log(
         f"collect ok: oi={len(oi_rows)} price={len(price_rows)} volume={len(volume_rows)} "
@@ -197,7 +207,9 @@ def collect(symbols_bybit, symbols_binance):
         f"binance_symbols={len(binance_collect_symbols)} "
         f"binance_workers={workers} "
         f"binance_seconds={binance_seconds:.2f} "
-        f"slow_side={slow_side}"
+        f"collect_seconds={collect_seconds:.2f} "
+        f"slow_side={slow_side} "
+        f"collect_health={collect_health}"
     )
 
 
