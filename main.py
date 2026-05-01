@@ -139,6 +139,7 @@ def collect(symbols_bybit, symbols_binance):
         return local_oi, local_price, local_volume
 
     bybit_workers = max(1, BYBIT_COLLECT_WORKERS)
+    bybit_started = time.time()
 
     with ThreadPoolExecutor(max_workers=bybit_workers) as executor:
         futures = [
@@ -152,6 +153,8 @@ def collect(symbols_bybit, symbols_binance):
             price_rows.extend(local_price)
             volume_rows.extend(local_volume)
 
+    bybit_seconds = time.time() - bybit_started
+
     binance_collect_symbols = (
         symbols_binance
         if ЛИМИТ_СИМВОЛОВ_BINANCE <= 0
@@ -159,6 +162,7 @@ def collect(symbols_bybit, symbols_binance):
     )
 
     workers = max(1, BINANCE_COLLECT_WORKERS)
+    binance_started = time.time()
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
@@ -176,6 +180,9 @@ def collect(symbols_bybit, symbols_binance):
             for exchange, symbol, data_type, exc in symbol_failures:
                 record_failure(exchange, symbol, data_type, exc)
 
+    binance_seconds = time.time() - binance_started
+    slow_side = "bybit" if bybit_seconds > binance_seconds else "binance"
+
     upsert_oi(oi_rows)
     upsert_price(price_rows)
     upsert_volume(volume_rows)
@@ -186,8 +193,11 @@ def collect(symbols_bybit, symbols_binance):
         f"request_failures={len(failures)} "
         f"bybit_symbols={len(bybit_collect_symbols)} "
         f"bybit_workers={bybit_workers} "
+        f"bybit_seconds={bybit_seconds:.2f} "
         f"binance_symbols={len(binance_collect_symbols)} "
-        f"binance_workers={workers}"
+        f"binance_workers={workers} "
+        f"binance_seconds={binance_seconds:.2f} "
+        f"slow_side={slow_side}"
     )
 
 
