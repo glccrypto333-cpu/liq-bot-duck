@@ -517,7 +517,7 @@ def _build_phases_text(phase: int | None = None) -> str:
     if not rows:
         return f"{title}\n\nСейчас монет в фазе нет."
 
-    lines = [title, "Метрики скрыты в карточке: /coin SYMBOL", ""]
+    lines = [title, "Детали: /coin SYMBOL", ""]
     for r in rows:
         symbol = r.get("symbol")
         tf = r.get("timeframe")
@@ -586,7 +586,7 @@ def _build_top_oi_text(timeframe: str | None = None, exchange: str | None = None
     if not rows:
         return f"{title}\n\nНет строк в market_oi_slope."
 
-    lines = [title, "_с момента расчёта бота_"]
+    lines = [title, "_market_oi_slope snapshot_"]
 
     for i, r in enumerate(rows, 1):
         symbol = r.get("symbol")
@@ -1256,13 +1256,13 @@ def _handle(text: str, chat_id=None) -> None:
     elif text in {"/phases", "⚙️ Фазы"}:
         send_message(_build_phases_text(), _phases_keyboard())
 
-    elif text in {"/phase1", "🥉 Stage 1", "🥉 Фаза 1"}:
+    elif text in {"/phase1", "🥉 Фаза 1"}:
         send_message(_build_phases_text(1), _phases_keyboard())
 
-    elif text in {"/phase2", "🥈 Stage 2", "🥈 Фаза 2"}:
+    elif text in {"/phase2", "🥈 Фаза 2"}:
         send_message(_build_phases_text(2), _phases_keyboard())
 
-    elif text in {"/phase3", "🥇 Stage 3", "🥇 Фаза 3"}:
+    elif text in {"/phase3", "🥇 Фаза 3"}:
         send_message(_build_stage3_text(), _phases_keyboard())
 
     elif text in {"/top_oi", "📈 ТОП OI", "📈 Топ ОИ"}:
@@ -1326,12 +1326,6 @@ def _handle(text: str, chat_id=None) -> None:
 
     elif text.startswith("/download "):
         _send_download(text.split(maxsplit=1)[1].strip())
-
-    elif text in {"/reports", "📄 Reports"}:
-        send_document(_build_runtime_reports_zip(), "runtime reports bundle")
-
-    elif text in {"/bundle"}:
-        send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "quick bundle")
 
     elif text in {"/quarantine", "🧱 Quarantine"} or text.startswith("/quarantine "):
         _handle_quarantine(text, chat_id)
