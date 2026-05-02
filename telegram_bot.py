@@ -59,8 +59,9 @@ def _stage3_reset_keyboard() -> dict:
 def _top_oi_keyboard() -> dict:
     return {
         "keyboard": [
-            ["15м", "30м"],
-            ["4ч", "24ч"],
+            ["🏆 BINANCE /30м", "🏆 BYBIT /30м"],
+            ["🏆 BINANCE /4ч", "🏆 BYBIT /4ч"],
+            ["🏆 BINANCE /24ч", "🏆 BYBIT /24ч"],
             ["⬅️ Назад"],
         ],
         "resize_keyboard": True,
@@ -404,7 +405,7 @@ def _symbol_links(symbol: str, exchange=None) -> str:
     by = f"https://www.bybit.com/trade/usdt/{sym}"
     bn = f"https://www.binance.com/en/futures/{sym}"
     ex_url = by if ex_code == "BY" else bn
-    return f'🔗 <a href="{cg}">CG</a> | <a href="{ex_url}">{ex_code}</a> | <code>{sym}</code>'
+    return f'<a href="{cg}">CG</a> | <a href="{ex_url}">{ex_code}</a> | <code>{sym}</code>'
 
 
 def _short_ts(value) -> str:
@@ -539,64 +540,71 @@ def _build_stage3_text() -> str:
     return _build_phases_text(3)
 
 
-def _build_top_oi_text(timeframe: str | None = None) -> str:
-    timeframe = _tf_sql(timeframe)
+def _build_top_oi_text(timeframe: str | None = None, exchange: str | None = None) -> str:
+    timeframe = _tf_sql(timeframe) if timeframe else None
+    exchange = str(exchange or "").upper().strip() or None
 
-    where = ""
     params = []
+    where = ["stage >= 1"]
+
+    if exchange in {"BINANCE", "BYBIT"}:
+        where.append("exchange = %s")
+        params.append(exchange)
 
     if timeframe in {"15м", "30м", "1ч"}:
-        tf_aliases = {
+        aliases = {
             "15м": ["15м", "15m"],
             "30м": ["30м", "30m"],
             "1ч": ["1ч", "1h"],
         }[timeframe]
-        where = "WHERE timeframe = ANY(%s)"
-        params.append(tf_aliases)
+        where.append("timeframe = ANY(%s)")
+        params.append(aliases)
 
     elif timeframe == "4ч":
-        where = "WHERE oi_trend_4h IS NOT NULL AND oi_trend_4h <> ''"
+        where.append("oi_trend_4h IS NOT NULL AND oi_trend_4h <> ''")
 
     elif timeframe == "24ч":
-        where = "WHERE oi_trend_24h IS NOT NULL AND oi_trend_24h <> ''"
+        where.append("oi_trend_24h IS NOT NULL AND oi_trend_24h <> ''")
+
+    where_sql = "WHERE " + " AND ".join(where)
 
     rows = _safe_rows(f"""
-        SELECT *
+        SELECT DISTINCT ON (exchange, symbol)
+               exchange, symbol, timeframe, stage, stage_name,
+               oi_delta_pct, oi_acceleration, oi_structure,
+               oi_trend_15m, oi_trend_30m, oi_trend_1h, oi_trend_4h, oi_trend_24h,
+               ts_close
         FROM market_oi_slope
-        {where}
-        ORDER BY ABS(oi_delta_pct) DESC, ABS(oi_acceleration) DESC, oi_priority ASC
-        LIMIT 30
+        {where_sql}
+        ORDER BY exchange, symbol, ABS(oi_delta_pct) DESC, ABS(oi_acceleration) DESC, ts_close DESC
+        LIMIT 80
     """, tuple(params))
 
-    latest = _safe_rows("SELECT MAX(ts_close) AS latest FROM market_oi_slope")
-    latest_ts = latest[0].get("latest") if latest else None
+    rows = sorted(
+        rows,
+        key=lambda r: (abs(float(r.get("oi_delta_pct") or 0)), abs(float(r.get("oi_acceleration") or 0))),
+        reverse=True,
+    )[:10]
 
-    title = f"📈 ТОП OI {timeframe}" if timeframe else "📈 ТОП OI"
+    ex_title = exchange or "ALL"
+    tf_title = timeframe or "ALL"
+    title = f"🏆 TOP OI за {tf_title} — {ex_title}"
 
     if not rows:
-        return f"{title}\n\nНет строк в market_oi_slope для этого фильтра."
+        return f"{title}\n\nНет строк в market_oi_slope."
 
-    lines = [
-        title,
-        _health_banner_for_table("market_oi_slope", "ts_close"),
-        f"latest_ts={_short_ts(latest_ts)}",
-        "",
-    ]
+    lines = [title, "<i>с момента расчёта бота</i>"]
 
-    for r in rows:
-        ex = r.get("exchange")
+    for i, r in enumerate(rows, 1):
         symbol = r.get("symbol")
-        tf = r.get("timeframe")
+        ex = r.get("exchange")
+        oi = _fmt_pct(r.get("oi_delta_pct"))
+        acc = _fmt_pct(r.get("oi_acceleration"))
+        links = _symbol_links(symbol, ex)
 
-        lines.extend([
-            f"{symbol} [{tf}]",
-            _symbol_links(symbol, ex),
-            f"stage={r.get('stage')} {r.get('stage_name')} | OI={_fmt_pct(r.get('oi_delta_pct'))} | acc={_fmt_pct(r.get('oi_acceleration'))}",
-            f"structure={r.get('oi_structure')} | priority={r.get('oi_priority')} | hold={r.get('oi_hold_state')}",
-            f"trend 15м={r.get('oi_trend_15m')} | 30м={r.get('oi_trend_30m')} | 1ч={r.get('oi_trend_1h')} | 4ч={r.get('oi_trend_4h')} | 24ч={r.get('oi_trend_24h')}",
-            f"/coin {symbol}",
-            "",
-        ])
+        lines.append(
+            f"{i}. <b>{_html_escape(symbol)}</b> — OI {oi} | acc {acc} [{links}]"
+        )
 
     return "\n".join(lines)
 
@@ -1202,6 +1210,7 @@ def check_stage3_alerts() -> int:
         SELECT *
         FROM market_phase
         WHERE phase = 3
+          AND COALESCE(phase_status, '') IN ('active', 'holding')
         ORDER BY phase_updated_at DESC
         LIMIT 50
     """)
@@ -1213,7 +1222,7 @@ def check_stage3_alerts() -> int:
             str(r.get("exchange")),
             str(r.get("symbol")),
             str(r.get("timeframe")),
-            str(r.get("phase_started_at") or r.get("phase_updated_at")),
+            "phase=3",
         ])
 
         if key in alerted:
@@ -1275,6 +1284,25 @@ def _handle(text: str, chat_id=None) -> None:
 
     elif text in {"🧱 Карантин", "🧱 Quarantine", "/quarantine"}:
         send_message(_build_quarantine_status_text(), _main_keyboard())
+
+
+    elif text in {"🏆 BINANCE /30м", "🏆 BINANCE /30m"}:
+        send_message(_build_top_oi_text("30м", "BINANCE"), _top_oi_keyboard())
+
+    elif text in {"🏆 BYBIT /30м", "🏆 BYBIT /30m"}:
+        send_message(_build_top_oi_text("30м", "BYBIT"), _top_oi_keyboard())
+
+    elif text in {"🏆 BINANCE /4ч", "🏆 BINANCE /4h"}:
+        send_message(_build_top_oi_text("4ч", "BINANCE"), _top_oi_keyboard())
+
+    elif text in {"🏆 BYBIT /4ч", "🏆 BYBIT /4h"}:
+        send_message(_build_top_oi_text("4ч", "BYBIT"), _top_oi_keyboard())
+
+    elif text in {"🏆 BINANCE /24ч", "🏆 BINANCE /24h"}:
+        send_message(_build_top_oi_text("24ч", "BINANCE"), _top_oi_keyboard())
+
+    elif text in {"🏆 BYBIT /24ч", "🏆 BYBIT /24h"}:
+        send_message(_build_top_oi_text("24ч", "BYBIT"), _top_oi_keyboard())
 
     elif text.startswith("/top_oi "):
         send_message(
