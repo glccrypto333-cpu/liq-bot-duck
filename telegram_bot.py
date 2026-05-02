@@ -389,23 +389,14 @@ def _exchange_code(exchange) -> str:
     return "BY" if str(exchange).upper() == "BYBIT" else "BN"
 
 
-def _html_escape(v) -> str:
-    return (
-        str(v or "")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
 def _symbol_links(symbol: str, exchange=None) -> str:
-    sym = _html_escape(str(symbol).upper())
+    sym = str(symbol or "").upper()
     ex_code = _exchange_code(exchange)
     cg = f"https://www.coinglass.com/tv/Binance_{sym}"
     by = f"https://www.bybit.com/trade/usdt/{sym}"
     bn = f"https://www.binance.com/en/futures/{sym}"
     ex_url = by if ex_code == "BY" else bn
-    return f'<a href="{cg}">CG</a> | <a href="{ex_url}">{ex_code}</a> | <code>{sym}</code>'
+    return f'[CG]({cg}) | [{ex_code}]({ex_url}) | `{sym}`'
 
 
 def _short_ts(value) -> str:
@@ -530,7 +521,7 @@ def _build_phases_text(phase: int | None = None) -> str:
         tf = r.get("timeframe")
         ex = r.get("exchange")
         lines.append(f"{symbol} [{tf}]")
-        lines.append(f"{_symbol_links(symbol, ex)} | /coin {symbol} | /feedback {symbol} текст")
+        lines.append(f"🔗 {_symbol_links(symbol, ex)} | /coin {symbol} | /feedback {symbol} текст")
         lines.append("")
 
     return "\n".join(lines)
@@ -593,7 +584,7 @@ def _build_top_oi_text(timeframe: str | None = None, exchange: str | None = None
     if not rows:
         return f"{title}\n\nНет строк в market_oi_slope."
 
-    lines = [title, "<i>с момента расчёта бота</i>"]
+    lines = [title, "_с момента расчёта бота_"]
 
     for i, r in enumerate(rows, 1):
         symbol = r.get("symbol")
@@ -603,7 +594,7 @@ def _build_top_oi_text(timeframe: str | None = None, exchange: str | None = None
         links = _symbol_links(symbol, ex)
 
         lines.append(
-            f"{i}. <b>{_html_escape(symbol)}</b> — OI {oi} | acc {acc} [{links}]"
+            f"{i}. `{symbol}` — OI {oi} | acc {acc} | {links}"
         )
 
     return "\n".join(lines)
