@@ -308,16 +308,17 @@ def _build_help_text() -> str:
     return "\n".join([
         "❓ Помощь",
         "",
-        "Главные разделы:",
+        "Меню:",
         "⚙️ Фазы — Фаза 1 / Фаза 2 / Фаза 3 / Сброс фазы 3",
-        "📈 Топ ОИ — 15м / 30м / 4ч / 24ч",
-        "⬇️ Скачать — файлы проекта по отдельности",
-        "🧱 Карантин — list / add / remove / history / status",
+        "📈 Топ ОИ — BINANCE/BYBIT 30м / 4ч / 24ч",
+        "⬇️ Скачать — файлы по кнопкам",
+        "🧱 Карантин — управление видимостью/alerts",
         "",
         "Команды:",
         "/phases",
         "/phase1 /phase2 /phase3",
-        "/top_oi 15м | 30м | 4ч | 24ч",
+        "/top_oi BINANCE 30м",
+        "/top_oi BYBIT 4ч",
         "/coin SYMBOL",
         "/feedback SYMBOL текст",
         "/feedback SYMBOL TF текст",
@@ -327,7 +328,8 @@ def _build_help_text() -> str:
         "/download filename",
         "/health",
         "",
-        "Правило: списки фаз показывают только монеты. Метрики открываются через /coin.",
+        "Фазы читаются только из market_phase.",
+        "Метрики открываются через /coin SYMBOL.",
     ])
 
 
@@ -598,6 +600,21 @@ def _build_top_oi_text(timeframe: str | None = None, exchange: str | None = None
         )
 
     return "\n".join(lines)
+
+
+
+def _latest_metric_row(table: str, symbol: str, exchange: str, timeframe: str) -> dict:
+    ts_col = "phase_updated_at" if table == "market_phase" else "ts_close"
+    rows = _safe_rows(f"""
+        SELECT *
+        FROM {table}
+        WHERE symbol = %s
+          AND exchange = %s
+          AND timeframe = %s
+        ORDER BY {ts_col} DESC
+        LIMIT 1
+    """, (symbol, exchange, timeframe))
+    return rows[0] if rows else {}
 
 
 def _build_coin_card(symbol: str) -> str:
@@ -1236,12 +1253,6 @@ def _handle(text: str, chat_id=None) -> None:
     elif text in {"/panel", "/control"}:
         send_message(_build_control_panel_text(), _main_keyboard())
 
-    elif text in {"/runtime", "🧭 Runtime"}:
-        send_message(_build_runtime_text(), _main_keyboard())
-
-    elif text in {"/status", "📊 Статус"}:
-        send_message(_build_status_text(), _main_keyboard())
-
     elif text in {"/phases", "⚙️ Фазы"}:
         send_message(_build_phases_text(), _phases_keyboard())
 
@@ -1255,7 +1266,7 @@ def _handle(text: str, chat_id=None) -> None:
         send_message(_build_stage3_text(), _phases_keyboard())
 
     elif text in {"/top_oi", "📈 ТОП OI", "📈 Топ ОИ"}:
-        send_message(_build_top_oi_text(), _top_oi_keyboard())
+        send_message("📈 Топ ОИ\n\nВыбери биржу и окно ниже.", _top_oi_keyboard())
 
 
     elif text in {"⬅️ Назад", "/menu"}:
@@ -1310,9 +1321,6 @@ def _handle(text: str, chat_id=None) -> None:
     elif text.startswith("/feedback "):
         send_message(_save_feedback(text), _main_keyboard())
 
-    elif text in {"/exports", "📦 Exports"}:
-        send_message(_build_exports_text(), _main_keyboard())
-
     elif text in {"/downloads", "⬇️ Скачать"}:
         send_message(_build_downloads_text(), _downloads_keyboard())
 
@@ -1324,9 +1332,6 @@ def _handle(text: str, chat_id=None) -> None:
 
     elif text in {"/bundle"}:
         send_document(ПАПКА_ДАННЫХ / "market_research_bundle.zip", "quick bundle")
-
-    elif text in {"/backup", "🔒 Backup"}:
-        send_message(_build_backup_text(), _main_keyboard())
 
     elif text in {"/quarantine", "🧱 Quarantine"} or text.startswith("/quarantine "):
         _handle_quarantine(text, chat_id)
