@@ -868,6 +868,14 @@ def _build_downloads_text() -> str:
 
 
 def _send_download(name: str) -> None:
+    if name == "backup_latest":
+        last = _latest_archive_entry("backup_db")
+        if not last or not last.get("file"):
+            send_message("Файл backup_latest не найден.", _main_keyboard())
+            return
+        send_document(Path(last["file"]), "latest postgres backup")
+        return
+
     allowed = {
         "bundle": "market_research_bundle.zip",
         "reports": "runtime_reports.zip",
@@ -885,7 +893,6 @@ def _send_download(name: str) -> None:
         send_message("Формат: /download bundle|reports|manifest|health|timing|failures|gaps|active|feedback|quarantine", _main_keyboard())
         return
     send_document(ПАПКА_ДАННЫХ / filename, filename)
-
 
 def _quarantine_path() -> Path:
     return ПАПКА_ДАННЫХ / "telegram_quarantine.csv"
