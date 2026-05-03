@@ -326,6 +326,9 @@ def _build_help_text() -> str:
         "/confirm_reset SYMBOL TF",
         "/cancel_reset",
         "/download filename",
+        "/backup_db",
+        "/archive",
+        "/download backup_latest",
         "/health",
         "",
         "Фазы читаются только из market_phase.",
@@ -1254,6 +1257,103 @@ def check_stage3_alerts() -> int:
 
 
 
+
+def _archive_index_path() -> Path:
+    return Path("archive") / "manifests" / "archive_index.json"
+
+
+def _read_archive_index() -> list[dict]:
+    p = _archive_index_path()
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _latest_archive_entry(kind: str | None = None) -> dict | None:
+    rows = _read_archive_index()
+    if kind:
+        rows = [r for r in rows if r.get("type") == kind]
+    return rows[-1] if rows else None
+
+
+def _build_archive_text() -> str:
+    rows = _read_archive_index()
+    if not rows:
+        return "🗂 Archive\n\nПока manifest пуст."
+
+    last = rows[-1]
+    backups = [r for r in rows if r.get("type") == "backup_db"]
+    last_backup = backups[-1] if backups else None
+
+    lines = [
+        "🗂 Archive",
+        "",
+        f"entries={len(rows)}",
+    ]
+
+    if last_backup:
+        lines += [
+            "",
+            "Last DB backup:",
+            f"status={last_backup.get('status')}",
+            f"file={last_backup.get('file')}",
+            f"size_mb={last_backup.get('size_mb')}",
+            f"duration_sec={last_backup.get('duration_sec')}",
+            f"finished_at={last_backup.get('finished_at')}",
+        ]
+
+    lines += [
+        "",
+        "Commands:",
+        "/backup_db",
+        "/download backup_latest",
+    ]
+
+    return "\n".join(lines)
+
+
+def _run_backup_db() -> str:
+    lock = Path("archive") / "locks" / "heavy_job.lock"
+
+    if lock.exists():
+        return f"⛔ Heavy job уже идёт\n\nlock={lock}"
+
+    send_message("⏳ DB backup started\n\nЭто heavy job. Runtime не трогаем.")
+
+    started = time.time()
+
+    proc = subprocess.run(
+        ["python3", "backup_db.py"],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+
+    duration = round(time.time() - started, 2)
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "")[-3000:]
+        return f"❌ DB backup failed\n\nduration_sec={duration}\n\n{err}"
+
+    last = _latest_archive_entry("backup_db")
+    if not last:
+        return f"⚠️ Backup finished, но manifest не найден\nduration_sec={duration}"
+
+    return "\n".join([
+        "✅ DB backup complete",
+        "",
+        f"file={last.get('file')}",
+        f"size_mb={last.get('size_mb')}",
+        f"duration_sec={last.get('duration_sec')}",
+        f"total_runtime_sec={duration}",
+        f"finished_at={last.get('finished_at')}",
+    ])
+
+
 def _handle(text: str, chat_id=None) -> None:
     text = text.strip()
 
@@ -1336,6 +1436,12 @@ def _handle(text: str, chat_id=None) -> None:
 
     elif text.startswith("/download "):
         _send_download(text.split(maxsplit=1)[1].strip())
+
+    elif text == "/backup_db":
+        send_message(_run_backup_db(), _main_keyboard())
+
+    elif text == "/archive":
+        send_message(_build_archive_text(), _main_keyboard())
 
     elif text in {"/quarantine", "🧱 Quarantine"} or text.startswith("/quarantine "):
         _handle_quarantine(text, chat_id)
