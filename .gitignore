@@ -22,3 +22,5 @@ archive/exports/
 archive/tmp/
 archive/locks/
 archive/manifests/archive_index.json
+archive/test/
+archive/manifests/
