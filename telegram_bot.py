@@ -311,7 +311,7 @@ def _build_help_text() -> str:
         "Меню:",
         "⚙️ Фазы — Фаза 1 / Фаза 2 / Фаза 3 / Сброс фазы 3",
         "📈 Топ ОИ — BINANCE/BYBIT 30м / 4ч / 24ч",
-        "⬇️ Скачать — файлы по кнопкам",
+        "⬇️ Скачать — файлы по кнопкам + OK/STALE/EMPTY/MISSING",
         "🧱 Карантин — управление видимостью/alerts",
         "",
         "Команды:",
@@ -851,7 +851,17 @@ def _file_status(path: Path, stale_minutes: int = 60) -> dict:
 
 
 def _build_downloads_text() -> str:
-    return "⬇️ Скачать файлы\n\nВыбери файл кнопкой ниже."
+    lines = ["⬇️ Скачать файлы", "", "Статус runtime files:"]
+    for alias, filename in _download_files():
+        path = ПАПКА_ДАННЫХ / filename
+        st = _file_status(path)
+        age = "—" if st.get("age_min") is None else f'{st.get("age_min"):.1f}m'
+        size = st.get("size", 0)
+        rows = st.get("rows", 0)
+        lines.append(
+            f"/download {alias} — {st.get('status')} | rows={rows} | age={age} | size={size}"
+        )
+    return "\n".join(lines)
 
 
 def _send_download(name: str) -> None:
