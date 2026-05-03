@@ -15,3 +15,10 @@ runtime/fast_snapshot/
 runtime/*.zip
 runtime/*.csv
 runtime/rebuild.lock
+
+# heavy archive / backups
+archive/backups/
+archive/exports/
+archive/tmp/
+archive/locks/
+archive/manifests/archive_index.json
