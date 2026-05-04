@@ -24,3 +24,13 @@ archive/locks/
 archive/manifests/archive_index.json
 archive/test/
 archive/manifests/
+
+# VPS production local files
+.env
+.env.*
+logs/
+runtime/
+runtime_reports/
+__pycache__/
+*.pyc
+scripts/
