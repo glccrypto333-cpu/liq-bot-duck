@@ -151,14 +151,12 @@ def _confidence(phase: int, oi_priority, oi_structure, volume_structure, price_s
 
 def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
     oi_structure = _v(row, "oi_structure")
-    oi_priority = _as_int(_v(row, "oi_priority", 5))
     oi_hold_state = _v(row, "oi_hold_state")
     oi_trend_15m = _v(row, "oi_trend_15m")
     oi_trend_30m = _v(row, "oi_trend_30m")
     oi_trend_1h = _v(row, "oi_trend_1h")
     oi_trend_4h = _v(row, "oi_trend_4h")
     price_structure = _v(row, "price_structure")
-    volume_structure = _v(row, "volume_structure")
 
     price_hard_block = price_structure in HARD_BAD_PRICE
 
@@ -168,40 +166,33 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
     stage1_age_ok = _age_ok(stage1_started_at, now, STAGE1_MIN_AGE)
     stage2_age_ok = _age_ok(stage2_started_at, now, STAGE2_MIN_AGE)
 
-    # oi_structure больше не управляет фазами напрямую.
-    # CORE:
-    # oi_priority
-    # oi_trend_15m
-    # oi_trend_30m
-    # oi_trend_1h
-    # oi_trend_4h
-    # oi_hold_state
+    # CORE STRICT:
+    # phase decision uses only OI trend / OI structure / OI hold.
+    # oi_priority is NOT a phase driver.
+    # price is only a hard stop-filter, not an upgrade driver.
 
-    # Жесткий фильтр: priority=0 не может быть Stage 1/2/3.
-    if oi_priority <= 0:
-        return 0, f"dead_oi_priority={oi_priority}"
+    if oi_trend_1h in {"нисходящий", "снижение", "strong_down", "down"}:
+        return 0, f"oi_downtrend_1h={oi_trend_1h}"
 
-    # Price сам не управляет фазой, но хаос без OI-поддержки отправляет в 0.
-    if price_structure in BAD_PRICE and oi_priority >= 4:
-        return 0, f"bad_price_without_oi_support price={price_structure} oi_priority={oi_priority}"
+    if oi_trend_4h in {"strong_down", "down", "нисходящий", "снижение"}:
+        return 0, f"oi_downtrend_4h={oi_trend_4h}"
 
-    # 2 -> 3: только после Stage 2 >= 15 минут.
+    # 2 -> 3: only from Stage 2 after minimum age, by strong OI slope + real hold.
     stage3_ok = (
         prev_phase == 2
         and stage2_age_ok
-        and oi_priority <= 2
         and oi_structure not in STAGE3_BLOCKED_OI
         and oi_trend_15m in STRONG_OI_TRENDS
         and oi_trend_30m in POSITIVE_OI_TRENDS
         and oi_trend_1h in POSITIVE_OI_TRENDS
         and oi_hold_state in REAL_HOLD
-        and oi_trend_4h not in {"strong_down", "down", "нисходящий"}
+        and not price_hard_block
     )
 
     if stage3_ok:
-        return 3, "stage2_to_stage3: stage2_age_ok strong_oi_slope quality_ok"
+        return 3, "stage2_to_stage3: stage2_age_ok strong_oi_slope real_hold"
 
-    # 1 -> 2: Stage 1 >= 1 час, OI P1/P2/P3, slope устойчивый или есть удержание.
+    # 1 -> 2 / hold 2: OI trend is positive and real hold exists.
     stage2_ok = (
         prev_phase in {1, 2}
         and (
@@ -211,7 +202,6 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
                 and stage1_age_ok
             )
         )
-        and oi_priority <= 3
         and oi_structure not in STAGE2_BLOCKED_OI
         and oi_trend_1h in POSITIVE_OI_TRENDS
         and oi_hold_state in REAL_HOLD
@@ -219,13 +209,13 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
     )
 
     if stage2_ok:
-        return 2, "stage1_to_stage2_or_hold: stage1_age_ok oi_slope_and_real_hold"
+        return 2, "stage1_to_stage2_or_hold: oi_slope_and_real_hold"
 
     if prev_phase == 2 and oi_structure in STAGE2_DOWNGRADE_TO_0:
         return 0, f"downgrade_stage2_to_stage0: bad_oi_structure={oi_structure}"
 
     if prev_phase == 2 and price_hard_block:
-        return 1, f"downgrade_stage2_to_stage1: hard_price_block_possible_squeeze={price_structure}"
+        return 1, f"downgrade_stage2_to_stage1: hard_price_stop_filter={price_structure}"
 
     if prev_phase == 2 and oi_structure in STAGE2_DOWNGRADE_TO_1:
         return 1, f"downgrade_stage2_to_stage1: weak_oi_structure={oi_structure}"
@@ -233,23 +223,17 @@ def _decide_phase(prev_phase: int, row, now: datetime) -> tuple[int, str]:
     if prev_phase == 2 and oi_hold_state not in REAL_HOLD:
         return 1, f"downgrade_stage2_to_stage1: hold_lost={oi_hold_state}"
 
-    # 2 -> 1: ОИ остыл, но мусора нет.
-    if prev_phase == 2 and oi_priority in {2, 3, 4}:
-        return 1, "downgrade_stage2_to_stage1: oi_cooled_but_alive"
-
-    # 0 -> 1: только живой OI, не спокойный боковик.
+    # 0 -> 1 / hold 1: first OI interest. No oi_priority.
     stage1_ok = (
-        oi_priority in {1, 2, 3}
-        and oi_trend_1h in POSITIVE_OI_TRENDS
-        and oi_trend_4h not in {"strong_down", "down", "нисходящий", "снижение"}
-        and price_structure in OK_PRICE
+        oi_trend_1h in POSITIVE_OI_TRENDS
+        and oi_structure not in BAD_OI
+        and not price_hard_block
     )
 
     if stage1_ok:
-        return 1, "stage0_to_stage1: oi_priority_alive_price_not_bad"
+        return 1, "stage0_to_stage1_or_hold: oi_1h_positive"
 
-    return 0, "no_valid_phase_conditions"
-
+    return 0, "no_valid_oi_phase_conditions"
 
 def rebuild_market_phase() -> int:
     now = datetime.now(timezone.utc)
@@ -259,25 +243,8 @@ def rebuild_market_phase() -> int:
             SELECT DISTINCT ON (exchange, symbol, timeframe)
                 *
             FROM market_oi_slope
+            WHERE ts_close >= NOW() - INTERVAL '12 hours'
             ORDER BY exchange, symbol, timeframe, ts_close DESC
-        ),
-        latest_price AS (
-            SELECT DISTINCT ON (exchange, symbol, timeframe)
-                *
-            FROM market_price_state
-            ORDER BY exchange, symbol, timeframe, ts_close DESC
-        ),
-        latest_volume AS (
-            SELECT DISTINCT ON (exchange, symbol, timeframe)
-                *
-            FROM market_volume_state
-            ORDER BY exchange, symbol, timeframe, ts_close DESC
-        ),
-        prev_phase AS (
-            SELECT DISTINCT ON (exchange, symbol, timeframe)
-                *
-            FROM market_phase
-            ORDER BY exchange, symbol, timeframe, phase_updated_at DESC NULLS LAST
         )
         SELECT
             oi.exchange,
@@ -309,11 +276,27 @@ def rebuild_market_phase() -> int:
             vo.volume_quality,
             vo.volume_hold_state
         FROM latest_oi oi
-        LEFT JOIN latest_price pr
-          ON pr.exchange=oi.exchange AND pr.symbol=oi.symbol AND pr.timeframe=oi.timeframe
-        LEFT JOIN latest_volume vo
-          ON vo.exchange=oi.exchange AND vo.symbol=oi.symbol AND vo.timeframe=oi.timeframe
-        LEFT JOIN prev_phase pp
+        LEFT JOIN LATERAL (
+            SELECT price_structure, price_quality, price_slope_state
+            FROM market_price_state pr
+            WHERE pr.exchange = oi.exchange
+              AND pr.symbol = oi.symbol
+              AND pr.timeframe = oi.timeframe
+              AND pr.ts_close >= NOW() - INTERVAL '12 hours'
+            ORDER BY pr.ts_close DESC
+            LIMIT 1
+        ) pr ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT volume_structure, volume_quality, volume_hold_state
+            FROM market_volume_state vo
+            WHERE vo.exchange = oi.exchange
+              AND vo.symbol = oi.symbol
+              AND vo.timeframe = oi.timeframe
+              AND vo.ts_close >= NOW() - INTERVAL '12 hours'
+            ORDER BY vo.ts_close DESC
+            LIMIT 1
+        ) vo ON TRUE
+        LEFT JOIN market_phase pp
           ON pp.exchange=oi.exchange AND pp.symbol=oi.symbol AND pp.timeframe=oi.timeframe
     """)
 

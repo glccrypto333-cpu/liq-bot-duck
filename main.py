@@ -450,15 +450,20 @@ def background(bybit_symbols, binance_symbols):
             _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
             collect_seconds = next((seconds for name, seconds in timings if name == "collect"), 0.0)
 
+            stop_reason = None
+
             if os.getenv("SKIP_HEAVY_AGGREGATES") == "1":
                 agg_count = -1
-                log("aggregates skipped: SKIP_HEAVY_AGGREGATES=1")
+                stop_reason = "SKIP_HEAVY_AGGREGATES=1"
+                log("DECISION_PIPELINE_STOP reason=SKIP_HEAVY_AGGREGATES=1")
             elif collect_seconds > MAX_COLLECT_SECONDS_FOR_AGGREGATES:
                 agg_count = -1
-                log(f"aggregates skipped: collect too slow {collect_seconds:.2f}s > {MAX_COLLECT_SECONDS_FOR_AGGREGATES}s")
+                stop_reason = f"collect too slow {collect_seconds:.2f}s > {MAX_COLLECT_SECONDS_FOR_AGGREGATES}s"
+                log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
             elif cycle_no % max(1, AGGREGATES_EVERY_CYCLES) != 0:
                 agg_count = -1
-                log(f"aggregates skipped: scheduled every {AGGREGATES_EVERY_CYCLES} cycles")
+                stop_reason = f"aggregates scheduled skip every {AGGREGATES_EVERY_CYCLES} cycles"
+                log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
             else:
                 agg_count = _timed_watchdog_step(
                     timings,
@@ -467,44 +472,78 @@ def background(bybit_symbols, binance_symbols):
                     "WATCHDOG_AGGREGATES_SECONDS",
                     90,
                 )
-            if os.getenv("ENABLE_RUNTIME_VALIDATION_AUDIT") == "1":
-                audit_count = _timed_step(timings, "validation_audit", rebuild_all)
-            else:
-                audit_count = -1
-                log("validation_audit skipped: ENABLE_RUNTIME_VALIDATION_AUDIT!=1")
+                if agg_count in (-2, -3) or agg_count <= 0:
+                    stop_reason = f"aggregates bad result={agg_count}"
+                    log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
 
-            auto_skip_stage2 = (
-                os.getenv("SKIP_STAGE2_REBUILDS") == "1"
-                or (
-                    os.getenv("SKIP_HEAVY_AGGREGATES") == "1"
-                    and os.getenv("FORCE_STAGE2_WITH_STALE_AGGREGATES") != "1"
-                )
-            )
-
-            if auto_skip_stage2:
-                research_count = silence_count = price_count = volume_count = oi_slope_count = phase_source_count = phase_count = -1
-                log("stage2 rebuilds skipped: safe runtime mode")
+            if stop_reason:
+                audit_count = research_count = silence_count = price_count = volume_count = oi_slope_count = phase_source_count = phase_count = stage3_alert_count = -1
+                log("decision pipeline stopped before stage2/phase")
             else:
-                research_count = _timed_watchdog_step(
-                    timings,
-                    "market_research",
-                    rebuild_market_research,
-                    "WATCHDOG_MARKET_RESEARCH_SECONDS",
-                    45,
+                if os.getenv("ENABLE_RUNTIME_VALIDATION_AUDIT") == "1":
+                    audit_count = _timed_step(timings, "validation_audit", rebuild_all)
+                else:
+                    audit_count = -1
+                    log("validation_audit skipped: ENABLE_RUNTIME_VALIDATION_AUDIT!=1")
+
+                auto_skip_stage2 = (
+                    os.getenv("SKIP_STAGE2_REBUILDS") == "1"
+                    or (
+                        os.getenv("SKIP_HEAVY_AGGREGATES") == "1"
+                        and os.getenv("FORCE_STAGE2_WITH_STALE_AGGREGATES") != "1"
+                    )
                 )
-                silence_count = _timed_step(timings, "market_silence", rebuild_market_silence)
-                price_count = _timed_step(timings, "price_state", rebuild_price_state)
-                volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
-                oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
-                phase_source_count = _timed_step(timings, "market_phase_source", rebuild_market_phase_source)
-                phase_count = _timed_watchdog_step(
-                    timings,
-                    "market_phase",
-                    rebuild_market_phase,
-                    "WATCHDOG_MARKET_PHASE_SECONDS",
-                    20,
-                )
-                stage3_alert_count = _timed_step(timings, "stage3_alerts", check_stage3_alerts)
+
+                if auto_skip_stage2:
+                    stop_reason = "SKIP_STAGE2_REBUILDS / stale aggregates mode"
+                    research_count = silence_count = price_count = volume_count = oi_slope_count = phase_source_count = phase_count = stage3_alert_count = -1
+                    log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
+                else:
+                    research_count = _timed_watchdog_step(
+                        timings,
+                        "market_research",
+                        rebuild_market_research,
+                        "WATCHDOG_MARKET_RESEARCH_SECONDS",
+                        45,
+                    )
+                    if research_count in (-2, -3) or research_count <= 0:
+                        stop_reason = f"market_research bad result={research_count}"
+                        silence_count = price_count = volume_count = oi_slope_count = phase_source_count = phase_count = stage3_alert_count = -1
+                        log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
+                    else:
+                        silence_count = _timed_step(timings, "market_silence", rebuild_market_silence)
+                        price_count = _timed_step(timings, "price_state", rebuild_price_state)
+                        volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
+                        oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
+
+                        if min(silence_count, price_count, volume_count, oi_slope_count) <= 0:
+                            stop_reason = (
+                                f"derived layer bad result "
+                                f"silence={silence_count} price={price_count} "
+                                f"volume={volume_count} oi_slope={oi_slope_count}"
+                            )
+                            phase_source_count = phase_count = stage3_alert_count = -1
+                            log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
+                        else:
+                            phase_source_count = _timed_step(timings, "market_phase_source", rebuild_market_phase_source)
+                            if phase_source_count <= 0:
+                                stop_reason = f"market_phase_source bad result={phase_source_count}"
+                                phase_count = stage3_alert_count = -1
+                                log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
+                            else:
+                                phase_count = _timed_watchdog_step(
+                                    timings,
+                                    "market_phase",
+                                    rebuild_market_phase,
+                                    "WATCHDOG_MARKET_PHASE_SECONDS",
+                                    20,
+                                )
+                                if phase_count in (-2, -3) or phase_count <= 0:
+                                    stop_reason = f"market_phase bad result={phase_count}"
+                                    stage3_alert_count = -1
+                                    log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
+                                else:
+                                    stage3_alert_count = _timed_step(timings, "stage3_alerts", check_stage3_alerts)
 
             _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
 
@@ -586,6 +625,8 @@ def background(bybit_symbols, binance_symbols):
                 "collect_reserve_health": collect_reserve_health,
                 "runtime_alerts": runtime_alerts,
                 "runtime_alert_count": len(runtime_alerts),
+                "decision_pipeline_stop_reason": stop_reason,
+                "decision_pipeline_health": "stopped" if stop_reason else "ok",
                 "cycle_health": "pending",
                 "bybit_symbols": len(bybit_symbols),
                 "binance_symbols": len(binance_symbols),
