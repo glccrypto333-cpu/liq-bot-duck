@@ -40,7 +40,6 @@ from exchange_clients import (
     reset_request_stats,
 )
 from aggregation_engine import rebuild_aggregate_windows
-from audit_engine import rebuild_all
 from autonomous_oi_service import run_autonomous_oi_service
 from export_engine import rebuild_exports
 from telegram_bot import start_polling, send_panel_message
@@ -818,10 +817,10 @@ def background(bybit_symbols, binance_symbols):
                     60,
                 )
                 _require_watchdog_success("autonomous_oi_service", autonomous_oi_count)
+            audit_count = -1
             if os.getenv("ENABLE_RUNTIME_VALIDATION_AUDIT") == "1":
-                audit_count = _timed_step(timings, "validation_audit", rebuild_all)
+                log("validation_audit skipped: legacy audit_engine archived")
             else:
-                audit_count = -1
                 log("validation_audit skipped: ENABLE_RUNTIME_VALIDATION_AUDIT!=1")
             research_count = -1
             silence_count = -1
