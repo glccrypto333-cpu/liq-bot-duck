@@ -1,0 +1,21 @@
+[
+  {
+    "type": "backup_db",
+    "status": "ERROR",
+    "started_at": "2026-05-25T06:43:27Z",
+    "finished_at": "2026-05-25T06:43:27Z",
+    "duration_sec": 0.15,
+    "error": "pg_dump: error: aborting because of server version mismatch\npg_dump: detail: server version: 18.3 (Debian 18.3-1.pgdg13+1); pg_dump version: 16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)\n"
+  },
+  {
+    "type": "backup_db",
+    "status": "OK",
+    "started_at": "2026-05-25T06:45:40Z",
+    "finished_at": "2026-05-25T06:47:43Z",
+    "duration_sec": 123.38,
+    "file": "archive/backups/db_20260525_064540.sql.gz",
+    "size_bytes": 264074755,
+    "size_mb": 251.84,
+    "retention_removed": []
+  }
+]
