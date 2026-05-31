@@ -3,6 +3,7 @@ import time
 import os
 import json
 import sys
+import subprocess
 import resource
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import threading
@@ -27,7 +28,7 @@ from config import (
     MAX_COLLECT_SECONDS_FOR_AGGREGATES,
 )
 from logger import log
-from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old, migrate_canonical_ts_close, replace_active_universe, replace_request_failures, load_quarantine_symbols
+from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old, migrate_canonical_ts_close, replace_active_universe, replace_request_failures, load_quarantine_symbols, fetch
 from exchange_clients import (
     fetch_bybit_symbols,
     fetch_binance_symbols,
@@ -38,18 +39,36 @@ from exchange_clients import (
     get_request_stats,
     reset_request_stats,
 )
-from aggregation_engine import rebuild_bot_aggregates
+from aggregation_engine import rebuild_aggregate_windows
 from audit_engine import rebuild_all
-from research_engine import rebuild_market_research
-from market_silence_engine import rebuild_market_silence
-from market_price_engine import rebuild_price_state
-from market_volume_engine import rebuild_volume_state
-from market_oi_slope_engine import rebuild_oi_slope
-from market_phase_engine import rebuild_market_phase
-from market_phase_source import rebuild_market_phase_source
+from autonomous_oi_service import run_autonomous_oi_service
 from export_engine import rebuild_exports
-from telegram_bot import start_polling, send_panel_message, check_stage3_alerts
+from telegram_bot import start_polling, send_panel_message
 from runtime_mode import runtime_mode_text
+from raw_validate import validate_collected_raw
+
+
+class CycleStop(RuntimeError):
+    def __init__(self, stop_reason: str, message: str, severity: str = "stop"):
+        super().__init__(message)
+        self.stop_reason = stop_reason
+        self.severity = severity
+
+
+def _validate_runtime_contract() -> None:
+    violations: list[str] = []
+
+    if os.getenv("SKIP_HEAVY_AGGREGATES") == "1":
+        violations.append("SKIP_HEAVY_AGGREGATES=1")
+
+    if AGGREGATES_EVERY_CYCLES != 1:
+        violations.append(f"AGGREGATES_EVERY_CYCLES={AGGREGATES_EVERY_CYCLES}")
+
+    if violations:
+        raise RuntimeError(
+            "runtime contract invalid: lower contour requires strict no-skip mode: "
+            + ", ".join(violations)
+        )
 
 
 def _write_runtime_timing_report(timings: list[tuple[str, float]]) -> None:
@@ -70,9 +89,140 @@ def _write_runtime_timing_report(timings: list[tuple[str, float]]) -> None:
     (runtime_dir / "runtime_timing_report.txt").write_text("\n".join(lines) + "\n")
 
 
+def _write_runtime_health_snapshot(
+    timings: list[tuple[str, float]],
+    bybit_symbols: list[str],
+    binance_symbols: list[str],
+    cycle_health: str,
+) -> None:
+    Path("runtime_reports").mkdir(exist_ok=True)
+
+    watchdog_streaks = dict(getattr(_timed_watchdog_step, "_timeout_streaks", {}))
+    watchdog_health = "critical" if any(
+        streak >= int(os.getenv("WATCHDOG_CRITICAL_STREAK", "3"))
+        for streak in watchdog_streaks.values()
+    ) else ("degraded" if any(streak > 0 for streak in watchdog_streaks.values()) else "ok")
+
+    Path("runtime_reports/watchdog_status.txt").write_text(
+        "\n".join([
+            f"watchdog_health={watchdog_health}",
+            f"watchdog_streaks={watchdog_streaks}",
+            f"updated_at_utc={datetime.now(timezone.utc).isoformat()}",
+        ]) + "\n"
+    )
+
+    rss_mb = _runtime_memory_mb()
+    rss_health = "ok"
+    if rss_mb >= float(os.getenv("RSS_CRITICAL_MB", "512")):
+        rss_health = "critical"
+    elif rss_mb >= float(os.getenv("RSS_WARNING_MB", "256")):
+        rss_health = "warning"
+
+    collect_seconds = next((seconds for name, seconds in timings if name == "collect"), 0.0)
+    collect_target_seconds = float(os.getenv("COLLECT_TARGET_SECONDS", "90"))
+    collect_reserve_seconds = max(0.0, collect_target_seconds - collect_seconds)
+    collect_reserve_pct = round((collect_reserve_seconds / collect_target_seconds) * 100, 2) if collect_target_seconds else 0
+    collect_reserve_health = "ok"
+    if collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_CRITICAL_SECONDS", "5")):
+        collect_reserve_health = "critical"
+    elif collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_WARNING_SECONDS", "15")):
+        collect_reserve_health = "warning"
+
+    runtime_alerts = []
+    if rss_health != "ok":
+        runtime_alerts.append(f"rss_{rss_health}")
+    if watchdog_health != "ok":
+        runtime_alerts.append(f"watchdog_{watchdog_health}")
+    if collect_reserve_health != "ok":
+        runtime_alerts.append(f"collect_reserve_{collect_reserve_health}")
+
+    timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
+    runtime_health = {
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "app_version": APP_VERSION,
+        "pid": os.getpid(),
+        "rss_mb": round(rss_mb, 2),
+        "rss_peak_mb": round(_runtime_memory_peak_mb(), 2),
+        "rss_health": rss_health,
+        "watchdog_health": watchdog_health,
+        "watchdog_streaks": watchdog_streaks,
+        "cycle_timing": timing_text,
+        "collect_seconds": round(collect_seconds, 2),
+        "collect_target_seconds": round(collect_target_seconds, 2),
+        "collect_reserve_seconds": round(collect_reserve_seconds, 2),
+        "collect_reserve_pct": collect_reserve_pct,
+        "collect_reserve_health": collect_reserve_health,
+        "runtime_alerts": runtime_alerts,
+        "runtime_alert_count": len(runtime_alerts),
+        "cycle_health": cycle_health,
+        "bybit_symbols": len(bybit_symbols),
+        "binance_symbols": len(binance_symbols),
+        "bybit_workers": BYBIT_COLLECT_WORKERS,
+        "binance_workers": BINANCE_COLLECT_WORKERS,
+        "skip_heavy": os.getenv("SKIP_HEAVY_AGGREGATES"),
+        "skip_stage2": os.getenv("SKIP_STAGE2_REBUILDS"),
+        "force_stage2": os.getenv("FORCE_STAGE2_WITH_STALE_AGGREGATES"),
+        "derived_window_hours": os.getenv("DERIVED_WINDOW_HOURS"),
+        "derived_batch_size": os.getenv("DERIVED_BATCH_SIZE"),
+        "derived_retention_hours": os.getenv("DERIVED_RETENTION_HOURS"),
+    }
+
+    Path("runtime_reports/runtime_health.txt").write_text(
+        "\n".join([f"{k}={v}" for k, v in runtime_health.items()]) + "\n"
+    )
+    runtime_health_json_path = Path("runtime_reports/runtime_health.json")
+
+    snapshot_health = "ok"
+    runtime_health["snapshot_health"] = snapshot_health
+    runtime_health["snapshot_size"] = 0
+    payload = json.dumps(runtime_health, ensure_ascii=False, indent=2) + "\n"
+    runtime_health_json_path.write_text(payload)
+
+    snapshot_size = runtime_health_json_path.stat().st_size
+    if snapshot_size <= 32:
+        snapshot_health = "critical"
+        log(f"RUNTIME_SNAPSHOT_CORRUPTED size={snapshot_size}")
+
+    runtime_health["snapshot_size"] = snapshot_size
+    runtime_health["snapshot_health"] = snapshot_health
+    runtime_health_json_path.write_text(
+        json.dumps(runtime_health, ensure_ascii=False, indent=2) + "\n"
+    )
+
+    Path("runtime_reports/snapshot_status.txt").write_text(
+        "\n".join([
+            f"snapshot_health={snapshot_health}",
+            f"snapshot_size={snapshot_size}",
+            f"updated_at_utc={runtime_health['updated_at_utc']}",
+        ]) + "\n"
+    )
+
+
 
 def _runtime_memory_mb() -> float:
     try:
+        if sys.platform != "darwin":
+            status = Path("/proc/self/status")
+            if status.exists():
+                for line in status.read_text().splitlines():
+                    if line.startswith("VmRSS:"):
+                        return float(line.split()[1]) / 1024
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return rss / 1024 / 1024
+        return rss / 1024
+    except Exception:
+        return 0.0
+
+
+def _runtime_memory_peak_mb() -> float:
+    try:
+        if sys.platform != "darwin":
+            status = Path("/proc/self/status")
+            if status.exists():
+                for line in status.read_text().splitlines():
+                    if line.startswith("VmHWM:"):
+                        return float(line.split()[1]) / 1024
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         if sys.platform == "darwin":
             return rss / 1024 / 1024
@@ -88,7 +238,7 @@ def _timed_step(timings: list[tuple[str, float]], name: str, fn):
     timings.append((name, elapsed))
     log(
         f"step resource: {name}={elapsed:.2f}s "
-        f"memory_max_rss_mb={_runtime_memory_mb():.2f}"
+        f"memory_rss_mb={_runtime_memory_mb():.2f} memory_peak_rss_mb={_runtime_memory_peak_mb():.2f}"
     )
     return result
 
@@ -220,11 +370,6 @@ def collect(symbols_bybit, symbols_binance):
     elif collect_reserve_seconds <= float(os.getenv("COLLECT_RESERVE_WARNING_SECONDS", "15")):
         collect_reserve_health = "warning"
 
-    upsert_oi(oi_rows)
-    upsert_price(price_rows)
-    upsert_volume(volume_rows)
-    replace_request_failures(failures)
-
     failure_types = {}
 
     for _, exchange, symbol, data_type, error_type, _ in failures:
@@ -324,6 +469,137 @@ def collect(symbols_bybit, symbols_binance):
         f"collect_health={collect_health}"
     )
 
+    return {
+        "oi_rows": oi_rows,
+        "price_rows": price_rows,
+        "volume_rows": volume_rows,
+        "failures": failures,
+        "cycle_ts": now,
+        "collect_seconds": collect_seconds,
+        "collect_health": collect_health,
+        "failure_health": failure_health,
+    }
+
+
+def insert_collected_raw(batch: dict) -> int:
+    if not batch:
+        raise RuntimeError("insert_raw failed: empty collect batch")
+
+    oi_rows = batch.get("oi_rows") or []
+    price_rows = batch.get("price_rows") or []
+    volume_rows = batch.get("volume_rows") or []
+    failures = batch.get("failures") or []
+    cycle_ts = batch.get("cycle_ts")
+
+    upsert_oi(oi_rows, cycle_ts=cycle_ts, source="collect")
+    upsert_price(price_rows, cycle_ts=cycle_ts, source="collect")
+    upsert_volume(volume_rows, cycle_ts=cycle_ts, source="collect")
+    replace_request_failures(failures)
+
+    total_rows = len(oi_rows) + len(price_rows) + len(volume_rows)
+
+    log(
+        f"insert_raw ok: oi={len(oi_rows)} "
+        f"price={len(price_rows)} "
+        f"volume={len(volume_rows)} "
+        f"request_failures={len(failures)} "
+        f"total_rows={total_rows}"
+    )
+
+    return total_rows
+
+
+def validate_aggregate_windows() -> dict:
+    required_windows = ["15м", "30м", "1ч", "4ч", "12ч", "24ч"]
+    window_minutes = {
+        "15м": 15,
+        "30м": 30,
+        "1ч": 60,
+        "4ч": 240,
+        "12ч": 720,
+        "24ч": 1440,
+    }
+    rows = fetch("""
+        SELECT metric, window_code, COUNT(*) AS row_count
+        FROM aggregate_windows
+        WHERE ts_close >= NOW() - INTERVAL '24 hours'
+        GROUP BY metric, window_code
+    """)
+
+    spans = fetch("""
+        SELECT
+            'OI' AS metric,
+            COUNT(*) AS row_count,
+            EXTRACT(EPOCH FROM (MAX(ts_close) - MIN(ts_open))) / 60.0 AS span_minutes
+        FROM oi_raw
+        WHERE ts_close >= NOW() - INTERVAL '30 hours'
+
+        UNION ALL
+
+        SELECT
+            'PRICE' AS metric,
+            COUNT(*) AS row_count,
+            EXTRACT(EPOCH FROM (MAX(ts_close) - MIN(ts_open))) / 60.0 AS span_minutes
+        FROM price_raw
+        WHERE ts_close >= NOW() - INTERVAL '30 hours'
+
+        UNION ALL
+
+        SELECT
+            'VOLUME' AS metric,
+            COUNT(*) AS row_count,
+            EXTRACT(EPOCH FROM (MAX(ts_close) - MIN(ts_open))) / 60.0 AS span_minutes
+        FROM volume_raw
+        WHERE ts_close >= NOW() - INTERVAL '30 hours'
+    """)
+
+    counts = {(row["metric"], row["window_code"]): row["row_count"] for row in rows}
+    span_map = {
+        row["metric"]: {
+            "row_count": int(row["row_count"] or 0),
+            "span_minutes": float(row["span_minutes"] or 0.0),
+        }
+        for row in spans
+    }
+    missing = []
+    warmup_pending = []
+    for metric in ("OI", "PRICE", "VOLUME"):
+        metric_span = span_map.get(metric, {"row_count": 0, "span_minutes": 0.0})
+        for timeframe in required_windows:
+            needed_minutes = window_minutes[timeframe]
+            if metric_span["span_minutes"] + 5 < needed_minutes:
+                warmup_pending.append(
+                    f"{metric}:{timeframe}:span={round(metric_span['span_minutes'], 1)}m"
+                )
+                continue
+            if counts.get((metric, timeframe), 0) <= 0:
+                missing.append(f"{metric}:{timeframe}")
+
+    if missing:
+        raise RuntimeError(f"aggregates_validate failed: missing_windows={missing}")
+
+    log(
+        "aggregates_validate ok: "
+        + " ".join(
+            f"{metric}:{timeframe}={counts.get((metric, timeframe), 0)}"
+            for metric in ("OI", "PRICE", "VOLUME")
+            for timeframe in required_windows
+        )
+        + (
+            " warmup_pending="
+            + ",".join(warmup_pending)
+            if warmup_pending
+            else ""
+        )
+    )
+
+    return {
+        "required_windows": required_windows,
+        "counts": counts,
+        "span_map": span_map,
+        "warmup_pending": warmup_pending,
+    }
+
 
 
 def _log_db_universe_check() -> None:
@@ -331,9 +607,9 @@ def _log_db_universe_check() -> None:
         from db import fetch
 
         tables = [
-            "oi_5m_сырые",
-            "price_5m_сырые",
-            "volume_5m_сырые",
+            "oi_raw",
+            "price_raw",
+            "volume_raw",
             "active_symbol_universe",
         ]
 
@@ -387,6 +663,55 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
         finally:
             _timed_watchdog_step._inflight.discard(name)
 
+    if name == "autonomous_oi_service":
+        script_path = Path(__file__).with_name("run_autonomous_oi_once.py")
+        try:
+            completed = subprocess.run(
+                [sys.executable, str(script_path)],
+                cwd=str(Path(__file__).resolve().parent),
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            _timed_watchdog_step._inflight.discard(name)
+            if completed.returncode != 0:
+                stderr = (completed.stderr or "").strip()
+                stdout = (completed.stdout or "").strip()
+                details = stderr or stdout or f"returncode={completed.returncode}"
+                raise RuntimeError(f"{name} subprocess failed: {details}")
+            result_text = (completed.stdout or "").strip().splitlines()
+            result = int(result_text[-1]) if result_text else 0
+            elapsed = time.time() - started
+            timings.append((name, elapsed))
+            _timed_watchdog_step._timeout_streaks[name] = 0
+            log(
+                f"step resource: {name}={elapsed:.2f}s "
+                f"watchdog=ok timeout={timeout_seconds}s "
+                f"watchdog_streak=0 "
+                f"memory_rss_mb={_runtime_memory_mb():.2f} memory_peak_rss_mb={_runtime_memory_peak_mb():.2f}"
+            )
+            return result
+        except subprocess.TimeoutExpired:
+            _timed_watchdog_step._inflight.discard(name)
+            elapsed = time.time() - started
+            timings.append((name, elapsed))
+            streak = _timed_watchdog_step._timeout_streaks.get(name, 0) + 1
+            _timed_watchdog_step._timeout_streaks[name] = streak
+            log(
+                f"WATCHDOG_TIMEOUT "
+                f"step={name} elapsed={elapsed:.2f}s "
+                f"timeout={timeout_seconds}s degraded=1 "
+                f"watchdog_streak={streak}"
+            )
+            if streak >= int(os.getenv("WATCHDOG_CRITICAL_STREAK", "3")):
+                log(
+                    f"WATCHDOG_CRITICAL "
+                    f"step={name} streak={streak} "
+                    f"timeout={timeout_seconds}s"
+                )
+            return -2
+
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(_run_and_release)
 
@@ -399,7 +724,7 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
             f"step resource: {name}={elapsed:.2f}s "
             f"watchdog=ok timeout={timeout_seconds}s "
             f"watchdog_streak=0 "
-            f"memory_max_rss_mb={_runtime_memory_mb():.2f}"
+            f"memory_rss_mb={_runtime_memory_mb():.2f} memory_peak_rss_mb={_runtime_memory_peak_mb():.2f}"
         )
         executor.shutdown(wait=True, cancel_futures=False)
         return result
@@ -437,6 +762,20 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
         raise
 
 
+def _require_watchdog_success(step_name: str, result: int) -> int:
+    if result == -3:
+        raise CycleStop(
+            f"{step_name}_watchdog_inflight",
+            f"decision pipeline stopped: {step_name} watchdog reported inflight skip",
+        )
+    if result == -2:
+        raise CycleStop(
+            f"{step_name}_watchdog_timeout",
+            f"decision pipeline stopped: {step_name} watchdog timeout",
+        )
+    return result
+
+
 def background(bybit_symbols, binance_symbols):
     last_export = 0.0
     cycle_no = 0
@@ -444,108 +783,53 @@ def background(bybit_symbols, binance_symbols):
     while True:
         cycle_no += 1
         cycle_started = time.time()
+        stop_reason = "ok"
+        stop_severity = "ok"
+        stage3_alert_count = -1
+        timings = []
         try:
-            timings = []
-
-            _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
+            collect_batch = _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
+            collect_batch = _timed_step(timings, "raw_validate", lambda: validate_collected_raw(collect_batch, bybit_symbols, binance_symbols))
+            _timed_step(timings, "insert_raw", lambda: insert_collected_raw(collect_batch))
             collect_seconds = next((seconds for name, seconds in timings if name == "collect"), 0.0)
 
-            stop_reason = None
-
             if os.getenv("SKIP_HEAVY_AGGREGATES") == "1":
-                agg_count = -1
-                stop_reason = "SKIP_HEAVY_AGGREGATES=1"
-                log("DECISION_PIPELINE_STOP reason=SKIP_HEAVY_AGGREGATES=1")
+                raise CycleStop("aggregates_skipped_by_env", "lower contour stopped: SKIP_HEAVY_AGGREGATES=1")
             elif collect_seconds > MAX_COLLECT_SECONDS_FOR_AGGREGATES:
-                agg_count = -1
-                stop_reason = f"collect too slow {collect_seconds:.2f}s > {MAX_COLLECT_SECONDS_FOR_AGGREGATES}s"
-                log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
-            elif cycle_no % max(1, AGGREGATES_EVERY_CYCLES) != 0:
-                agg_count = -1
-                stop_reason = f"aggregates scheduled skip every {AGGREGATES_EVERY_CYCLES} cycles"
-                log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
+                raise CycleStop(
+                    "collect_too_slow_for_aggregates",
+                    f"lower contour stopped: collect too slow {collect_seconds:.2f}s > {MAX_COLLECT_SECONDS_FOR_AGGREGATES}s",
+                )
             else:
                 agg_count = _timed_watchdog_step(
                     timings,
                     "aggregates",
-                    rebuild_bot_aggregates,
+                    rebuild_aggregate_windows,
                     "WATCHDOG_AGGREGATES_SECONDS",
-                    90,
+                    150,
                 )
-                if agg_count in (-2, -3) or agg_count <= 0:
-                    stop_reason = f"aggregates bad result={agg_count}"
-                    log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
-
-            if stop_reason:
-                audit_count = research_count = silence_count = price_count = volume_count = oi_slope_count = phase_source_count = phase_count = stage3_alert_count = -1
-                log("decision pipeline stopped before stage2/phase")
+                _require_watchdog_success("aggregates", agg_count)
+                _timed_step(timings, "aggregates_validate", validate_aggregate_windows)
+                autonomous_oi_count = _timed_watchdog_step(
+                    timings,
+                    "autonomous_oi_service",
+                    run_autonomous_oi_service,
+                    "WATCHDOG_AUTONOMOUS_OI_SECONDS",
+                    60,
+                )
+                _require_watchdog_success("autonomous_oi_service", autonomous_oi_count)
+            if os.getenv("ENABLE_RUNTIME_VALIDATION_AUDIT") == "1":
+                audit_count = _timed_step(timings, "validation_audit", rebuild_all)
             else:
-                if os.getenv("ENABLE_RUNTIME_VALIDATION_AUDIT") == "1":
-                    audit_count = _timed_step(timings, "validation_audit", rebuild_all)
-                else:
-                    audit_count = -1
-                    log("validation_audit skipped: ENABLE_RUNTIME_VALIDATION_AUDIT!=1")
-
-                auto_skip_stage2 = (
-                    os.getenv("SKIP_STAGE2_REBUILDS") == "1"
-                    or (
-                        os.getenv("SKIP_HEAVY_AGGREGATES") == "1"
-                        and os.getenv("FORCE_STAGE2_WITH_STALE_AGGREGATES") != "1"
-                    )
-                )
-
-                if auto_skip_stage2:
-                    stop_reason = "SKIP_STAGE2_REBUILDS / stale aggregates mode"
-                    research_count = silence_count = price_count = volume_count = oi_slope_count = phase_source_count = phase_count = stage3_alert_count = -1
-                    log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
-                else:
-                    research_count = _timed_watchdog_step(
-                        timings,
-                        "market_research",
-                        rebuild_market_research,
-                        "WATCHDOG_MARKET_RESEARCH_SECONDS",
-                        45,
-                    )
-                    if research_count in (-2, -3) or research_count <= 0:
-                        stop_reason = f"market_research bad result={research_count}"
-                        silence_count = price_count = volume_count = oi_slope_count = phase_source_count = phase_count = stage3_alert_count = -1
-                        log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
-                    else:
-                        silence_count = _timed_step(timings, "market_silence", rebuild_market_silence)
-                        price_count = _timed_step(timings, "price_state", rebuild_price_state)
-                        volume_count = _timed_step(timings, "volume_state", rebuild_volume_state)
-                        oi_slope_count = _timed_step(timings, "oi_slope", rebuild_oi_slope)
-
-                        if min(silence_count, price_count, volume_count, oi_slope_count) <= 0:
-                            stop_reason = (
-                                f"derived layer bad result "
-                                f"silence={silence_count} price={price_count} "
-                                f"volume={volume_count} oi_slope={oi_slope_count}"
-                            )
-                            phase_source_count = phase_count = stage3_alert_count = -1
-                            log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
-                        else:
-                            phase_source_count = _timed_step(timings, "market_phase_source", rebuild_market_phase_source)
-                            if phase_source_count <= 0:
-                                stop_reason = f"market_phase_source bad result={phase_source_count}"
-                                phase_count = stage3_alert_count = -1
-                                log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
-                            else:
-                                phase_count = _timed_watchdog_step(
-                                    timings,
-                                    "market_phase",
-                                    rebuild_market_phase,
-                                    "WATCHDOG_MARKET_PHASE_SECONDS",
-                                    20,
-                                )
-                                if phase_count in (-2, -3) or phase_count <= 0:
-                                    stop_reason = f"market_phase bad result={phase_count}"
-                                    stage3_alert_count = -1
-                                    log(f"DECISION_PIPELINE_STOP reason={stop_reason}")
-                                else:
-                                    stage3_alert_count = _timed_step(timings, "stage3_alerts", check_stage3_alerts)
-
-            _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
+                audit_count = -1
+                log("validation_audit skipped: ENABLE_RUNTIME_VALIDATION_AUDIT!=1")
+            research_count = -1
+            silence_count = -1
+            price_count = -1
+            volume_count = -1
+            oi_slope_count = -1
+            phase_source_count = -1
+            phase_count = -1
 
             now = time.time()
 
@@ -564,7 +848,7 @@ def background(bybit_symbols, binance_symbols):
                 rss_health = "warning"
 
             if rss_health != "ok":
-                log(f"RSS_{rss_health.upper()} memory_max_rss_mb={rss_mb:.2f}")
+                log(f"RSS_{rss_health.upper()} memory_rss_mb={rss_mb:.2f} memory_peak_rss_mb={_runtime_memory_peak_mb():.2f}")
 
             log(
                 f"cycle resource: pid={os.getpid()} "
@@ -614,6 +898,7 @@ def background(bybit_symbols, binance_symbols):
                 "app_version": APP_VERSION,
                 "pid": os.getpid(),
                 "rss_mb": round(rss_mb, 2),
+        "rss_peak_mb": round(_runtime_memory_peak_mb(), 2),
                 "rss_health": rss_health,
                 "watchdog_health": watchdog_health,
                 "watchdog_streaks": watchdog_streaks,
@@ -625,8 +910,6 @@ def background(bybit_symbols, binance_symbols):
                 "collect_reserve_health": collect_reserve_health,
                 "runtime_alerts": runtime_alerts,
                 "runtime_alert_count": len(runtime_alerts),
-                "decision_pipeline_stop_reason": stop_reason,
-                "decision_pipeline_health": "stopped" if stop_reason else "ok",
                 "cycle_health": "pending",
                 "bybit_symbols": len(bybit_symbols),
                 "binance_symbols": len(binance_symbols),
@@ -678,11 +961,37 @@ def background(bybit_symbols, binance_symbols):
                     f"size={snapshot_size}"
                 )
 
-            log(f"canonical validation cycle ok: aggregates={agg_count} audit={audit_count} research={research_count} silence={silence_count} price={price_count} volume={volume_count} oi_slope={oi_slope_count} phase_source={phase_source_count} phase={phase_count}")
+            log(
+                f"oi runtime cycle ok: aggregates={agg_count} "
+                f"autonomous_oi={autonomous_oi_count} "
+                f"audit={audit_count} "
+                f"legacy_research={research_count} "
+                f"legacy_silence={silence_count} "
+                f"legacy_price={price_count} "
+                f"legacy_volume={volume_count} "
+                f"legacy_oi_slope={oi_slope_count} "
+                f"legacy_phase_source={phase_source_count} "
+                f"legacy_phase={phase_count}"
+            )
             _log_db_universe_check()
 
+        except CycleStop as exc:
+            stop_reason = exc.stop_reason
+            stop_severity = exc.severity
+            log(f"canonical validation cycle stopped: {stop_reason}: {exc}")
         except Exception as exc:
+            stop_reason = type(exc).__name__
+            stop_severity = "error"
             log(f"canonical validation cycle error: {type(exc).__name__}: {exc}")
+            log(traceback.format_exc())
+
+        try:
+            _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
+        except Exception as exc:
+            if stop_reason == "ok":
+                stop_reason = "cleanup_old_failed"
+                stop_severity = "error"
+            log(f"cleanup_old error: {type(exc).__name__}: {exc}")
             log(traceback.format_exc())
 
         elapsed = time.time() - cycle_started
@@ -708,7 +1017,9 @@ def background(bybit_symbols, binance_symbols):
         sleep_seconds = max(0, ИНТЕРВАЛ_ЦИКЛА_СЕК - elapsed)
 
         cycle_health = "ok"
-        if elapsed > ИНТЕРВАЛ_ЦИКЛА_СЕК:
+        if stop_reason != "ok":
+            cycle_health = "stopped"
+        elif elapsed > ИНТЕРВАЛ_ЦИКЛА_СЕК:
             cycle_health = "overrun"
         elif sleep_seconds < float(os.getenv("CYCLE_SLEEP_WARNING_SECONDS", "30")):
             cycle_health = "tight"
@@ -726,6 +1037,13 @@ def background(bybit_symbols, binance_symbols):
             f"cycle_health={cycle_health}"
         )
 
+        _write_runtime_health_snapshot(
+            timings,
+            bybit_symbols,
+            binance_symbols,
+            cycle_health,
+        )
+
         Path("runtime_reports").mkdir(exist_ok=True)
         cycle_status = {
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -735,6 +1053,8 @@ def background(bybit_symbols, binance_symbols):
             "cycle_reserve_pct": cycle_reserve_pct,
             "cycle_latency_class": cycle_latency_class,
             "cycle_health": cycle_health,
+            "stop_reason": stop_reason,
+            "stop_severity": stop_severity,
             "overrun_streak": getattr(background, "_overrun_streak", 0),
         }
 
@@ -761,6 +1081,8 @@ def main():
         f"derived_batch_size={os.getenv('DERIVED_BATCH_SIZE')} "
         f"derived_retention_hours={os.getenv('DERIVED_RETENTION_HOURS')}"
     )
+    _validate_runtime_contract()
+    log("runtime contract ok: strict no-skip lower contour enabled")
 
     log("init_db start")
     init_db()

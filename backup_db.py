@@ -1,10 +1,12 @@
 import gzip
 import json
 import os
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 ARCHIVE = Path("archive")
 BACKUPS = ARCHIVE / "backups"
@@ -15,6 +17,21 @@ TMP = ARCHIVE / "tmp"
 LOCK_FILE = LOCKS / "heavy_job.lock"
 INDEX_FILE = MANIFESTS / "archive_index.json"
 RETENTION_KEEP = int(os.getenv("BACKUP_RETENTION_KEEP", "7"))
+
+DOCKER_PG_CONTAINER = os.getenv("BACKUP_DB_DOCKER_CONTAINER", "openclaw-postgres")
+
+
+def pg_dump_command(db_url: str) -> list[str]:
+    parsed = urlparse(db_url)
+    host = str(parsed.hostname or "").lower()
+    dbname = (parsed.path or "/").lstrip("/") or "postgres"
+    user = parsed.username or "postgres"
+
+    if host in {"127.0.0.1", "localhost", "openclaw-postgres"} and shutil.which("docker"):
+        return ["docker", "exec", DOCKER_PG_CONTAINER, "pg_dump", "-U", user, "-d", dbname]
+
+    return ["pg_dump", db_url]
+
 
 
 def utc_now():
@@ -40,13 +57,17 @@ def save_index(rows):
 
 
 def acquire_lock():
-    if LOCK_FILE.exists():
-        raise RuntimeError(f"LOCK_EXISTS: {LOCK_FILE}")
-    LOCK_FILE.write_text(json.dumps({
+    payload = json.dumps({
         "job": "backup_db",
         "started_at": utc_now(),
         "pid": os.getpid(),
-    }, ensure_ascii=False))
+    }, ensure_ascii=False)
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise RuntimeError(f"LOCK_EXISTS: {LOCK_FILE}")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(payload)
 
 
 def release_lock():
@@ -86,7 +107,7 @@ def main():
     try:
         with gzip.open(tmp_file, "wb") as gz:
             proc = subprocess.Popen(
-                ["pg_dump", db_url],
+                pg_dump_command(db_url),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )

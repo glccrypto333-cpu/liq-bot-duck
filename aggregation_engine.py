@@ -5,12 +5,12 @@ from datetime import timedelta
 
 import os
 
-from db import fetch, replace_bot_aggregates, insert_bot_aggregates, active_universe_sql
+from db import fetch, replace_aggregate_layers_atomically, active_universe_sql
 from metrics import изменение_в_процентах
 from logger import log
 
-WINDOWS = {"15м": 3, "30м": 6, "1ч": 12, "4ч": 48}
-WINDOW_MINUTES = {"15м": 15, "30м": 30, "1ч": 60, "4ч": 240}
+WINDOWS = {"15м": 3, "30м": 6, "1ч": 12, "4ч": 48, "12ч": 144, "24ч": 288}
+WINDOW_MINUTES = {"15м": 15, "30м": 30, "1ч": 60, "4ч": 240, "12ч": 720, "24ч": 1440}
 FIVE_MINUTES = timedelta(minutes=5)
 
 
@@ -52,24 +52,14 @@ def _is_contiguous_5m(chunk) -> bool:
     return True
 
 
-def _flush_aggregates(rows_out: list[tuple]) -> int:
-    if not rows_out:
-        return 0
-    insert_bot_aggregates(rows_out)
-    return len(rows_out)
-
-
-def rebuild_bot_aggregates() -> int:
-    window_hours = int(os.getenv("AGGREGATES_WINDOW_HOURS", "6"))
-    replace_bot_aggregates([])
-    rows_out = []
-    total_out = 0
-    flush_size = 5000
+def rebuild_aggregate_windows() -> int:
+    window_hours = int(os.getenv("AGGREGATES_WINDOW_HOURS", "30"))
+    rows_out: list[tuple] = []
     skipped_non_contiguous = 0
 
     oi_rows = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close
-        FROM oi_5m_сырые x
+        FROM oi_raw x
         WHERE ts_close <= NOW() - interval '30 seconds'
           AND ts_close >= NOW() - (%s || ' hours')::interval
           AND {active_universe_sql("x")}
@@ -97,13 +87,10 @@ def rebuild_bot_aggregates() -> int:
                     изменение_в_процентах(chunk[0]["oi_open"], chunk[-1]["oi_close"]),
                     len(chunk),
                 ))
-                if len(rows_out) >= flush_size:
-                    total_out += _flush_aggregates(rows_out)
-                    rows_out.clear()
 
     price_rows = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close
-        FROM price_5m_сырые x
+        FROM price_raw x
         WHERE ts_close <= NOW() - interval '30 seconds'
           AND ts_close >= NOW() - (%s || ' hours')::interval
           AND {active_universe_sql("x")}
@@ -131,13 +118,10 @@ def rebuild_bot_aggregates() -> int:
                     изменение_в_процентах(chunk[0]["price_open"], chunk[-1]["price_close"]),
                     len(chunk),
                 ))
-                if len(rows_out) >= flush_size:
-                    total_out += _flush_aggregates(rows_out)
-                    rows_out.clear()
 
     volume_rows = fetch(f"""
         SELECT ts_open, ts_close, exchange, symbol, volume
-        FROM volume_5m_сырые x
+        FROM volume_raw x
         WHERE ts_close <= NOW() - interval '30 seconds'
           AND ts_close >= NOW() - (%s || ' hours')::interval
           AND {active_universe_sql("x")}
@@ -164,15 +148,14 @@ def rebuild_bot_aggregates() -> int:
                     None,
                     sum(values),
                     sum(values) / len(values),
-                    None,
+                    изменение_в_процентах(chunk[0]["volume"], chunk[-1]["volume"]),
                     len(chunk),
                 ))
-                if len(rows_out) >= flush_size:
-                    total_out += _flush_aggregates(rows_out)
-                    rows_out.clear()
+    if not rows_out:
+        raise RuntimeError("aggregates rebuild failed: empty rows_out")
 
-    total_out += _flush_aggregates(rows_out)
-    rows_out.clear()
+    replace_aggregate_layers_atomically(rows_out)
+    total_out = len(rows_out)
 
     log(
         f"aggregates rebuilt: raw_oi={len(oi_rows)} "
@@ -181,3 +164,4 @@ def rebuild_bot_aggregates() -> int:
         f"skipped_non_contiguous={skipped_non_contiguous}"
     )
     return total_out
+

@@ -96,9 +96,8 @@ def init_db() -> None:
         return
 
     with _conn() as conn, conn.cursor() as cur:
-        # RAW canonical tables
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS oi_5m_сырые(
+        CREATE TABLE IF NOT EXISTS oi_raw(
             ts_open TIMESTAMPTZ NOT NULL,
             ts_close TIMESTAMPTZ NOT NULL,
             exchange TEXT NOT NULL,
@@ -107,11 +106,13 @@ def init_db() -> None:
             oi_high DOUBLE PRECISION NOT NULL,
             oi_low DOUBLE PRECISION NOT NULL,
             oi_close DOUBLE PRECISION NOT NULL,
+            cycle_ts TIMESTAMPTZ,
+            source TEXT,
             collected_at TIMESTAMPTZ DEFAULT NOW()
         )
         """)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS price_5m_сырые(
+        CREATE TABLE IF NOT EXISTS price_raw(
             ts_open TIMESTAMPTZ NOT NULL,
             ts_close TIMESTAMPTZ NOT NULL,
             exchange TEXT NOT NULL,
@@ -120,49 +121,27 @@ def init_db() -> None:
             price_high DOUBLE PRECISION NOT NULL,
             price_low DOUBLE PRECISION NOT NULL,
             price_close DOUBLE PRECISION NOT NULL,
+            cycle_ts TIMESTAMPTZ,
+            source TEXT,
             collected_at TIMESTAMPTZ DEFAULT NOW()
         )
         """)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS volume_5m_сырые(
+        CREATE TABLE IF NOT EXISTS volume_raw(
             ts_open TIMESTAMPTZ NOT NULL,
             ts_close TIMESTAMPTZ NOT NULL,
             exchange TEXT NOT NULL,
             symbol TEXT NOT NULL,
             volume DOUBLE PRECISION NOT NULL,
+            cycle_ts TIMESTAMPTZ,
+            source TEXT,
             collected_at TIMESTAMPTZ DEFAULT NOW()
         )
         """)
-
-        # Add collected_at if old tables exist without it
-        for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
-            log(f"DDL deferred: collected_at migration skipped for {table}")
-
-        run_runtime_ddl = _runtime_ddl_enabled()
-
-        if run_runtime_ddl:
-            # Deduplicate old raw rows before unique index
-            for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
-                cur.execute(f"""
-                DELETE FROM {table} a
-                USING {table} b
-                WHERE a.ctid < b.ctid
-                  AND a.exchange = b.exchange
-                  AND a.symbol = b.symbol
-                  AND a.ts_open = b.ts_open
-                """)
-
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_oi5m_candle ON oi_5m_сырые(exchange, symbol, ts_open)")
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_price5m_candle ON price_5m_сырые(exchange, symbol, ts_open)")
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_volume5m_candle ON volume_5m_сырые(exchange, symbol, ts_open)")
-        else:
-            log("DDL deferred: raw dedupe + unique indexes skipped")
-
-        # IMPORTANT: rebuild derived tables to guarantee schema correctness
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_aggregates(
+        CREATE TABLE IF NOT EXISTS aggregate_windows(
             metric TEXT NOT NULL,
-            timeframe TEXT NOT NULL,
+            window_code TEXT NOT NULL,
             ts_open TIMESTAMPTZ NOT NULL,
             ts_close TIMESTAMPTZ NOT NULL,
             exchange TEXT NOT NULL,
@@ -174,9 +153,248 @@ def init_db() -> None:
             sum_value DOUBLE PRECISION,
             avg_value DOUBLE PRECISION,
             delta_pct DOUBLE PRECISION,
-            unique_candles INTEGER NOT NULL
+            unique_candles INTEGER NOT NULL,
+            source_cycle_ts TIMESTAMPTZ,
+            built_at TIMESTAMPTZ DEFAULT NOW()
         )
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS oi_core_state(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            current_stage INTEGER,
+            oi_pattern TEXT,
+            oi_pattern_code TEXT,
+            oi_pattern_label TEXT,
+            oi_direction TEXT,
+            oi_angle TEXT,
+            oi_stability TEXT,
+            oi_retention TEXT,
+            oi_breakdown TEXT,
+            oi_direction_summary TEXT,
+            oi_angle_summary TEXT,
+            oi_stability_summary TEXT,
+            oi_retention_summary TEXT,
+            oi_breakdown_summary TEXT,
+            price_state_summary TEXT,
+            price_block_level_summary TEXT,
+            volume_state_summary TEXT,
+            volume_confidence_summary TEXT,
+            oi_stage_age_minutes DOUBLE PRECISION,
+            oi_transition_permission TEXT,
+            blocked_by_price BOOLEAN DEFAULT FALSE,
+            blocked_stage_max INTEGER,
+            volume_confirmation TEXT,
+            decision_reason TEXT,
+            block_reason TEXT,
+            breakdown_reason TEXT,
+            latest_cycle_ts TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS oi_window_state(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            window_code TEXT NOT NULL,
+            oi_direction TEXT,
+            oi_angle TEXT,
+            oi_stability TEXT,
+            oi_retention TEXT,
+            oi_breakdown TEXT,
+            oi_pattern TEXT,
+            oi_pattern_code TEXT,
+            oi_pattern_label TEXT,
+            price_state_code TEXT,
+            price_state_label TEXT,
+            price_block_level TEXT,
+            volume_state_code TEXT,
+            volume_state_label TEXT,
+            volume_confidence_effect TEXT,
+            window_growth_pct DOUBLE PRECISION,
+            window_weight DOUBLE PRECISION,
+            visual_label TEXT,
+            cycle_ts TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS oi_stage_history(
+            id BIGSERIAL PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            from_stage INTEGER,
+            to_stage INTEGER NOT NULL,
+            transition_reason TEXT NOT NULL,
+            transition_allowed BOOLEAN,
+            stage_age_before_transition DOUBLE PRECISION,
+            cycle_ts TIMESTAMPTZ,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS oi_debug_cases(
+            id BIGSERIAL PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            cycle_ts TIMESTAMPTZ,
+            current_stage INTEGER,
+            oi_pattern TEXT,
+            decision_snapshot JSONB,
+            user_comment TEXT,
+            assistant_analysis TEXT,
+            status TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS oi_post_stage_analytics(
+            id BIGSERIAL PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            stage_triggered INTEGER NOT NULL,
+            triggered_at TIMESTAMPTZ NOT NULL,
+            trigger_price DOUBLE PRECISION,
+            trigger_oi DOUBLE PRECISION,
+            price_after_1h DOUBLE PRECISION,
+            price_after_4h DOUBLE PRECISION,
+            price_after_12h DOUBLE PRECISION,
+            price_after_24h DOUBLE PRECISION,
+            oi_after_1h DOUBLE PRECISION,
+            oi_after_4h DOUBLE PRECISION,
+            oi_after_12h DOUBLE PRECISION,
+            oi_after_24h DOUBLE PRECISION,
+            quality_label TEXT,
+            notes TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS core_state_v2(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            latest_cycle_ts TIMESTAMPTZ,
+            current_stage INTEGER,
+            stage_age_minutes DOUBLE PRECISION,
+            transition_permission TEXT,
+            manual_reset_required BOOLEAN DEFAULT FALSE,
+            price_hard_ban BOOLEAN DEFAULT FALSE,
+            phase_reason TEXT,
+            oi_summary JSONB,
+            price_summary JSONB,
+            volume_summary JSONB,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS window_state_v2(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            cycle_ts TIMESTAMPTZ,
+            window_code TEXT NOT NULL,
+            window_weight DOUBLE PRECISION,
+            oi_slope_class TEXT,
+            oi_slope_value DOUBLE PRECISION,
+            oi_hold_class TEXT,
+            oi_pullback_class TEXT,
+            oi_smoothness_class TEXT,
+            price_regime TEXT,
+            price_direction TEXT,
+            price_hard_ban BOOLEAN DEFAULT FALSE,
+            volume_class TEXT,
+            volume_10x_confirmed BOOLEAN DEFAULT FALSE,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS transition_history_v2(
+            id BIGSERIAL PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            from_stage INTEGER,
+            to_stage INTEGER NOT NULL,
+            cycle_ts TIMESTAMPTZ,
+            transition_allowed BOOLEAN,
+            stage_age_before_transition DOUBLE PRECISION,
+            reason TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS debug_cases_v2(
+            id BIGSERIAL PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            cycle_ts TIMESTAMPTZ,
+            current_stage INTEGER,
+            oi_summary JSONB,
+            price_summary JSONB,
+            volume_summary JSONB,
+            user_comment TEXT,
+            status TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS post_stage_analytics_v2(
+            id BIGSERIAL PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            stage_triggered INTEGER NOT NULL,
+            triggered_at TIMESTAMPTZ NOT NULL,
+            trigger_price DOUBLE PRECISION,
+            trigger_oi DOUBLE PRECISION,
+            price_after_1h DOUBLE PRECISION,
+            price_after_4h DOUBLE PRECISION,
+            price_after_12h DOUBLE PRECISION,
+            price_after_24h DOUBLE PRECISION,
+            oi_after_1h DOUBLE PRECISION,
+            oi_after_4h DOUBLE PRECISION,
+            oi_after_12h DOUBLE PRECISION,
+            oi_after_24h DOUBLE PRECISION,
+            quality_label TEXT,
+            notes TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        run_runtime_ddl = _runtime_ddl_enabled()
+
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_oi_raw_candle ON oi_raw(exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_price_raw_candle ON price_raw(exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_volume_raw_candle ON volume_raw(exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_aggregate_windows_key ON aggregate_windows(metric, window_code, exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_oi_core_state_key ON oi_core_state(exchange, symbol)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_oi_window_state_key ON oi_window_state(exchange, symbol, window_code)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_core_state_v2_key ON core_state_v2(exchange, symbol)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_window_state_v2_key ON window_state_v2(exchange, symbol, window_code)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_post_stage_v2_key ON post_stage_analytics_v2(exchange, symbol, stage_triggered, triggered_at)")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_pattern_code TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_pattern_label TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_direction_summary TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_angle_summary TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_stability_summary TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_retention_summary TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_breakdown_summary TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS price_state_summary TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS price_block_level_summary TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS volume_state_summary TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS volume_confidence_summary TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS blocked_stage_max INTEGER")
+        safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS oi_pattern_code TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS oi_pattern_label TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS price_state_code TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS price_state_label TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS price_block_level TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS volume_state_code TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS volume_state_label TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS volume_confidence_effect TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS window_weight DOUBLE PRECISION")
+
+        if not run_runtime_ddl:
+            log("DDL runtime migrations skipped")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS validation_audit(
             calculated_at TIMESTAMPTZ NOT NULL,
@@ -429,11 +647,10 @@ def init_db() -> None:
             log("DDL runtime migrations skipped")
             return
 
-        log("DDL deferred: idx_bot_agg_main")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_validation_main ON validation_audit(metric, timeframe, exchange, symbol, ts_close)")
-        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_raw_oi_main ON oi_5m_сырые(exchange, symbol, ts_open)")
-        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_raw_price_main ON price_5m_сырые(exchange, symbol, ts_open)")
-        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_raw_volume_main ON volume_5m_сырые(exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_oi_raw_main ON oi_raw(exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_price_raw_main ON price_raw(exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_volume_raw_main ON volume_raw(exchange, symbol, ts_open)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_coverage_report_main ON coverage_report(metric, exchange, symbol, coverage_pct)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_gap_report_main ON gap_report(metric, exchange, symbol, gap_start)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_active_symbol_universe_main ON active_symbol_universe(exchange, symbol)")
@@ -476,6 +693,15 @@ def init_db() -> None:
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_price_state_latest ON market_price_state(exchange, symbol, timeframe, ts_close DESC)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_volume_state_latest ON market_volume_state(exchange, symbol, timeframe, ts_close DESC)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_aggregate_windows_latest ON aggregate_windows(exchange, symbol, window_code, ts_close DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_oi_core_stage ON oi_core_state(current_stage)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_oi_stage_history_main ON oi_stage_history(exchange, symbol, created_at DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_oi_debug_cases_main ON oi_debug_cases(exchange, symbol, created_at DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_oi_post_stage_main ON oi_post_stage_analytics(exchange, symbol, triggered_at DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_core_state_v2_stage ON core_state_v2(current_stage)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_transition_history_v2_main ON transition_history_v2(exchange, symbol, created_at DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_debug_cases_v2_main ON debug_cases_v2(exchange, symbol, created_at DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_post_stage_v2_main ON post_stage_analytics_v2(exchange, symbol, triggered_at DESC)")
 
 
     log("Postgres: canonical schema + derived tables готовы")
@@ -495,13 +721,25 @@ def fetch(sql: str, params: tuple = ()) -> list[dict]:
         cur.execute(sql, params)
         return list(cur.fetchall())
 
-def upsert_oi(rows: list[tuple]) -> None:
+def upsert_oi(rows: list[tuple], cycle_ts=None, source: str = "collect") -> None:
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
+        canonical_rows = [
+            (
+                ts_open, ts_close, exchange, symbol,
+                oi_open, oi_high, oi_low, oi_close,
+                cycle_ts, source,
+            )
+            for ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close in rows
+        ]
         _executemany_with_lock_retry(cur, """
-        INSERT INTO oi_5m_сырые(ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close, collected_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        INSERT INTO oi_raw(
+            ts_open, ts_close, exchange, symbol,
+            oi_open, oi_high, oi_low, oi_close,
+            cycle_ts, source, collected_at
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
         ON CONFLICT (exchange, symbol, ts_open)
         DO UPDATE SET
             ts_close=EXCLUDED.ts_close,
@@ -509,16 +747,30 @@ def upsert_oi(rows: list[tuple]) -> None:
             oi_high=EXCLUDED.oi_high,
             oi_low=EXCLUDED.oi_low,
             oi_close=EXCLUDED.oi_close,
+            cycle_ts=EXCLUDED.cycle_ts,
+            source=EXCLUDED.source,
             collected_at=NOW()
-        """, rows)
+        """, canonical_rows)
 
-def upsert_price(rows: list[tuple]) -> None:
+def upsert_price(rows: list[tuple], cycle_ts=None, source: str = "collect") -> None:
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
+        canonical_rows = [
+            (
+                ts_open, ts_close, exchange, symbol,
+                price_open, price_high, price_low, price_close,
+                cycle_ts, source,
+            )
+            for ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close in rows
+        ]
         _executemany_with_lock_retry(cur, """
-        INSERT INTO price_5m_сырые(ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close, collected_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        INSERT INTO price_raw(
+            ts_open, ts_close, exchange, symbol,
+            price_open, price_high, price_low, price_close,
+            cycle_ts, source, collected_at
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
         ON CONFLICT (exchange, symbol, ts_open)
         DO UPDATE SET
             ts_close=EXCLUDED.ts_close,
@@ -526,40 +778,82 @@ def upsert_price(rows: list[tuple]) -> None:
             price_high=EXCLUDED.price_high,
             price_low=EXCLUDED.price_low,
             price_close=EXCLUDED.price_close,
+            cycle_ts=EXCLUDED.cycle_ts,
+            source=EXCLUDED.source,
             collected_at=NOW()
-        """, rows)
+        """, canonical_rows)
 
-def upsert_volume(rows: list[tuple]) -> None:
+def upsert_volume(rows: list[tuple], cycle_ts=None, source: str = "collect") -> None:
     if not DATABASE_URL or not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
+        canonical_rows = [
+            (
+                ts_open, ts_close, exchange, symbol,
+                volume, cycle_ts, source,
+            )
+            for ts_open, ts_close, exchange, symbol, volume in rows
+        ]
         _executemany_with_lock_retry(cur, """
-        INSERT INTO volume_5m_сырые(ts_open, ts_close, exchange, symbol, volume, collected_at)
-        VALUES (%s,%s,%s,%s,%s,NOW())
+        INSERT INTO volume_raw(
+            ts_open, ts_close, exchange, symbol,
+            volume, cycle_ts, source, collected_at
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
         ON CONFLICT (exchange, symbol, ts_open)
         DO UPDATE SET
             ts_close=EXCLUDED.ts_close,
             volume=EXCLUDED.volume,
+            cycle_ts=EXCLUDED.cycle_ts,
+            source=EXCLUDED.source,
             collected_at=NOW()
-        """, rows)
-
-def insert_bot_aggregates(rows: list[tuple]) -> None:
-    if not DATABASE_URL or not rows:
+        """, canonical_rows)
+def replace_aggregate_layers_atomically(rows: list[tuple]) -> None:
+    if not DATABASE_URL:
         return
-    with _conn() as conn, conn.cursor() as cur:
-        cur.executemany("""
-        INSERT INTO bot_aggregates(
-            metric, timeframe, ts_open, ts_close, exchange, symbol,
-            open_value, high_value, low_value, close_value,
-            sum_value, avg_value, delta_pct, unique_candles
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, rows)
+    if not rows:
+        raise RuntimeError("replace_aggregate_layers_atomically failed: empty rows")
 
+    conn = _conn()
+    prev_autocommit = conn.autocommit
 
-def replace_bot_aggregates(rows: list[tuple]) -> None:
-    execute("DELETE FROM bot_aggregates WHERE ts_close < NOW() - INTERVAL '72 hours'")
-    execute("DELETE FROM bot_aggregates WHERE ts_close >= NOW() - INTERVAL '24 hours'")
-    insert_bot_aggregates(rows)
+    try:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM aggregate_windows WHERE ts_close < NOW() - INTERVAL '72 hours'")
+            cur.execute("DELETE FROM aggregate_windows WHERE ts_close >= NOW() - INTERVAL '72 hours'")
+
+            batch_size = int(os.getenv("AGGREGATE_INSERT_BATCH_SIZE", "5000"))
+            insert_sql = """
+            INSERT INTO aggregate_windows(
+                metric, window_code, ts_open, ts_close, exchange, symbol,
+                open_value, high_value, low_value, close_value,
+                sum_value, avg_value, delta_pct, unique_candles,
+                source_cycle_ts, built_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            """
+
+            for i in range(0, len(rows), batch_size):
+                batch = [
+                    (
+                        metric, timeframe, ts_open, ts_close, exchange, symbol,
+                        open_value, high_value, low_value, close_value,
+                        sum_value, avg_value, delta_pct, unique_candles,
+                        ts_close,
+                    )
+                    for (
+                        metric, timeframe, ts_open, ts_close, exchange, symbol,
+                        open_value, high_value, low_value, close_value,
+                        sum_value, avg_value, delta_pct, unique_candles,
+                    ) in rows[i:i + batch_size]
+                ]
+                cur.executemany(insert_sql, batch)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.autocommit = prev_autocommit
 
 def replace_validation(rows: list[tuple]) -> None:
     execute("DELETE FROM validation_audit")
@@ -637,6 +931,244 @@ def replace_gaps(rows: list[tuple]) -> None:
             missing_candles,
             gap_minutes
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
+
+
+def replace_oi_core_state(rows: list[tuple]) -> None:
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO oi_core_state(
+            exchange,
+            symbol,
+            current_stage,
+            oi_pattern,
+            oi_pattern_code,
+            oi_pattern_label,
+            oi_direction,
+            oi_angle,
+            oi_stability,
+            oi_retention,
+            oi_breakdown,
+            oi_direction_summary,
+            oi_angle_summary,
+            oi_stability_summary,
+            oi_retention_summary,
+            oi_breakdown_summary,
+            price_state_summary,
+            price_block_level_summary,
+            volume_state_summary,
+            volume_confidence_summary,
+            oi_stage_age_minutes,
+            oi_transition_permission,
+            blocked_by_price,
+            blocked_stage_max,
+            volume_confirmation,
+            decision_reason,
+            block_reason,
+            breakdown_reason,
+            latest_cycle_ts,
+            updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (exchange, symbol)
+        DO UPDATE SET
+            current_stage = EXCLUDED.current_stage,
+            oi_pattern = EXCLUDED.oi_pattern,
+            oi_pattern_code = EXCLUDED.oi_pattern_code,
+            oi_pattern_label = EXCLUDED.oi_pattern_label,
+            oi_direction = EXCLUDED.oi_direction,
+            oi_angle = EXCLUDED.oi_angle,
+            oi_stability = EXCLUDED.oi_stability,
+            oi_retention = EXCLUDED.oi_retention,
+            oi_breakdown = EXCLUDED.oi_breakdown,
+            oi_direction_summary = EXCLUDED.oi_direction_summary,
+            oi_angle_summary = EXCLUDED.oi_angle_summary,
+            oi_stability_summary = EXCLUDED.oi_stability_summary,
+            oi_retention_summary = EXCLUDED.oi_retention_summary,
+            oi_breakdown_summary = EXCLUDED.oi_breakdown_summary,
+            price_state_summary = EXCLUDED.price_state_summary,
+            price_block_level_summary = EXCLUDED.price_block_level_summary,
+            volume_state_summary = EXCLUDED.volume_state_summary,
+            volume_confidence_summary = EXCLUDED.volume_confidence_summary,
+            oi_stage_age_minutes = EXCLUDED.oi_stage_age_minutes,
+            oi_transition_permission = EXCLUDED.oi_transition_permission,
+            blocked_by_price = EXCLUDED.blocked_by_price,
+            blocked_stage_max = EXCLUDED.blocked_stage_max,
+            volume_confirmation = EXCLUDED.volume_confirmation,
+            decision_reason = EXCLUDED.decision_reason,
+            block_reason = EXCLUDED.block_reason,
+            breakdown_reason = EXCLUDED.breakdown_reason,
+            latest_cycle_ts = EXCLUDED.latest_cycle_ts,
+            updated_at = NOW()
+        """, rows)
+
+
+def replace_oi_window_state(rows: list[tuple]) -> None:
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO oi_window_state(
+            exchange,
+            symbol,
+            window_code,
+            oi_direction,
+            oi_angle,
+            oi_stability,
+            oi_retention,
+            oi_breakdown,
+            oi_pattern,
+            oi_pattern_code,
+            oi_pattern_label,
+            price_state_code,
+            price_state_label,
+            price_block_level,
+            volume_state_code,
+            volume_state_label,
+            volume_confidence_effect,
+            window_growth_pct,
+            window_weight,
+            visual_label,
+            cycle_ts,
+            updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (exchange, symbol, window_code)
+        DO UPDATE SET
+            oi_direction = EXCLUDED.oi_direction,
+            oi_angle = EXCLUDED.oi_angle,
+            oi_stability = EXCLUDED.oi_stability,
+            oi_retention = EXCLUDED.oi_retention,
+            oi_breakdown = EXCLUDED.oi_breakdown,
+            oi_pattern = EXCLUDED.oi_pattern,
+            oi_pattern_code = EXCLUDED.oi_pattern_code,
+            oi_pattern_label = EXCLUDED.oi_pattern_label,
+            price_state_code = EXCLUDED.price_state_code,
+            price_state_label = EXCLUDED.price_state_label,
+            price_block_level = EXCLUDED.price_block_level,
+            volume_state_code = EXCLUDED.volume_state_code,
+            volume_state_label = EXCLUDED.volume_state_label,
+            volume_confidence_effect = EXCLUDED.volume_confidence_effect,
+            window_growth_pct = EXCLUDED.window_growth_pct,
+            window_weight = EXCLUDED.window_weight,
+            visual_label = EXCLUDED.visual_label,
+            cycle_ts = EXCLUDED.cycle_ts,
+            updated_at = NOW()
+        """, rows)
+
+
+def replace_core_state_v2(rows: list[tuple]) -> None:
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO core_state_v2(
+            exchange,
+            symbol,
+            latest_cycle_ts,
+            current_stage,
+            stage_age_minutes,
+            transition_permission,
+            manual_reset_required,
+            price_hard_ban,
+            phase_reason,
+            oi_summary,
+            price_summary,
+            volume_summary,
+            updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,NOW())
+        ON CONFLICT (exchange, symbol)
+        DO UPDATE SET
+            latest_cycle_ts = EXCLUDED.latest_cycle_ts,
+            current_stage = EXCLUDED.current_stage,
+            stage_age_minutes = EXCLUDED.stage_age_minutes,
+            transition_permission = EXCLUDED.transition_permission,
+            manual_reset_required = EXCLUDED.manual_reset_required,
+            price_hard_ban = EXCLUDED.price_hard_ban,
+            phase_reason = EXCLUDED.phase_reason,
+            oi_summary = EXCLUDED.oi_summary,
+            price_summary = EXCLUDED.price_summary,
+            volume_summary = EXCLUDED.volume_summary,
+            updated_at = NOW()
+        """, rows)
+
+
+def replace_window_state_v2(rows: list[tuple]) -> None:
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO window_state_v2(
+            exchange,
+            symbol,
+            cycle_ts,
+            window_code,
+            window_weight,
+            oi_slope_class,
+            oi_slope_value,
+            oi_hold_class,
+            oi_pullback_class,
+            oi_smoothness_class,
+            price_regime,
+            price_direction,
+            price_hard_ban,
+            volume_class,
+            volume_10x_confirmed,
+            updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (exchange, symbol, window_code)
+        DO UPDATE SET
+            cycle_ts = EXCLUDED.cycle_ts,
+            window_weight = EXCLUDED.window_weight,
+            oi_slope_class = EXCLUDED.oi_slope_class,
+            oi_slope_value = EXCLUDED.oi_slope_value,
+            oi_hold_class = EXCLUDED.oi_hold_class,
+            oi_pullback_class = EXCLUDED.oi_pullback_class,
+            oi_smoothness_class = EXCLUDED.oi_smoothness_class,
+            price_regime = EXCLUDED.price_regime,
+            price_direction = EXCLUDED.price_direction,
+            price_hard_ban = EXCLUDED.price_hard_ban,
+            volume_class = EXCLUDED.volume_class,
+            volume_10x_confirmed = EXCLUDED.volume_10x_confirmed,
+            updated_at = NOW()
+        """, rows)
+
+
+def insert_transition_history_v2(rows: list[tuple]) -> None:
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO transition_history_v2(
+            exchange,
+            symbol,
+            from_stage,
+            to_stage,
+            cycle_ts,
+            transition_allowed,
+            stage_age_before_transition,
+            reason,
+            created_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        """, rows)
+
+
+def insert_oi_stage_history(rows: list[tuple]) -> None:
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO oi_stage_history(
+            exchange,
+            symbol,
+            from_stage,
+            to_stage,
+            transition_reason,
+            transition_allowed,
+            stage_age_before_transition,
+            cycle_ts,
+            created_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
         """, rows)
 
 
@@ -964,7 +1496,7 @@ def load_quarantine_symbols(min_coverage_pct: float = 95.0) -> set[tuple[str, st
 def cleanup_old(days: int) -> None:
     raw_days = int(days or RAW_RETENTION_DAYS)
 
-    for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
+    for table in ["oi_raw", "price_raw", "volume_raw"]:
         rows = execute(
             f"DELETE FROM {table} WHERE ts_open < NOW() - (%s || ' days')::interval",
             (raw_days,),
@@ -972,16 +1504,18 @@ def cleanup_old(days: int) -> None:
         print(f"RAW_CLEANUP_TABLE table={table} rows_deleted={int(rows or 0)} retention_days={raw_days}")
 
     derived_hours = int(os.getenv("DERIVED_RETENTION_HOURS", "72"))
-    derived_tables = [
-        "bot_aggregates",
-        "market_research",
-        "market_price_state",
-        "market_volume_state",
-        "market_oi_slope",
-        "market_silence",
-        "market_phase_source",
-        "market_oi_slope_staging",
-    ]
+    derived_tables = ["aggregate_windows"]
+
+    if os.getenv("CLEANUP_LEGACY_DERIVED_TABLES") == "1":
+        derived_tables.extend([
+            "market_research",
+            "market_price_state",
+            "market_volume_state",
+            "market_oi_slope",
+            "market_silence",
+            "market_phase_source",
+            "market_oi_slope_staging",
+        ])
 
     for table in derived_tables:
         try:
@@ -1005,7 +1539,7 @@ def migrate_canonical_ts_close() -> None:
         return
 
     with _conn() as conn, conn.cursor() as cur:
-        for table in ["oi_5m_сырые", "price_5m_сырые", "volume_5m_сырые"]:
+        for table in ["oi_raw", "price_raw", "volume_raw"]:
             cur.execute(
                 f"""
                 UPDATE {table}
