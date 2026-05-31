@@ -6,40 +6,44 @@ from db import fetch, execute
 
 
 REQUIRED_TABLES = [
-    "oi_5m_сырые",
-    "price_5m_сырые",
-    "volume_5m_сырые",
+    "oi_raw",
+    "price_raw",
+    "volume_raw",
     "active_symbol_universe",
-    "bot_aggregates",
-    "market_research",
-    "market_price_state",
-    "market_volume_state",
-    "market_oi_slope",
-    "market_silence",
-    "market_phase_source",
-    "market_phase",
-    "market_phase_history",
+    "aggregate_windows",
+    "oi_core_state",
+    "oi_window_state",
+    "oi_stage_history",
 ]
 
 REQUIRED_COLUMNS = {
-    "market_phase": [
-        "exchange", "symbol", "timeframe",
-        "phase", "phase_name",
-        "phase_updated_at",
-        "stage1_started_at",
-        "stage2_started_at",
-        "stage3_started_at",
+    "oi_core_state": [
+        "exchange", "symbol",
+        "current_stage",
+        "oi_pattern_code",
+        "oi_transition_permission",
+        "oi_stage_age_minutes",
+        "latest_cycle_ts",
+        "decision_reason",
     ],
-    "market_phase_source": [
-        "exchange", "symbol", "timeframe", "ts_close",
-        "oi_structure", "oi_priority", "oi_hold_state",
-        "oi_trend_15m", "oi_trend_30m", "oi_trend_1h", "oi_trend_4h",
-        "price_structure", "volume_structure",
+    "oi_window_state": [
+        "exchange", "symbol", "window_code",
+        "oi_pattern_code",
+        "price_state_code",
+        "volume_state_code",
+        "cycle_ts",
+    ],
+    "oi_stage_history": [
+        "exchange", "symbol",
+        "from_stage", "to_stage",
+        "transition_reason",
+        "transition_allowed",
+        "cycle_ts",
     ],
 }
 
 LEGACY_COLUMNS_ABSENT = {
-    "market_phase": ["ts_close"],
+    "oi_core_state": ["timeframe", "phase", "phase_name"],
 }
 
 
@@ -102,21 +106,47 @@ def main() -> None:
             fail(f"table={table} legacy_columns_present={present}")
         print(f"STARTUP_CHECK legacy_absent_ok table={table}")
 
-    phase = fetch("""
+    aggregates = fetch("""
         SELECT
             COUNT(*) AS rows,
-            MAX(phase_updated_at) AS latest
-        FROM market_phase
+            MAX(ts_close) AS latest,
+            EXTRACT(EPOCH FROM (NOW() - MAX(ts_close))) / 60.0 AS age_minutes
+        FROM aggregate_windows
     """)
-    print(f"STARTUP_CHECK market_phase {dict(phase[0]) if phase else None}")
+    print(f"STARTUP_CHECK aggregate_windows {dict(aggregates[0]) if aggregates else None}")
+    if not aggregates or int(aggregates[0].get("rows") or 0) <= 0:
+        fail("aggregate_windows_empty")
 
-    source = fetch("""
+    core_state = fetch("""
         SELECT
             COUNT(*) AS rows,
-            MAX(ts_close) AS latest
-        FROM market_phase_source
+            MAX(latest_cycle_ts) AS latest,
+            EXTRACT(EPOCH FROM (NOW() - MAX(latest_cycle_ts))) / 60.0 AS age_minutes
+        FROM oi_core_state
     """)
-    print(f"STARTUP_CHECK market_phase_source {dict(source[0]) if source else None}")
+    print(f"STARTUP_CHECK oi_core_state {dict(core_state[0]) if core_state else None}")
+    if not core_state or int(core_state[0].get("rows") or 0) <= 0:
+        fail("oi_core_state_empty")
+
+    window_state = fetch("""
+        SELECT
+            COUNT(*) AS rows,
+            MAX(cycle_ts) AS latest,
+            EXTRACT(EPOCH FROM (NOW() - MAX(cycle_ts))) / 60.0 AS age_minutes
+        FROM oi_window_state
+    """)
+    print(f"STARTUP_CHECK oi_window_state {dict(window_state[0]) if window_state else None}")
+    if not window_state or int(window_state[0].get("rows") or 0) <= 0:
+        fail("oi_window_state_empty")
+
+    stage_history = fetch("""
+        SELECT
+            COUNT(*) AS rows,
+            MAX(cycle_ts) AS latest,
+            EXTRACT(EPOCH FROM (NOW() - MAX(cycle_ts))) / 60.0 AS age_minutes
+        FROM oi_stage_history
+    """)
+    print(f"STARTUP_CHECK oi_stage_history {dict(stage_history[0]) if stage_history else None}")
 
     print("STARTUP_CHECK_OK")
 

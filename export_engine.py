@@ -3,37 +3,61 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import csv
-import zipfile
-import os
+import json
 import resource
+import zipfile
 
-from config import ПАПКА_ДАННЫХ, APP_VERSION, QUICK_EXPORT_CANDLES, RESEARCH_EXPORT_DAYS, RESEARCH_30D_EXPORT_DAYS
-from db import fetch, active_universe_sql
+from config import (
+    ПАПКА_ДАННЫХ,
+    APP_VERSION,
+    QUICK_EXPORT_CANDLES,
+    RESEARCH_EXPORT_DAYS,
+    RESEARCH_30D_EXPORT_DAYS,
+)
+from db import active_universe_sql, fetch
 
 
+RUNTIME_REPORTS_DIR = Path(__file__).resolve().parent / "runtime_reports"
 
-LEGACY_EXPORT_FILES = {
-    "market_regime.csv",
-    "regime_states.csv",
-    "metric_alignment.csv",
-    "stage_metrics_table.csv",
-    "stage_calibration_template.csv",
+WINDOW_ORDER = {
+    "15м": 1,
+    "30м": 2,
+    "1ч": 3,
+    "4ч": 4,
+    "12ч": 5,
+    "24ч": 6,
 }
 
 
-def _cleanup_legacy_exports() -> None:
-    for filename in LEGACY_EXPORT_FILES:
-        try:
-            (ПАПКА_ДАННЫХ / filename).unlink(missing_ok=True)
-        except Exception:
-            pass
+def _safe_fetch(sql: str, params: tuple = ()) -> list[dict]:
+    try:
+        rows = fetch(sql, params) or []
+        return [row for row in rows if row is not None]
+    except Exception:
+        return []
 
 
-def _write_csv(path: Path, header: list[str], rows: list[list]) -> None:
+def _write_dict_csv(path: Path, rows: list[dict], preferred: list[str] | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [dict(row) for row in (rows or []) if row is not None]
+
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+
+    keys: list[str] = []
+    if preferred:
+        for key in preferred:
+            if any(key in row for row in rows):
+                keys.append(key)
+    for row in rows:
+        for key in row.keys():
+            if key not in keys:
+                keys.append(key)
+
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
         writer.writerows(rows)
 
 
@@ -50,34 +74,22 @@ def _zip(zip_path: Path, files: list[Path]) -> None:
                 z.write(file, arcname=file.name)
 
 
-def _safe_fetch(sql: str, params: tuple = ()) -> list[dict]:
+def _read_text(path: Path) -> str:
     try:
-        rows = fetch(sql, params) or []
-        return [row for row in rows if row is not None]
+        return path.read_text(encoding="utf-8")
     except Exception:
-        return []
+        return ""
 
 
-def _v(row, key: str, default=None):
-    if row is None:
-        return default
-
+def _read_json(path: Path) -> dict:
     try:
-        return row.get(key, default)
-    except AttributeError:
-        try:
-            return row[key]
-        except Exception:
-            return default
-
-
-def _rows(rows):
-    return [row for row in (rows or []) if row is not None]
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def _runtime_memory_mb() -> float:
     try:
-        # macOS returns bytes, Linux returns KB. Railway/Linux will be KB.
         usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         if usage > 10_000_000:
             return usage / 1024 / 1024
@@ -86,1308 +98,438 @@ def _runtime_memory_mb() -> float:
         return 0.0
 
 
-def _fmt_pct(value) -> str:
-    try:
-        return f"{float(value):.4f}%"
-    except Exception:
-        return "n/a"
+def _window_sort(value: str) -> int:
+    return WINDOW_ORDER.get(str(value or ""), 99)
 
 
-def _fetch_top_oi_rows(since, timeframe: str, limit: int = 100):
-    latest = _safe_fetch("""
-        SELECT MAX(ts_close) AS max_ts
-        FROM market_oi_slope
-        WHERE timeframe = %s
-          AND stage >= 1
-    """, (timeframe,))
+def _mode_since(mode: str) -> tuple[datetime, str, str]:
+    now = datetime.now(timezone.utc)
+    if mode == "research_30d":
+        return now - timedelta(days=RESEARCH_30D_EXPORT_DAYS), "research_30d", f"{RESEARCH_30D_EXPORT_DAYS}d"
+    if mode == "research_7d":
+        return now - timedelta(days=RESEARCH_EXPORT_DAYS), "research_7d", f"{RESEARCH_EXPORT_DAYS}d"
+    return now - timedelta(minutes=QUICK_EXPORT_CANDLES * 5), "quick", f"{QUICK_EXPORT_CANDLES * 5}m"
 
-    latest_ts = _v(latest[0], "max_ts") if latest else None
 
-    if not latest_ts:
-        return []
+def _raw_market_rows(since: datetime) -> list[dict]:
+    return _safe_fetch(
+        """
+        SELECT
+            o.ts_open,
+            o.ts_close,
+            o.exchange,
+            o.symbol,
+            o.oi_open,
+            o.oi_high,
+            o.oi_low,
+            o.oi_close,
+            p.price_open,
+            p.price_high,
+            p.price_low,
+            p.price_close,
+            v.volume,
+            o.cycle_ts,
+            o.source,
+            o.collected_at
+        FROM oi_raw o
+        LEFT JOIN price_raw p
+          ON p.exchange = o.exchange
+         AND p.symbol = o.symbol
+         AND p.ts_close = o.ts_close
+        LEFT JOIN volume_raw v
+          ON v.exchange = o.exchange
+         AND v.symbol = o.symbol
+         AND v.ts_close = o.ts_close
+        WHERE o.ts_close >= %s
+        ORDER BY o.ts_close DESC, o.exchange, o.symbol
+        """,
+        (since,),
+    )
 
-    return _safe_fetch("""
+
+def _aggregate_rows(since: datetime) -> list[dict]:
+    return _safe_fetch(
+        """
         SELECT *
-        FROM market_oi_slope
-        WHERE timeframe = %s
-          AND ts_close >= %s - INTERVAL '60 minutes'
-          AND stage >= 1
-        ORDER BY
-            stage DESC,
-            oi_priority DESC,
-            
-            oi_hold_state DESC,
-            oi_acceleration DESC,
-            ts_close DESC,
-            exchange,
-            symbol
-        LIMIT %s
-    """, (timeframe, latest_ts, limit))
+        FROM aggregate_windows
+        WHERE ts_close >= %s
+        ORDER BY ts_close DESC, metric, window_code, exchange, symbol
+        """,
+        (since,),
+    )
 
 
-def _num(row, key: str, default: float = 0.0) -> float:
-    try:
-        return float(_v(row, key, default) or default)
-    except Exception:
-        return default
+def _window_rows(since: datetime) -> list[dict]:
+    rows = _safe_fetch(
+        """
+        SELECT c.current_stage, w.*
+        FROM oi_window_state w
+        LEFT JOIN oi_core_state c
+          ON c.exchange = w.exchange
+         AND c.symbol = w.symbol
+        WHERE w.cycle_ts >= %s
+        ORDER BY w.cycle_ts DESC, w.exchange, w.symbol, w.window_code
+        """,
+        (since,),
+    )
+    return sorted(rows, key=lambda r: (
+        str(r.get("exchange") or ""),
+        str(r.get("symbol") or ""),
+        _window_sort(str(r.get("window_code") or "")),
+        str(r.get("cycle_ts") or ""),
+    ))
 
 
-def _continuation_score(oi, price, volume, alignment) -> float:
-    score = 0.0
-
-    oi_delta = abs(_num(oi, "oi_delta_pct"))
-    oi_accel = abs(_num(oi, "oi_acceleration"))
-    price_delta = abs(_num(price, "price_delta_pct"))
-    volume_norm = _num(volume, "volume_normalized")
-    alignment_score = _alignment_score(alignment)
-
-    if oi_delta >= 5:
-        score += 25
-    if oi_accel >= 3:
-        score += 25
-    if price_delta >= 2:
-        score += 20
-    if volume_norm >= 2:
-        score += 15
-    if alignment_score > 0:
-        score += min(alignment_score, 15)
-
-    return round(min(score, 100), 2)
+def _stage_summary_rows(core_rows: list[dict]) -> list[dict]:
+    summary: dict[int, dict] = {}
+    for row in core_rows:
+        stage = int(row.get("current_stage") or 0)
+        item = summary.setdefault(stage, {
+            "current_stage": stage,
+            "rows": 0,
+            "max_stage_age_minutes": 0.0,
+            "latest_cycle_ts": None,
+        })
+        item["rows"] += 1
+        try:
+            item["max_stage_age_minutes"] = max(item["max_stage_age_minutes"], float(row.get("oi_stage_age_minutes") or 0.0))
+        except Exception:
+            pass
+        latest = row.get("latest_cycle_ts")
+        if latest and (item["latest_cycle_ts"] is None or str(latest) > str(item["latest_cycle_ts"])):
+            item["latest_cycle_ts"] = latest
+    return sorted(summary.values(), key=lambda r: r["current_stage"], reverse=True)
 
 
-def _exhaustion_score(oi, price, volume, alignment) -> float:
-    score = 0.0
-
-    oi_delta = abs(_num(oi, "oi_delta_pct"))
-    oi_accel = abs(_num(oi, "oi_acceleration"))
-    price_delta = abs(_num(price, "price_delta_pct"))
-    volume_norm = _num(volume, "volume_normalized")
-    alignment_score = _alignment_score(alignment)
-
-    if oi_delta >= 8 and price_delta < 1:
-        score += 35
-    if oi_accel >= 5 and price_delta < 1.5:
-        score += 25
-    if volume_norm >= 2 and price_delta < 1:
-        score += 20
-    if alignment_score < 0:
-        score += min(abs(alignment_score), 20)
-
-    return round(min(score, 100), 2)
-
-
-def _liquidity_event_flag(oi, price, volume, alignment) -> int:
-    continuation = _continuation_score(oi, price, volume, alignment)
-    exhaustion = _exhaustion_score(oi, price, volume, alignment)
-
-    if continuation >= 60 or exhaustion >= 60:
-        return 1
-
-    return 0
+def _window_summary_rows(window_rows: list[dict]) -> list[dict]:
+    summary: dict[tuple[str, str], dict] = {}
+    for row in window_rows:
+        key = (str(row.get("window_code") or ""), str(row.get("oi_pattern_code") or ""))
+        item = summary.setdefault(key, {
+            "window_code": key[0],
+            "oi_pattern_code": key[1],
+            "oi_pattern_label": row.get("oi_pattern_label"),
+            "rows": 0,
+            "avg_growth_pct": 0.0,
+        })
+        item["rows"] += 1
+        try:
+            item["avg_growth_pct"] += float(row.get("window_growth_pct") or 0.0)
+        except Exception:
+            pass
+    out = []
+    for item in summary.values():
+        item["avg_growth_pct"] = round(item["avg_growth_pct"] / max(item["rows"], 1), 4)
+        out.append(item)
+    return sorted(out, key=lambda r: (_window_sort(r["window_code"]), -r["rows"], r["oi_pattern_code"]))
 
 
-STAGE_ENGINE_RULES = [
-    {
-        "stage_engine_state": "continuation",
-        "stage_engine_score": 90,
-        "min_alignment": 25,
-        "min_continuation": 70,
-        "max_exhaustion": 40,
-        "liquidity_event": 1,
-        "reason": "alignment confirms continuation: OI expansion + price/volume follow-through",
-    },
-    {
-        "stage_engine_state": "exhaustion",
-        "stage_engine_score": 85,
-        "max_alignment": -20,
-        "min_exhaustion": 60,
-        "reason": "exhaustion: OI/volume expanded but price failed to continue",
-    },
-    {
-        "stage_engine_state": "range",
-        "stage_engine_score": 70,
-        "min_exhaustion": 45,
-        "max_continuation": 55,
-        "reason": "range candidate: liquidity event without clean continuation",
-    },
-    {
-        "stage_engine_state": "watch",
-        "stage_engine_score": 45,
-        "min_continuation": 35,
-        "reason": "watch: partial activity, no deterministic regime confirmation",
-    }]
+def _top_window_rows(window_rows: list[dict], window_code: str, limit: int = 100) -> list[dict]:
+    rows = [row for row in window_rows if row.get("window_code") == window_code]
+    rows.sort(
+        key=lambda r: (
+            -(int(r.get("current_stage") or 0) if r.get("current_stage") is not None else 0),
+            -abs(float(r.get("window_growth_pct") or 0.0)),
+            str(r.get("exchange") or ""),
+            str(r.get("symbol") or ""),
+        )
+    )
+    return rows[:limit]
 
 
-def _stage_rule_match(rule: dict, alignment_score: float, continuation_score: float, exhaustion_score: float, liquidity_event_flag: int) -> bool:
-    if "min_alignment" in rule and alignment_score < rule["min_alignment"]:
-        return False
-    if "max_alignment" in rule and alignment_score > rule["max_alignment"]:
-        return False
-    if "min_continuation" in rule and continuation_score < rule["min_continuation"]:
-        return False
-    if "max_continuation" in rule and continuation_score > rule["max_continuation"]:
-        return False
-    if "min_exhaustion" in rule and exhaustion_score < rule["min_exhaustion"]:
-        return False
-    if "max_exhaustion" in rule and exhaustion_score > rule["max_exhaustion"]:
-        return False
-    if "liquidity_event" in rule and liquidity_event_flag != rule["liquidity_event"]:
-        return False
-    return True
+def _table_health_rows() -> list[dict]:
+    return _safe_fetch(
+        """
+        WITH h AS (
+            SELECT 'oi_raw' AS table_name, COUNT(*) AS rows, MAX(ts_close) AS latest_ts FROM oi_raw
+            UNION ALL SELECT 'price_raw', COUNT(*), MAX(ts_close) FROM price_raw
+            UNION ALL SELECT 'volume_raw', COUNT(*), MAX(ts_close) FROM volume_raw
+            UNION ALL SELECT 'aggregate_windows', COUNT(*), MAX(ts_close) FROM aggregate_windows
+            UNION ALL SELECT 'oi_core_state', COUNT(*), MAX(latest_cycle_ts) FROM oi_core_state
+            UNION ALL SELECT 'oi_window_state', COUNT(*), MAX(cycle_ts) FROM oi_window_state
+            UNION ALL SELECT 'oi_stage_history', COUNT(*), MAX(cycle_ts) FROM oi_stage_history
+            UNION ALL SELECT 'validation_audit', COUNT(*), MAX(ts_close) FROM validation_audit
+            UNION ALL SELECT 'coverage_report', COUNT(*), NULL::timestamptz FROM coverage_report
+            UNION ALL SELECT 'gap_report', COUNT(*), NULL::timestamptz FROM gap_report
+            UNION ALL SELECT 'active_symbol_universe', COUNT(*), MAX(activated_at) FROM active_symbol_universe
+            UNION ALL SELECT 'request_failure_report', COUNT(*), MAX(calculated_at) FROM request_failure_report
+        )
+        SELECT
+            table_name,
+            rows,
+            latest_ts,
+            CASE
+                WHEN latest_ts IS NULL THEN NULL
+                ELSE ROUND(EXTRACT(EPOCH FROM (NOW() - latest_ts)) / 60.0, 2)
+            END AS age_minutes,
+            CASE
+                WHEN rows = 0 THEN 'EMPTY'
+                WHEN latest_ts IS NULL THEN 'OK'
+                WHEN NOW() - latest_ts > INTERVAL '90 minutes' THEN 'STALE'
+                ELSE 'OK'
+            END AS status
+        FROM h
+        ORDER BY table_name
+        """
+    )
 
 
-def _stage_engine(oi, price, volume, alignment) -> dict:
-    alignment_score = _alignment_score(alignment)
-    continuation_score = _continuation_score(oi, price, volume, alignment)
-    exhaustion_score = _exhaustion_score(oi, price, volume, alignment)
-    liquidity_event_flag = _liquidity_event_flag(oi, price, volume, alignment)
-
-    for rule in STAGE_ENGINE_RULES:
-        if _stage_rule_match(
-            rule,
-            alignment_score,
-            continuation_score,
-            exhaustion_score,
-            liquidity_event_flag,
-        ):
-            return {
-                "stage_engine_state": rule["stage_engine_state"],
-                "stage_engine_score": rule["stage_engine_score"],
-                "stage_engine_reason": rule["reason"],
-            }
-
-    return {
-        "stage_engine_state": "neutral",
-        "stage_engine_score": 0,
-        "stage_engine_reason": "no deterministic stage rule matched",
-    }
-
-
-def _alignment_score_from_state(alignment) -> float:
-    state = str(_v(alignment, "alignment_state", "") or "").strip().lower()
-
-    scores = {
-        "strong continuation": 60,
-        "continuation": 45,
-        "bullish continuation": 45,
-        "bearish continuation": 45,
-        "noisy expansion": 45,
-        "expansion": 20,
-        "aligned": 45,
-        "silent accumulation": 15,
-        "neutral": 0,
-        "mixed": 0,
-        "range": -10,
-        "exhausted": -45,
-        "exhaustion": -45,
-        "bullish exhaustion": -45,
-        "bearish exhaustion": -45,
-        "failed continuation": -35,
-        "divergence": -35,
-    }
-
-    if state in scores:
-        return float(scores[state])
-
-    return 0.0
+def _storage_manifest_text(files: list[Path], mode: str, range_label: str) -> str:
+    lines = [
+        f"generated_at_utc={datetime.now(timezone.utc).isoformat()}",
+        f"app_version={APP_VERSION}",
+        f"mode={mode}",
+        f"range={range_label}",
+        "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt",
+        "surface=oi_only_runtime",
+        "pipeline=oi_raw/price_raw/volume_raw -> aggregate_windows -> oi_core_state/oi_window_state/oi_stage_history",
+        "",
+        "files:",
+    ]
+    for file in files:
+        if file.exists():
+            lines.append(f"- {file.name} size={file.stat().st_size}")
+    return "\n".join(lines) + "\n"
+def _storage_health_text(files: list[Path]) -> str:
+    now = datetime.now(timezone.utc)
+    lines = [
+        f"generated_at_utc={now.isoformat()}",
+        f"export_process_rss_mb={round(_runtime_memory_mb(), 2)}",
+        "",
+        "artifact,status,size,age_minutes",
+    ]
+    for file in files:
+        if not file.exists():
+            lines.append(f"{file.name},MISSING,0,")
+            continue
+        mtime = datetime.fromtimestamp(file.stat().st_mtime, timezone.utc)
+        age = round((now - mtime).total_seconds() / 60.0, 2)
+        status = "STALE" if age > 180 else "OK"
+        lines.append(f"{file.name},{status},{file.stat().st_size},{age}")
+    return "\n".join(lines) + "\n"
 
 
-def _alignment_score(alignment) -> float:
-    raw = _v(alignment, "alignment_score", None)
+def _runtime_health_text(table_health: list[dict], core_rows: list[dict], stage_history_rows: list[dict]) -> str:
+    runtime = _read_json(RUNTIME_REPORTS_DIR / "runtime_health.json")
+    cycle = _read_json(RUNTIME_REPORTS_DIR / "cycle_status.json")
+    watchdog = _read_text(RUNTIME_REPORTS_DIR / "watchdog_status.txt").strip()
+    snapshot = _read_text(RUNTIME_REPORTS_DIR / "snapshot_status.txt").strip()
 
-    try:
-        if raw is not None and raw != "":
-            return float(raw)
-    except Exception:
-        pass
+    active_stage_rows = [row for row in core_rows if int(row.get("current_stage") or 0) > 0]
+    stage3_rows = [row for row in core_rows if int(row.get("current_stage") or 0) == 3]
 
-    return _alignment_score_from_state(alignment)
+    lines = [
+        f"generated_at_utc={datetime.now(timezone.utc).isoformat()}",
+        f"app_version={APP_VERSION}",
+        f"canonical_tables_ok={sum(1 for row in table_health if row.get('status') == 'OK')}",
+        f"canonical_tables_stale={sum(1 for row in table_health if row.get('status') == 'STALE')}",
+        f"core_rows={len(core_rows)}",
+        f"active_stage_rows={len(active_stage_rows)}",
+        f"stage3_rows={len(stage3_rows)}",
+        f"stage_history_rows={len(stage_history_rows)}",
+        f"rss_mb={runtime.get('rss_mb', 'n/a')}",
+        f"rss_peak_mb={runtime.get('rss_peak_mb', 'n/a')}",
+        f"rss_health={runtime.get('rss_health', 'unknown')}",
+        f"watchdog_health={runtime.get('watchdog_health', 'unknown')}",
+        f"collect_reserve_health={runtime.get('collect_reserve_health', 'unknown')}",
+        f"snapshot_health={runtime.get('snapshot_health', 'unknown')}",
+        f"cycle_health={cycle.get('cycle_health', 'unknown')}",
+        f"cycle_elapsed_seconds={cycle.get('cycle_elapsed_seconds', 'n/a')}",
+        f"cycle_sleep_seconds={cycle.get('cycle_sleep_seconds', 'n/a')}",
+        f"cycle_reserve_pct={cycle.get('cycle_reserve_pct', 'n/a')}",
+        f"latest_core_cycle_ts={max([str(row.get('latest_cycle_ts') or '') for row in core_rows] or [''])}",
+        "",
+        "watchdog_status:",
+        watchdog or "missing",
+        "",
+        "snapshot_status:",
+        snapshot or "missing",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _research_report_text(
+    mode: str,
+    range_label: str,
+    raw_rows: list[dict],
+    aggregate_rows: list[dict],
+    core_rows: list[dict],
+    window_rows: list[dict],
+    stage_history_rows: list[dict],
+) -> str:
+    active_stage_rows = [row for row in core_rows if int(row.get("current_stage") or 0) > 0]
+    blocked_rows = [row for row in core_rows if row.get("blocked_by_price")]
+    top_stage = sorted(active_stage_rows, key=lambda r: (
+        -int(r.get("current_stage") or 0),
+        -float(r.get("oi_stage_age_minutes") or 0.0),
+        str(r.get("exchange") or ""),
+        str(r.get("symbol") or ""),
+    ))[:15]
+
+    lines = [
+        f"generated_at_utc={datetime.now(timezone.utc).isoformat()}",
+        f"app_version={APP_VERSION}",
+        f"mode={mode}",
+        f"range={range_label}",
+        f"raw_market_5m_rows={len(raw_rows)}",
+        f"aggregate_windows_rows={len(aggregate_rows)}",
+        f"oi_core_state_rows={len(core_rows)}",
+        f"oi_window_state_rows={len(window_rows)}",
+        f"oi_stage_history_rows={len(stage_history_rows)}",
+        f"active_stage_rows={len(active_stage_rows)}",
+        f"blocked_by_price_rows={len(blocked_rows)}",
+        "",
+        "stage_distribution:",
+    ]
+
+    for row in _stage_summary_rows(core_rows):
+        lines.append(
+            f"- stage={row['current_stage']} rows={row['rows']} max_age_m={row['max_stage_age_minutes']} latest={row['latest_cycle_ts']}"
+        )
+
+    lines.extend(["", "top_stage_watch:"])
+    for row in top_stage:
+        lines.append(
+            "- "
+            f"{row.get('exchange')} {row.get('symbol')} "
+            f"stage={row.get('current_stage')} "
+            f"pattern={row.get('oi_pattern_label') or row.get('oi_pattern_code')} "
+            f"price={row.get('price_state_summary')} "
+            f"volume={row.get('volume_state_summary')} "
+            f"age={row.get('oi_stage_age_minutes')}m "
+            f"reason={row.get('decision_reason')}"
+        )
+
+    return "\n".join(lines) + "\n"
 
 
 def rebuild_exports(mode: str = "quick") -> Path:
-    now = datetime.now(timezone.utc)
+    since, suffix, range_label = _mode_since(mode)
 
-    if mode == "research_30d":
-        since = now - timedelta(days=RESEARCH_30D_EXPORT_DAYS)
-        suffix = "research_30d"
-    elif mode == "research_7d":
-        since = now - timedelta(days=RESEARCH_EXPORT_DAYS)
-        suffix = "research_7d"
-    else:
-        since = now - timedelta(minutes=QUICK_EXPORT_CANDLES * 5)
-        suffix = "quick"
-
-    oi = fetch(f"""
-        SELECT ts_open, ts_close, exchange, symbol, oi_open, oi_high, oi_low, oi_close
-        FROM oi_5m_сырые x
-        WHERE ts_open >= %s
-          AND {active_universe_sql("x")}
-        ORDER BY exchange, symbol, ts_open
-    """, (since,))
-
-    price = fetch(f"""
-        SELECT ts_open, ts_close, exchange, symbol, price_open, price_high, price_low, price_close
-        FROM price_5m_сырые x
-        WHERE ts_open >= %s
-          AND {active_universe_sql("x")}
-        ORDER BY exchange, symbol, ts_open
-    """, (since,))
-
-    volume = fetch(f"""
-        SELECT ts_open, ts_close, exchange, symbol, volume
-        FROM volume_5m_сырые x
-        WHERE ts_open >= %s
-          AND {active_universe_sql("x")}
-        ORDER BY exchange, symbol, ts_open
-    """, (since,))
-
-    oi_map = {(r["exchange"], r["symbol"], r["ts_open"]): r for r in oi}
-    price_map = {(r["exchange"], r["symbol"], r["ts_open"]): r for r in price}
-    volume_map = {(r["exchange"], r["symbol"], r["ts_open"]): r for r in volume}
-
-    keys = sorted(set(oi_map.keys()) | set(price_map.keys()) | set(volume_map.keys()), key=lambda x: (x[0], x[1], x[2]))
-
-    raw_rows = []
-    missing_price = 0
-    missing_volume = 0
-    missing_oi = 0
-
-    for exchange, symbol, ts_open in keys:
-        oi_row = oi_map.get((exchange, symbol, ts_open))
-        price_row = price_map.get((exchange, symbol, ts_open))
-        volume_row = volume_map.get((exchange, symbol, ts_open))
-        close_norm = ts_open + timedelta(minutes=5)
-
-        if not oi_row:
-            missing_oi += 1
-        if not price_row:
-            missing_price += 1
-        if not volume_row:
-            missing_volume += 1
-
-        raw_rows.append([
-            ts_open, close_norm, close_norm, exchange, symbol,
-            oi_row["oi_open"] if oi_row else None,
-            oi_row["oi_high"] if oi_row else None,
-            oi_row["oi_low"] if oi_row else None,
-            oi_row["oi_close"] if oi_row else None,
-            price_row["price_open"] if price_row else None,
-            price_row["price_high"] if price_row else None,
-            price_row["price_low"] if price_row else None,
-            price_row["price_close"] if price_row else None,
-            volume_row["volume"] if volume_row else None])
-
-    aggregates = fetch("""
+    raw_rows = _raw_market_rows(since)
+    aggregate_rows = _aggregate_rows(since)
+    audit_rows = _safe_fetch(
+        "SELECT * FROM validation_audit WHERE ts_close >= %s ORDER BY ts_close DESC, metric, timeframe, exchange, symbol",
+        (since,),
+    )
+    coverage_rows = _safe_fetch("SELECT * FROM coverage_report ORDER BY metric, exchange, symbol")
+    gap_rows = _safe_fetch("SELECT * FROM gap_report ORDER BY metric, exchange, symbol, gap_start")
+    active_universe_rows = _safe_fetch(
+        f"SELECT * FROM {active_universe_sql()} ORDER BY exchange, symbol"
+    )
+    request_failure_rows = _safe_fetch(
+        "SELECT * FROM request_failure_report WHERE calculated_at >= %s ORDER BY calculated_at DESC, exchange, symbol, data_type",
+        (since,),
+    )
+    core_rows = _safe_fetch(
+        """
         SELECT *
-        FROM bot_aggregates
-        WHERE ts_close >= %s
-        ORDER BY metric, exchange, symbol, timeframe, ts_close
-    """, (since,))
-
-    audit = fetch("""
+        FROM oi_core_state
+        ORDER BY current_stage DESC, oi_stage_age_minutes DESC NULLS LAST, latest_cycle_ts DESC, exchange, symbol
+        """
+    )
+    window_rows = _window_rows(since)
+    stage_history_rows = _safe_fetch(
+        """
         SELECT *
-        FROM validation_audit
-        WHERE ts_close >= %s
-        ORDER BY metric, exchange, symbol, timeframe, ts_close
-    """, (since,))
-
-    integrity = _safe_fetch("SELECT * FROM raw_integrity_report ORDER BY metric, exchange, symbol")
-    coverage = _safe_fetch("SELECT * FROM coverage_report ORDER BY metric, exchange, symbol")
-    gaps = _safe_fetch("SELECT * FROM gap_report ORDER BY metric, exchange, symbol, gap_start")
-
-    market_research = _safe_fetch("""
-        SELECT *
-        FROM market_research
-        WHERE ts_close >= %s
-        ORDER BY exchange, symbol, timeframe, ts_close
-    """, (since,))
-
-    market_states = _safe_fetch("""
-        SELECT
-            exchange,
-            symbol,
-            timeframe,
-            market_state,
-            COUNT(*) AS state_count,
-            AVG(continuation_score) AS avg_continuation_score,
-            AVG(exhaustion_score) AS avg_exhaustion_score,
-            AVG(compression_score) AS avg_compression_score
-        FROM market_research
-        WHERE ts_close >= %s
-        GROUP BY exchange, symbol, timeframe, market_state
-        ORDER BY exchange, symbol, timeframe, state_count DESC
-    """, (since,))
-
-    top_volume_anomalies = _safe_fetch("""
-        SELECT *
-        FROM market_volume_state
-        WHERE ts_close >= %s
-          AND (
-              volume_state_name = 'аномальный объем'
-              OR noise_state != 'не шум'
-              OR volume_percentile >= 95
-          )
-        ORDER BY
-            CASE WHEN noise_state != 'не шум' THEN 1 ELSE 0 END DESC,
-            volume_percentile DESC,
-            volume_delta_pct DESC,
-            normalized_volume DESC,
-            ts_close DESC
-        LIMIT 500
-    """, (since,))
-
-    volume_state_summary = _safe_fetch("""
-        SELECT
-            exchange,
-            symbol,
-            timeframe,
-            volume_state_name,
-            COUNT(*) AS rows_count,
-            AVG(volume_delta_pct) AS avg_volume_delta_pct,
-            AVG(normalized_volume) AS avg_normalized_volume,
-            AVG(volume_percentile) AS avg_volume_percentile,
-            SUM(CASE WHEN noise_state != 'не шум' THEN 1 ELSE 0 END) AS noise_count
-        FROM market_volume_state
-        WHERE ts_close >= %s
-        GROUP BY exchange, symbol, timeframe, volume_state_name
-        ORDER BY noise_count DESC, rows_count DESC, exchange, symbol, timeframe
-    """, (since,))
-
-    market_volume_state = _safe_fetch("""
-        SELECT *
-        FROM market_volume_state
-        WHERE ts_close >= %s
-        ORDER BY exchange, symbol, timeframe, ts_close
-    """, (since,))
-
-    market_price_state = _safe_fetch("""
-        SELECT *
-        FROM market_price_state
-        WHERE ts_close >= %s
-        ORDER BY exchange, symbol, timeframe, ts_close
-    """, (since,))
-
-    market_oi_slope = _safe_fetch("""
-        SELECT *
-        FROM market_oi_slope
-        WHERE ts_close >= %s
-        ORDER BY stage DESC, oi_priority DESC,  oi_hold_state DESC, oi_acceleration DESC, exchange, symbol, timeframe, ts_close
-    """, (since,))
-
-    oi_slope_top = _safe_fetch("""
-        SELECT *
-        FROM market_oi_slope
-        WHERE ts_close >= %s
-          AND stage >= 1
-        ORDER BY
-            stage DESC,
-            oi_priority DESC,
-            
-            oi_hold_state DESC,
-            oi_acceleration DESC,
-            exchange,
-            symbol,
-            timeframe,
-            ts_close
-        LIMIT 300
-    """, (since,))
-
-    top_oi_15m = _fetch_top_oi_rows(since, "15м")
-    top_oi_30m = _fetch_top_oi_rows(since, "30м")
-    top_oi_1h = _fetch_top_oi_rows(since, "1ч")
-    top_oi_4h = _fetch_top_oi_rows(since, "4ч")
-
-
-    oi_slope_summary = _safe_fetch("""
-        SELECT
-            exchange,
-            timeframe,
-            stage_name,
-
-            COUNT(*) AS rows_count,
-
-            MIN(oi_priority) AS min_oi_priority,
-            AVG(oi_priority) AS avg_oi_priority,
-            MAX(oi_priority) AS max_oi_priority,
-
-
-            SUM(CASE WHEN oi_priority >= 3 THEN 1 ELSE 0 END) AS oi_priority_ge_3,
-            SUM(CASE WHEN oi_priority >= 4 THEN 1 ELSE 0 END) AS oi_priority_ge_4
-
-        FROM market_oi_slope
-        WHERE ts_close >= %s
-
-        GROUP BY
-            exchange,
-            timeframe,
-            stage_name,
-
-        ORDER BY
-            timeframe,
-            stage_name,
-            avg_oi_priority DESC,
-            rows_count DESC
-    """, (since,))
-
-    metric_alignment = []
-
-    oi_persistence = _safe_fetch("""
-        WITH base AS (
-            SELECT
-                exchange,
-                symbol,
-                timeframe,
-                ts_close,
-                oi_delta_pct,
-                oi_acceleration,
-
-                CASE
-                    WHEN oi_delta_pct > 0 THEN 1
-                    ELSE 0
-                END AS positive_flag
-
-            FROM market_oi_slope
-            WHERE ts_close >= %s
-              AND stage_name != 'нет сигнала'
-        ),
-
-        grouped AS (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY exchange, symbol, timeframe
-                    ORDER BY ts_close
-                )
-                -
-                ROW_NUMBER() OVER (
-                    PARTITION BY exchange, symbol, timeframe, positive_flag
-                    ORDER BY ts_close
-                ) AS grp
-            FROM base
-        )
-
-        SELECT
-            exchange,
-            symbol,
-            timeframe,
-            MAX(ts_close) AS ts_close,
-
-            COUNT(*) FILTER (
-                WHERE positive_flag = 1
-            ) AS positive_oi_windows,
-
-            ROUND(
-                SUM(
-                    CASE
-                        WHEN positive_flag = 1
-                        THEN oi_delta_pct
-                        ELSE 0
-                    END
-                )::numeric,
-                4
-            ) AS cumulative_oi_delta_pct,
-
-            ROUND(
-                AVG(
-                    CASE
-                        WHEN positive_flag = 1
-                        THEN oi_delta_pct
-                    END
-                )::numeric,
-                4
-            ) AS avg_oi_delta_pct,
-
-            ROUND(
-                AVG(
-                    CASE
-                        WHEN positive_flag = 1
-                        THEN oi_acceleration
-                    END
-                )::numeric,
-                4
-            ) AS avg_oi_acceleration,
-
-            CASE
-                WHEN COUNT(*) FILTER (
-                    WHERE positive_flag = 1
-                ) >= 6
-                AND SUM(
-                    CASE
-                        WHEN positive_flag = 1
-                        THEN oi_delta_pct
-                        ELSE 0
-                    END
-                ) >= 15
-                THEN 'устойчивый набор'
-
-                WHEN COUNT(*) FILTER (
-                    WHERE positive_flag = 1
-                ) >= 3
-                AND AVG(
-                    CASE
-                        WHEN positive_flag = 1
-                        THEN oi_acceleration
-                    END
-                ) >= 0.5
-                THEN 'ступенчатый набор'
-
-                WHEN COUNT(*) FILTER (
-                    WHERE positive_flag = 1
-                ) >= 1
-                THEN 'локальный всплеск'
-
-                ELSE 'нет набора'
-            END AS persistence_state
-
-        FROM grouped
-        GROUP BY exchange, symbol, timeframe, grp
-        ORDER BY ts_close DESC
-    """, (since,))
-
-    symbol_baseline = _safe_fetch("""
-        SELECT
-            exchange,
-            symbol,
-            timeframe,
-            COUNT(*) AS rows_count,
-
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY ABS(range_width_pct)) AS median_range_width_pct,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY ABS(price_delta_pct)) AS median_abs_price_delta_pct,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY ABS(volume_delta_pct)) AS median_abs_volume_delta_pct,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY ABS(oi_delta_pct)) AS median_abs_oi_delta_pct,
-
-            AVG(ABS(range_width_pct)) AS avg_range_width_pct,
-            AVG(ABS(price_delta_pct)) AS avg_abs_price_delta_pct,
-            AVG(ABS(volume_delta_pct)) AS avg_abs_volume_delta_pct,
-            AVG(ABS(oi_delta_pct)) AS avg_abs_oi_delta_pct
-        FROM market_research
-        WHERE ts_close >= %s
-          AND market_state != 'invalid_data'
-        GROUP BY exchange, symbol, timeframe
-        ORDER BY exchange, symbol, timeframe
-    """, (since,))
-
-    market_silence = _safe_fetch("""
-        SELECT *
-        FROM market_silence
-        WHERE ts_close >= %s
-        ORDER BY exchange, symbol, timeframe, ts_close
-    """, (since,))
-
-    silence_states = _safe_fetch("""
-        SELECT exchange, symbol, timeframe, stage, stage_name, COUNT(*) AS stage_count, AVG(score) AS avg_score
-        FROM market_silence
-        WHERE ts_close >= %s
-        GROUP BY exchange, symbol, timeframe, stage, stage_name
-        ORDER BY exchange, symbol, timeframe, stage
-    """, (since,))
-
-    storage_summary = _safe_fetch(f"""
-        SELECT metric, MIN(ts_open) AS oldest_ts, MAX(ts_open) AS newest_ts, COUNT(*) AS rows_count
-        FROM (
-            SELECT 'OI' AS metric, ts_open, exchange, symbol FROM oi_5m_сырые
-            UNION ALL
-            SELECT 'PRICE' AS metric, ts_open, exchange, symbol FROM price_5m_сырые
-            UNION ALL
-            SELECT 'VOLUME' AS metric, ts_open, exchange, symbol FROM volume_5m_сырые
-        ) x
-        WHERE {active_universe_sql("x")}
-        GROUP BY metric
-        ORDER BY metric
-    """)
-
-    active_universe = _safe_fetch("""
-        SELECT exchange, symbol, activated_at, source
-        FROM active_symbol_universe
-        ORDER BY exchange, symbol
-    """)
-
-    request_failures = _safe_fetch("""
-        SELECT calculated_at, exchange, symbol, data_type, error_type, error_message
-        FROM request_failure_report
-        ORDER BY exchange, symbol, data_type
-    """)
-
-    invalid_reasons = _safe_fetch("""
-        SELECT invalid_reason, COUNT(*) AS total
-        FROM market_research
-        WHERE ts_close >= %s
-          AND market_state = 'invalid_data'
-        GROUP BY invalid_reason
-        ORDER BY total DESC
-    """, (since,))
-
-    raw_path = ПАПКА_ДАННЫХ / "raw_market_5m.csv"
-    aggregates_path = ПАПКА_ДАННЫХ / "bot_aggregates.csv"
-    audit_path = ПАПКА_ДАННЫХ / "validation_audit.csv"
-    market_research_path = ПАПКА_ДАННЫХ / "market_research.csv"
-    market_states_path = ПАПКА_ДАННЫХ / "market_states.csv"
-    market_silence_path = ПАПКА_ДАННЫХ / "market_silence.csv"
-    market_price_state_path = ПАПКА_ДАННЫХ / "market_price_state.csv"
-    market_volume_state_path = ПАПКА_ДАННЫХ / "market_volume_state.csv"
-    volume_state_summary_path = ПАПКА_ДАННЫХ / "volume_state_summary.csv"
-    top_volume_anomalies_path = ПАПКА_ДАННЫХ / "top_volume_anomalies.csv"
-    market_oi_slope_path = ПАПКА_ДАННЫХ / "market_oi_slope.csv"
-    oi_slope_top_path = ПАПКА_ДАННЫХ / "oi_slope_top.csv"
-
-    top_oi_15m_path = ПАПКА_ДАННЫХ / "top_oi_slope_15m.csv"
-    top_oi_30m_path = ПАПКА_ДАННЫХ / "top_oi_slope_30m.csv"
-    top_oi_1h_path = ПАПКА_ДАННЫХ / "top_oi_slope_1h.csv"
-    top_oi_4h_path = ПАПКА_ДАННЫХ / "top_oi_slope_4h.csv"
-
-    oi_slope_summary_path = ПАПКА_ДАННЫХ / "oi_slope_summary.csv"
-    silence_states_path = ПАПКА_ДАННЫХ / "silence_states.csv"
-    engine_summary_path = ПАПКА_ДАННЫХ / "engine_summary.csv"
-    market_phase_path = ПАПКА_ДАННЫХ / "market_phase.csv"
-    symbol_baseline_path = ПАПКА_ДАННЫХ / "symbol_baseline.csv"
-    oi_persistence_path = ПАПКА_ДАННЫХ / "oi_persistence.csv"
-    coverage_path = ПАПКА_ДАННЫХ / "coverage_report.csv"
-    gap_path = ПАПКА_ДАННЫХ / "gap_report.csv"
-    manifest_path = ПАПКА_ДАННЫХ / "storage_manifest.txt"
-    audit_report_path = ПАПКА_ДАННЫХ / "audit_report.txt"
-    research_report_path = ПАПКА_ДАННЫХ / "research_report.txt"
-    storage_health_path = ПАПКА_ДАННЫХ / "storage_health_report.txt"
-    runtime_health_path = ПАПКА_ДАННЫХ / "runtime_health_report.txt"
-    runtime_timing_path = ПАПКА_ДАННЫХ / "runtime_timing_report.txt"
-    active_universe_path = ПАПКА_ДАННЫХ / "active_universe_report.csv"
-    request_failures_path = ПАПКА_ДАННЫХ / "request_failure_report.csv"
-    invalid_reasons_path = ПАПКА_ДАННЫХ / "invalid_reason_report.csv"
-
-    _write_csv(
-        raw_path,
-        ["ts_open", "ts_close", "candle_close_norm", "exchange", "symbol", "oi_open", "oi_high", "oi_low", "oi_close", "price_open", "price_high", "price_low", "price_close", "volume"],
-        raw_rows,
+        FROM oi_stage_history
+        WHERE cycle_ts >= %s
+        ORDER BY cycle_ts DESC, exchange, symbol, to_stage DESC
+        """,
+        (since,),
     )
-
-    _write_csv(
-        aggregates_path,
-        ["metric", "timeframe", "ts_open", "ts_close", "exchange", "symbol", "open_value", "high_value", "low_value", "close_value", "sum_value", "avg_value", "delta_pct", "unique_candles"],
-        [[r["metric"], r["timeframe"], r["ts_open"], r["ts_close"], r["exchange"], r["symbol"], r["open_value"], r["high_value"], r["low_value"], r["close_value"], r["sum_value"], r["avg_value"], r["delta_pct"], r["unique_candles"]] for r in aggregates],
-    )
-
-    _write_csv(
-        audit_path,
-        ["calculated_at", "metric", "timeframe", "ts_close", "exchange", "symbol", "bot_open", "audit_open", "bot_close", "audit_close", "bot_delta_pct", "audit_delta_pct", "bot_sum", "audit_sum", "bot_avg", "audit_avg", "drift", "unique_candles", "validation_status"],
-        [[r["calculated_at"], r["metric"], r["timeframe"], r["ts_close"], r["exchange"], r["symbol"], r["bot_open"], r["audit_open"], r["bot_close"], r["audit_close"], r["bot_delta_pct"], r["audit_delta_pct"], r["bot_sum"], r["audit_sum"], r["bot_avg"], r["audit_avg"], r["drift"], r["unique_candles"], r["validation_status"]] for r in audit],
-    )
-
-    _write_csv(
-        coverage_path,
-        ["calculated_at", "metric", "exchange", "symbol", "first_ts_open", "last_ts_open", "expected_candles", "actual_candles", "missing_candles", "coverage_pct", "missing_pct", "invalid_timestamps", "quality_status"],
-        [[r["calculated_at"], r["metric"], r["exchange"], r["symbol"], r["first_ts_open"], r["last_ts_open"], r["expected_candles"], r["actual_candles"], r["missing_candles"], r["coverage_pct"], r["missing_pct"], r["invalid_timestamps"], r["quality_status"]] for r in coverage],
-    )
-
-    _write_csv(
-        gap_path,
-        ["calculated_at", "metric", "exchange", "symbol", "gap_start", "gap_end", "missing_candles", "gap_minutes"],
-        [[r["calculated_at"], r["metric"], r["exchange"], r["symbol"], r["gap_start"], r["gap_end"], r["missing_candles"], r["gap_minutes"]] for r in gaps],
-    )
-
-    _write_csv(
-        active_universe_path,
-        ["exchange", "symbol", "activated_at", "source"],
-        [[r["exchange"], r["symbol"], r["activated_at"], r["source"]] for r in active_universe],
-    )
-
-    _write_csv(
-        request_failures_path,
-        ["calculated_at", "exchange", "symbol", "data_type", "error_type", "error_message"],
-        [[r["calculated_at"], r["exchange"], r["symbol"], r["data_type"], r["error_type"], r["error_message"]] for r in request_failures],
-    )
-
-    _write_csv(
-        invalid_reasons_path,
-        ["invalid_reason", "total"],
-        [[r["invalid_reason"], r["total"]] for r in invalid_reasons],
-    )
-
-    _write_csv(
-        market_research_path,
-        ["calculated_at", "ts_close", "exchange", "symbol", "timeframe", "oi_delta_pct", "price_delta_pct", "volume_delta_pct", "oi_velocity", "oi_acceleration", "range_width_pct", "continuation_score", "exhaustion_score", "compression_score", "market_state", "invalid_reason"],
-        [[r["calculated_at"], r["ts_close"], r["exchange"], r["symbol"], r["timeframe"], r["oi_delta_pct"], r["price_delta_pct"], r["volume_delta_pct"], r["oi_velocity"], r["oi_acceleration"], r["range_width_pct"], r["continuation_score"], r["exhaustion_score"], r["compression_score"], r["market_state"], r.get("invalid_reason")] for r in market_research],
-    )
-
-    _write_csv(
-        market_states_path,
-        ["exchange", "symbol", "timeframe", "market_state", "state_count", "avg_continuation_score", "avg_exhaustion_score", "avg_compression_score"],
-        [[r["exchange"], r["symbol"], r["timeframe"], r["market_state"], r["state_count"], r["avg_continuation_score"], r["avg_exhaustion_score"], r["avg_compression_score"]] for r in market_states],
-    )
-
-    _write_csv(
-        top_volume_anomalies_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","volume_state","volume_state_name","volume_structure","volume_quality","volume_baseline_24h","volume_hold_state","volume_reason","reason","volume_delta_pct","normalized_volume","volume_percentile","noise_state","market_state","invalid_reason"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["volume_state"],r["volume_state_name"],_v(r,"volume_structure"),_v(r,"volume_quality"),_v(r,"volume_baseline_24h"),_v(r,"volume_hold_state"),_v(r,"volume_reason"),r["reason"],r["volume_delta_pct"],r["normalized_volume"],r["volume_percentile"],r["noise_state"],r["market_state"],r["invalid_reason"]] for r in top_volume_anomalies],
-    )
-
-    _write_csv(
-        volume_state_summary_path,
-        ["exchange","symbol","timeframe","volume_state_name","rows_count","avg_volume_delta_pct","avg_normalized_volume","avg_volume_percentile","noise_count"],
-        [[r["exchange"],r["symbol"],r["timeframe"],r["volume_state_name"],r["rows_count"],r["avg_volume_delta_pct"],r["avg_normalized_volume"],r["avg_volume_percentile"],r["noise_count"]] for r in volume_state_summary],
-    )
-
-    _write_csv(
-        market_volume_state_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","volume_state","volume_state_name","volume_structure","volume_quality","volume_baseline_24h","volume_hold_state","volume_reason","reason","volume_delta_pct","normalized_volume","volume_percentile","noise_state","market_state","invalid_reason"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["volume_state"],r["volume_state_name"],_v(r,"volume_structure"),_v(r,"volume_quality"),_v(r,"volume_baseline_24h"),_v(r,"volume_hold_state"),_v(r,"volume_reason"),r["reason"],r["volume_delta_pct"],r["normalized_volume"],r["volume_percentile"],r["noise_state"],r["market_state"],r["invalid_reason"]] for r in market_volume_state],
-    )
-
-    _write_csv(
-        market_price_state_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","price_state","price_state_name","price_structure","price_quality","price_slope_state","price_trend_24h","price_range_from_median_pct","price_reason","reason","price_delta_pct","range_width_pct","market_state","invalid_reason"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["price_state"],r["price_state_name"],_v(r,"price_structure"),_v(r,"price_quality"),_v(r,"price_slope_state"),_v(r,"price_trend_24h"),_v(r,"price_range_from_median_pct"),_v(r,"price_reason"),r["reason"],r["price_delta_pct"],r["range_width_pct"],r["market_state"],r["invalid_reason"]] for r in market_price_state],
-    )
-
-    _write_csv(
-        market_oi_slope_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","oi_structure","oi_priority","oi_hold_state","oi_trend_1h","oi_trend_4h","oi_trend_24h","oi_reason","reason","oi_delta_pct","oi_acceleration","oi_prev_avg","price_delta_pct","volume_delta_pct","range_width_pct","silence_stage"],
-        [[r["calculated_at"],r["ts_close"],r["exchange"],r["symbol"],r["timeframe"],r["stage"],r["stage_name"],_v(r,"oi_structure"),_v(r,"oi_priority"),_v(r,"oi_hold_state"),_v(r,"oi_trend_1h"),_v(r,"oi_trend_4h"),_v(r,"oi_trend_24h"),_v(r,"oi_reason"),r["reason"],r["oi_delta_pct"],r["oi_acceleration"],r["oi_prev_avg"],r["price_delta_pct"],r["volume_delta_pct"],r["range_width_pct"],r["silence_stage"]] for r in market_oi_slope],
-    )
-
-
-    _write_csv(
-        top_oi_15m_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(top_oi_15m)],
-    )
-
-    _write_csv(
-        top_oi_30m_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(top_oi_30m)],
-    )
-
-    _write_csv(
-        top_oi_1h_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(top_oi_1h)],
-    )
-
-    _write_csv(
-        top_oi_4h_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(top_oi_4h)],
-    )
-
-    _write_csv(
-        oi_slope_summary_path,
-        [
-            "exchange",
-            "timeframe",
-            "stage_name",
-            
-            "rows_count",
-            "oi_priority_ge_3",
-            "oi_priority_ge_4"],
-        [
-            [
-                _v(r, "exchange"),
-                _v(r, "timeframe"),
-                _v(r, "stage_name"),
-                _v(r, "rows_count", 0),
-                _v(r, "oi_priority_ge_3", 0),
-                _v(r, "oi_priority_ge_4", 0)]
-            for r in _rows(oi_slope_summary)
-        ],
-    )
-
-    _write_csv(
-        oi_slope_top_path,
-        ["calculated_at","ts_close","exchange","symbol","timeframe","stage","stage_name","reason","oi_delta_pct","oi_acceleration","price_delta_pct","volume_delta_pct","range_width_pct"],
-        [[_v(r,"calculated_at"),_v(r,"ts_close"),_v(r,"exchange"),_v(r,"symbol"),_v(r,"timeframe"),_v(r,"stage"),_v(r,"stage_name"),_v(r,"reason"),_v(r,"oi_delta_pct"),_v(r,"oi_acceleration"),_v(r,"price_delta_pct"),_v(r,"volume_delta_pct"),_v(r,"range_width_pct"),_v(r)] for r in _rows(oi_slope_top)],
-    )
-
-    _write_csv(
-        market_silence_path,
-        ["calculated_at", "ts_close", "exchange", "symbol", "timeframe", "stage", "stage_name", "score", "reason", "oi_delta_pct", "price_delta_pct", "volume_delta_pct", "range_width_pct", "market_state", "invalid_reason"],
-        [[r["calculated_at"], r["ts_close"], r["exchange"], r["symbol"], r["timeframe"], r["stage"], r["stage_name"], r["score"], r["reason"], r["oi_delta_pct"], r["price_delta_pct"], r["volume_delta_pct"], r["range_width_pct"], r["market_state"], r["invalid_reason"]] for r in market_silence],
-    )
-
-    _write_csv(
-        silence_states_path,
-        ["exchange", "symbol", "timeframe", "stage", "stage_name", "stage_count", "avg_score"],
-        [[r["exchange"], r["symbol"], r["timeframe"], r["stage"], r["stage_name"], r["stage_count"], r["avg_score"]] for r in silence_states],
-    )
-
-    engine_summary = [
-        [
-            "market_silence",
-            len(_rows(market_silence)),
-            len([r for r in _rows(market_silence) if _v(r, "stage_name") == "тишина"]),
-            len([r for r in _rows(market_silence) if _v(r, "stage_name") == "сухой рынок"]),
-            None,
-            None],
-        [
-            "market_price_state",
-            len(_rows(market_price_state)),
-            len([r for r in _rows(market_price_state) if _v(r, "price_state_name") == "сжатие"]),
-            len([r for r in _rows(market_price_state) if "импульс" in str(_v(r, "price_state_name", ""))]),
-            None,
-            None],
-        [
-            "market_volume_state",
-            len(_rows(market_volume_state)),
-            len([r for r in _rows(market_volume_state) if _v(r, "noise_state") == "шум"]),
-            len([r for r in _rows(market_volume_state) if _v(r, "volume_state_name") == "аномальный объем"]),
-            round(sum(float(_v(r, "volume_percentile", 0) or 0) for r in _rows(market_volume_state)) / max(len(_rows(market_volume_state)), 1), 2),
-            None],
-        [
-            "market_oi_slope",
-            len(_rows(market_oi_slope)),
-            len([r for r in _rows(market_oi_slope) if _v(r, "stage_name") == "наблюдение"]),
-            len([r for r in _rows(market_oi_slope) if _v(r, "stage_name") == "возня"]),
-            round(sum(float(_v(r,  0) or 0) for r in _rows(market_oi_slope)) / max(len(_rows(market_oi_slope)), 1), 2),
-            max([float(_v(r,  0) or 0) for r in _rows(market_oi_slope)] or [0])]]
-
-    oi_state_map = {
-        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
-        for r in _rows(market_oi_slope)
-    }
-
-    price_state_map = {
-        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
-        for r in _rows(market_price_state)
-    }
-
-    volume_state_map = {
-        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
-        for r in _rows(market_volume_state)
-    }
-
-    metric_alignment = []
-
-    for r in _rows(market_research):
-        if _v(r, "market_state") == "invalid_data":
-            continue
-
-        key = (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close"))
-
-        oi_row = oi_state_map.get(key)
-        price_row = price_state_map.get(key)
-        volume_row = volume_state_map.get(key)
-
-        oi_stage = _v(oi_row, "stage_name", "нет сигнала")
-        price_state_name = _v(price_row, "price_state_name", "")
-        volume_state_name = _v(volume_row, "volume_state_name", "")
-
-        if (
-            oi_stage in ("наблюдение", "возня")
-            and price_state_name in ("сжатие", "спокойный боковик")
-            and volume_state_name in ("обычный объем", "объем растет")
-        ):
-            alignment_state = "silent accumulation"
-
-        elif (
-            oi_stage in ("наблюдение", "возня")
-            and price_state_name == "импульс вниз"
-            and volume_state_name in ("аномальный объем", "всплеск объема")
-        ):
-            alignment_state = "conflicted"
-
-        elif (
-            oi_stage == "нет сигнала"
-            and price_state_name in ("импульс вверх", "импульс вниз")
-            and volume_state_name in ("аномальный объем", "всплеск объема")
-        ):
-            alignment_state = "exhausted"
-
-        elif (
-            oi_stage in ("наблюдение", "возня")
-            and price_state_name in ("импульс вверх", "импульс вниз")
-            and volume_state_name in ("объем растет", "аномальный объем")
-        ):
-            alignment_state = "aligned"
-
-        elif (
-            price_state_name == "широкий боковик"
-            and volume_state_name in ("аномальный объем", "всплеск объема")
-        ):
-            alignment_state = "noisy expansion"
-
-        else:
-            alignment_state = "neutral"
-
-        metric_alignment.append({
-            "exchange": _v(r, "exchange"),
-            "symbol": _v(r, "symbol"),
-            "timeframe": _v(r, "timeframe"),
-            "ts_close": _v(r, "ts_close"),
-            "oi_stage": oi_stage,
-            "price_state_name": price_state_name,
-            "volume_state_name": volume_state_name,
-            "market_state": _v(r, "market_state"),
-            "oi_delta_pct": _v(r, "oi_delta_pct", 0),
-            "price_delta_pct": _v(r, "price_delta_pct", 0),
-            "volume_delta_pct": _v(r, "volume_delta_pct", 0),
-            "range_width_pct": _v(r, "range_width_pct", 0),
-            "alignment_state": alignment_state,
-        })
-
-    _write_csv(
-        oi_persistence_path,
-        [
-            "exchange",
-            "symbol",
-            "timeframe",
-            "ts_close",
-            "positive_oi_windows",
-            "cumulative_oi_delta_pct",
-            "avg_oi_delta_pct",
-            "avg_oi_acceleration",
-            "persistence_state"],
-        [
-            [
-                _v(r, "exchange"),
-                _v(r, "symbol"),
-                _v(r, "timeframe"),
-                _v(r, "ts_close"),
-                _v(r, "positive_oi_windows", 0),
-                _v(r, "cumulative_oi_delta_pct", 0),
-                _v(r, "avg_oi_delta_pct", 0),
-                _v(r, "avg_oi_acceleration", 0),
-                _v(r, "persistence_state")]
-            for r in _rows(oi_persistence)
-        ],
-    )
-
-    _write_csv(
-        symbol_baseline_path,
-        [
-            "exchange",
-            "symbol",
-            "timeframe",
-            "rows_count",
-            "median_range_width_pct",
-            "median_abs_price_delta_pct",
-            "median_abs_volume_delta_pct",
-            "median_abs_oi_delta_pct",
-            "avg_range_width_pct",
-            "avg_abs_price_delta_pct",
-            "avg_abs_volume_delta_pct",
-            "avg_abs_oi_delta_pct"],
-        [
-            [
-                _v(r, "exchange"),
-                _v(r, "symbol"),
-                _v(r, "timeframe"),
-                _v(r, "rows_count", 0),
-                _v(r, "median_range_width_pct", 0),
-                _v(r, "median_abs_price_delta_pct", 0),
-                _v(r, "median_abs_volume_delta_pct", 0),
-                _v(r, "median_abs_oi_delta_pct", 0),
-                _v(r, "avg_range_width_pct", 0),
-                _v(r, "avg_abs_price_delta_pct", 0),
-                _v(r, "avg_abs_volume_delta_pct", 0),
-                _v(r, "avg_abs_oi_delta_pct", 0)]
-            for r in _rows(symbol_baseline)
-        ],
-    )
-
-    stage_metrics_rows = []
-    price_by_key = {
-        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
-        for r in _rows(market_price_state)
-    }
-    volume_by_key = {
-        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
-        for r in _rows(market_volume_state)
-    }
-    alignment_by_key = {
-        (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close")): r
-        for r in _rows(metric_alignment)
-    }
-
-    for r in _rows(market_oi_slope):
-        key = (_v(r, "exchange"), _v(r, "symbol"), _v(r, "timeframe"), _v(r, "ts_close"))
-        pr = price_by_key.get(key, {})
-        vr = volume_by_key.get(key, {})
-        ar = alignment_by_key.get(key, {})
-
-        se = _stage_engine(r, pr, vr, ar)
-
-        stage_metrics_rows.append([
-            _v(r, "calculated_at"),
-            _v(r, "ts_close"),
-            _v(r, "exchange"),
-            _v(r, "symbol"),
-            _v(r, "timeframe"),
-
-            _v(r, "oi_delta_pct"),
-            _v(r, "oi_acceleration"),
-            _v(r, "oi_prev_avg"),
-            abs(float(_v(r, "oi_delta_pct", 0) or 0)),
-            abs(float(_v(r, "oi_acceleration", 0) or 0)),
-            _v(r, "stage"),
-            _v(r, "stage_name"),
-            _v(r, "reason"),
-
-            _v(pr, "price_delta_pct"),
-            _v(pr, "price_delta_pct"),
-            _v(pr, "range_width_pct"),
-            _v(pr, "price_state"),
-            _v(pr, "price_state_name"),
-            _v(pr, "reason"),
-
-            _v(vr, "volume_delta_pct"),
-            _v(vr, "normalized_volume"),
-            _v(vr, "volume_percentile"),
-            _v(vr, "noise_state"),
-            _v(vr, "volume_state"),
-            _v(vr, "volume_state_name"),
-            _v(vr, "reason"),
-
-            _v(ar, "alignment_state"),
-            _alignment_score(ar),
-            _v(ar, "reason"),
-
-            _continuation_score(r, pr, vr, ar),
-            _exhaustion_score(r, pr, vr, ar),
-            _liquidity_event_flag(r, pr, vr, ar),
-
-            se["stage_engine_state"],
-            se["stage_engine_score"],
-            se["stage_engine_reason"],
-
-            _v(r, "silence_stage")])
-
-    market_phase = _safe_fetch("""
-        SELECT *
-        FROM market_phase
-        ORDER BY priority, phase DESC, exchange, symbol, timeframe
-    """)
-
-    _write_csv(
-        market_phase_path,
-        [
-            "calculated_at","exchange","symbol","timeframe",
-            "phase","phase_name","phase_status","priority",
-            "phase_started_at","phase_updated_at",
-            "stage1_started_at","stage2_started_at","stage3_started_at",
-            "manual_reset_required","confidence",
-            "oi_structure","oi_priority","oi_hold_state",
-            "oi_trend_1h","oi_trend_4h","oi_trend_24h",
-            "price_structure","price_quality","price_slope_state",
-            "volume_structure","volume_quality","volume_hold_state",
-            "transition_reason","reason"],
-        [
-            [
-                r["calculated_at"], r["exchange"], r["symbol"], r["timeframe"],
-                r["phase"], r["phase_name"], r["phase_status"], r["priority"],
-                r["phase_started_at"], r["phase_updated_at"],
-                r["stage1_started_at"], r["stage2_started_at"], r["stage3_started_at"],
-                r["manual_reset_required"], r["confidence"],
-                r["oi_structure"], r["oi_priority"], r["oi_hold_state"],
-                r["oi_trend_1h"], r["oi_trend_4h"], r["oi_trend_24h"],
-                r["price_structure"], r["price_quality"], r["price_slope_state"],
-                r["volume_structure"], r["volume_quality"], r["volume_hold_state"],
-                r["transition_reason"], r["reason"]]
-            for r in market_phase
-        ],
-    )
-
-    _write_csv(
-        engine_summary_path,
-        ["engine","rows","metric_a","metric_b","metric_c","metric_d"],
-        engine_summary,
-    )
-
-
-    invalid = [r for r in _rows(audit) if r["validation_status"] != "валидно"]
-    critical_coverage = [r for r in _rows(coverage) if r["quality_status"] == "critical"]
-    warning_coverage = [r for r in _rows(coverage) if r["quality_status"] == "warning"]
-    invalid_data_states = [r for r in _rows(market_states) if r["market_state"] == "invalid_data"]
-
-    audit_lines = [
-        f"Mighty Duck {APP_VERSION}",
-        f"generated_at: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"mode: {mode}",
-        "",
-        "v3.5.4 data quality foundation: active",
-        "canonical_close: active",
-        "contiguous_window_validation: active",
-        "coverage_report: active",
-        "gap_report: active",
-        "invalid_data_protection: active",
-        "",
-        f"raw_rows: {len(raw_rows)}",
-        f"raw_missing_oi_rows: {missing_oi}",
-        f"raw_missing_price_rows: {missing_price}",
-        f"raw_missing_volume_rows: {missing_volume}",
-        f"bot_aggregates_rows: {len(aggregates)}",
-        f"validation_audit_rows: {len(audit)}",
-        f"invalid_rows: {len(invalid)}",
-        f"integrity_rows: {len(integrity)}",
-        f"coverage_rows: {len(coverage)}",
-        f"gap_rows: {len(gaps)}",
-        f"active_universe_rows: {len(active_universe)}",
-        f"request_failure_rows: {len(request_failures)}",
-        f"coverage_critical_rows: {len(critical_coverage)}",
-        f"coverage_warning_rows: {len(warning_coverage)}",
-        f"active_universe_rows: {len(active_universe)}",
-        f"request_failure_rows: {len(request_failures)}",
-        f"market_research_rows: {len(market_research)}",
-        f"market_states_rows: {len(market_states)}",
-        f"invalid_data_state_rows: {len(invalid_data_states)}",
-        f"request_failure_rows: {len(request_failures)}",
-        "",
-        "Top invalid audit:"]
-
-    for r in invalid[:100]:
-        audit_lines.append(f'{r["metric"]} {r["symbol"]} {r["exchange"]} {r["timeframe"]} drift={r["drift"]} status={r["validation_status"]}')
-
-    audit_lines.append("")
-    audit_lines.append("Invalid data reasons:")
-    for r in invalid_reasons:
-        audit_lines.append(f"{r['invalid_reason']}: {r['total']}")
-
-    audit_lines.append("")
-    audit_lines.append("Worst coverage:")
-    for r in sorted(coverage, key=lambda x: (float(x["coverage_pct"] or 0), x["metric"], x["exchange"], x["symbol"]))[:100]:
-        audit_lines.append(
-            f'{r["metric"]} {r["exchange"]} {r["symbol"]} '
-            f'coverage={_fmt_pct(r["coverage_pct"])} missing={r["missing_candles"]} '
-            f'invalid_ts={r["invalid_timestamps"]} status={r["quality_status"]}'
-        )
-
-    _write_text(audit_report_path, "\n".join(audit_lines))
-
-    research_lines = [
-        f"Mighty Duck {APP_VERSION}",
-        f"generated_at: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"mode: {mode}",
-        "",
-        "Исследовательский слой структуры рынка",
-        "Источник: реальные bot_aggregates + coverage_report",
-        "Fake rows: нет",
-        "invalid_data protection: active",
-        "",
-        f"market_research_rows: {len(market_research)}",
-        f"market_states_rows: {len(market_states)}",
-        f"invalid_data_state_rows: {len(invalid_data_states)}",
-        f"request_failure_rows: {len(request_failures)}",
-        "",
-        "Состояния:"]
-
-    for r in market_states[:200]:
-        research_lines.append(
-            f'{r["exchange"]} {r["symbol"]} {r["timeframe"]} {r["market_state"]} '
-            f'count={r["state_count"]} '
-            f'continuation={r["avg_continuation_score"]} '
-            f'exhaustion={r["avg_exhaustion_score"]} '
-            f'compression={r["avg_compression_score"]}'
-        )
-
-    _write_text(research_report_path, "\n".join(research_lines))
-
-    storage_lines = [
-        f"Mighty Duck {APP_VERSION}",
-        f"generated_at: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        "",
-        "Storage health report",
-        "",
-        f"coverage_rows: {len(coverage)}",
-        f"gap_rows: {len(gaps)}",
-        f"coverage_critical_rows: {len(critical_coverage)}",
-        f"coverage_warning_rows: {len(warning_coverage)}",
-        "",
-        "Storage summary:"]
-
-    for r in storage_summary:
-        oldest = r["oldest_ts"]
-        newest = r["newest_ts"]
-        days = 0.0
-        if oldest and newest:
-            try:
-                days = (newest - oldest).total_seconds() / 86400.0
-            except Exception:
-                days = 0.0
-        storage_lines.append(
-            f'{r["metric"]}: rows={r["rows_count"]} oldest={oldest} newest={newest} estimated_days={days:.2f}'
-        )
-
-    storage_lines.append("")
-    storage_lines.append("Worst coverage:")
-    for r in sorted(coverage, key=lambda x: (float(x["coverage_pct"] or 0), x["metric"], x["exchange"], x["symbol"]))[:200]:
-        storage_lines.append(
-            f'{r["metric"]} {r["exchange"]} {r["symbol"]}: '
-            f'coverage={_fmt_pct(r["coverage_pct"])} missing_pct={_fmt_pct(r["missing_pct"])} '
-            f'missing={r["missing_candles"]} invalid_ts={r["invalid_timestamps"]} status={r["quality_status"]}'
-        )
-
-    _write_text(storage_health_path, "\n".join(storage_lines))
-
-    runtime_lines = [
-        f"Mighty Duck {APP_VERSION}",
-        f"generated_at: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        "",
-        "Runtime health report",
-        "",
-        f"process_id: {os.getpid()}",
-        f"memory_max_rss_mb: {_runtime_memory_mb():.2f}",
-        f"export_mode: {mode}",
-        f"raw_rows_exported: {len(raw_rows)}",
-        f"bot_aggregates_rows_exported: {len(aggregates)}",
-        f"validation_audit_rows_exported: {len(audit)}",
-        f"market_research_rows_exported: {len(market_research)}",
-        "",
-        "Runtime note:",
-        "This report is generated during export rebuild. It does not restart the bot."]
-
-    _write_text(runtime_health_path, "\n".join(runtime_lines))
-
+    table_health_rows = _table_health_rows()
+
+    data_dir = Path(ПАПКА_ДАННЫХ)
+    raw_path = data_dir / "raw_market_5m.csv"
+    aggregate_path = data_dir / "aggregate_windows.csv"
+    audit_path = data_dir / "validation_audit.csv"
+    coverage_path = data_dir / "coverage_report.csv"
+    gap_path = data_dir / "gap_report.csv"
+    active_universe_path = data_dir / "active_universe_report.csv"
+    request_failures_path = data_dir / "request_failure_report.csv"
+    core_path = data_dir / "oi_core_state.csv"
+    window_path = data_dir / "oi_window_state.csv"
+    stage_history_path = data_dir / "oi_stage_history.csv"
+    stage_summary_path = data_dir / "oi_stage_summary.csv"
+    window_summary_path = data_dir / "oi_window_summary.csv"
+    top_15m_path = data_dir / "top_oi_15m.csv"
+    top_30m_path = data_dir / "top_oi_30m.csv"
+    top_1h_path = data_dir / "top_oi_1h.csv"
+    top_4h_path = data_dir / "top_oi_4h.csv"
+    table_health_path = data_dir / "table_health.csv"
+    audit_report_path = data_dir / "audit_report.txt"
+    research_report_path = data_dir / "research_report.txt"
+    manifest_path = data_dir / "storage_manifest.txt"
+    storage_health_path = data_dir / "storage_health_report.txt"
+    runtime_health_path = data_dir / "runtime_health_report.txt"
+    runtime_timing_path = data_dir / "runtime_timing_report.txt"
+
+    _write_dict_csv(raw_path, raw_rows)
+    _write_dict_csv(aggregate_path, aggregate_rows)
+    _write_dict_csv(audit_path, audit_rows)
+    _write_dict_csv(coverage_path, coverage_rows)
+    _write_dict_csv(gap_path, gap_rows)
+    _write_dict_csv(active_universe_path, active_universe_rows)
+    _write_dict_csv(request_failures_path, request_failure_rows)
+    _write_dict_csv(core_path, core_rows)
+    _write_dict_csv(window_path, window_rows)
+    _write_dict_csv(stage_history_path, stage_history_rows)
+    _write_dict_csv(stage_summary_path, _stage_summary_rows(core_rows))
+    _write_dict_csv(window_summary_path, _window_summary_rows(window_rows))
+    _write_dict_csv(top_15m_path, _top_window_rows(window_rows, "15м"))
+    _write_dict_csv(top_30m_path, _top_window_rows(window_rows, "30м"))
+    _write_dict_csv(top_1h_path, _top_window_rows(window_rows, "1ч"))
+    _write_dict_csv(top_4h_path, _top_window_rows(window_rows, "4ч"))
+    _write_dict_csv(table_health_path, table_health_rows)
+
+    _write_text(audit_report_path, _storage_health_text([table_health_path, audit_path, coverage_path, gap_path]))
     _write_text(
-        manifest_path,
-        (
-            f"Mighty Duck {APP_VERSION}\n"
-            f"mode={mode}\n"
-            "main_downloads=market_research_bundle.zip, audit_report.txt, research_report.txt\n"
-            "inside_bundle=raw_market_5m.csv, bot_aggregates.csv, validation_audit.csv, market_research.csv, market_states.csv, market_volume_state.csv, volume_state_summary.csv, top_volume_anomalies.csv, market_price_state.csv, market_oi_slope.csv, oi_slope_top.csv, top_oi_slope_15m.csv, top_oi_slope_30m.csv, top_oi_slope_1h.csv, top_oi_slope_4h.csv, oi_slope_summary.csv, engine_summary.csv, market_phase.csv, symbol_baseline.csv, oi_persistence.csv, coverage_report.csv, gap_report.csv, active_universe_report.csv, request_failure_report.csv, invalid_reason_report.csv, storage_manifest.txt, storage_health_report.txt, runtime_health_report.txt, runtime_timing_report.txt\n"
-            "timestamp_migration=active\n"
-            "canonical_close=active\n"
-            "contiguous_window_validation=active\n"
-            "coverage_report=active\n"
-            "gap_report=active\n"
-            "invalid_data_protection=active\n"
-            "research_source=real_bot_aggregates_plus_coverage_report\n"
-        ),
+        research_report_path,
+        _research_report_text(mode, range_label, raw_rows, aggregate_rows, core_rows, window_rows, stage_history_rows),
     )
+    _write_text(runtime_health_path, _runtime_health_text(table_health_rows, core_rows, stage_history_rows))
 
-    bundle_path = ПАПКА_ДАННЫХ / "market_research_bundle.zip"
-    mode_bundle_path = ПАПКА_ДАННЫХ / f"market_research_bundle_{suffix}.zip"
-
-    _cleanup_legacy_exports()
+    runtime_timing_source = Path("runtime/runtime_timing_report.txt")
+    runtime_timing_text = _read_text(runtime_timing_source)
+    if not runtime_timing_text:
+        runtime_timing_text = (
+            f"generated_at={datetime.now(timezone.utc).isoformat()}\n"
+            f"status=missing_runtime_timing_source\n"
+        )
+    _write_text(runtime_timing_path, runtime_timing_text)
 
     bundle_files = [
         raw_path,
-        aggregates_path,
+        aggregate_path,
         audit_path,
-        market_research_path,
-        market_silence_path,
-        market_states_path,
-        market_volume_state_path,
-        volume_state_summary_path,
-        top_volume_anomalies_path,
-        market_price_state_path,
-        market_oi_slope_path,
-        oi_slope_top_path,
-        top_oi_15m_path,
-        top_oi_30m_path,
-        top_oi_1h_path,
-        top_oi_4h_path,
-        oi_slope_summary_path,
-        engine_summary_path,
-        symbol_baseline_path,
-        oi_persistence_path,
         coverage_path,
         gap_path,
         active_universe_path,
         request_failures_path,
-        invalid_reasons_path,
-        manifest_path,
+        core_path,
+        window_path,
+        stage_history_path,
+        stage_summary_path,
+        window_summary_path,
+        top_15m_path,
+        top_30m_path,
+        top_1h_path,
+        top_4h_path,
+        table_health_path,
+        audit_report_path,
+        research_report_path,
         storage_health_path,
         runtime_health_path,
-        runtime_timing_path]
+        runtime_timing_path,
+    ]
 
-    _zip(bundle_path, bundle_files)
-    _zip(mode_bundle_path, bundle_files + [audit_report_path, research_report_path])
+    _write_text(manifest_path, _storage_manifest_text(bundle_files, mode, range_label))
+    _write_text(storage_health_path, _storage_health_text(bundle_files + [manifest_path]))
 
-    return bundle_path
+    bundle_path = data_dir / "market_research_bundle.zip"
+    mode_bundle_path = data_dir / f"market_research_bundle_{suffix}.zip"
+    _zip(bundle_path, bundle_files + [manifest_path])
+    _zip(mode_bundle_path, bundle_files + [manifest_path])
+
+    return mode_bundle_path if suffix != "quick" else bundle_path

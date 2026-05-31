@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import time
+import atexit
 import threading
+import fcntl
 import zipfile
 import json
+import os
+import subprocess
 from datetime import datetime, timezone
 import csv
 from pathlib import Path
@@ -11,7 +15,7 @@ import requests
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ПАПКА_ДАННЫХ, APP_VERSION
 from logger import log
-from db import fetch
+from db import fetch, execute
 from reset_stage3 import reset_stage3
 
 BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
@@ -19,6 +23,59 @@ _polling_started = False
 _offset = 0
 _export_lock = threading.Lock()
 _csv_lock = threading.Lock()
+RUNTIME_REPORTS_DIR = Path(__file__).resolve().parent / "runtime_reports"
+POLLING_LOCK_PATH = ПАПКА_ДАННЫХ / "telegram_polling.lock"
+_polling_lock_file = None
+
+
+
+def _release_polling_lock() -> None:
+    global _polling_lock_file
+    lock_file = _polling_lock_file
+    _polling_lock_file = None
+    if lock_file is None:
+        return
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        lock_file.close()
+    except Exception:
+        pass
+
+
+def _acquire_polling_lock() -> bool:
+    global _polling_lock_file
+    if _polling_lock_file is not None:
+        return True
+
+    POLLING_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = POLLING_LOCK_PATH.open("a+", encoding="utf-8")
+
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            lock_file.seek(0)
+            holder = lock_file.read().strip()
+        except Exception:
+            holder = ""
+        log(f"telegram polling skipped: lock busy {holder}".strip())
+        lock_file.close()
+        return False
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(
+        f"pid={os.getpid()} started_at={datetime.now(timezone.utc).isoformat()}\n"
+    )
+    lock_file.flush()
+    _polling_lock_file = lock_file
+    return True
+
+
+atexit.register(_release_polling_lock)
 
 
 def _main_keyboard() -> dict:
@@ -128,7 +185,7 @@ def send_document(path: Path, caption: str | None = None) -> None:
 def _build_runtime_reports_zip() -> Path:
     report_path = ПАПКА_ДАННЫХ / "runtime_reports.zip"
 
-    files = [
+    data_files = [
         ПАПКА_ДАННЫХ / "runtime_timing_report.txt",
         ПАПКА_ДАННЫХ / "runtime_health_report.txt",
         ПАПКА_ДАННЫХ / "request_failure_report.csv",
@@ -136,11 +193,28 @@ def _build_runtime_reports_zip() -> Path:
         ПАПКА_ДАННЫХ / "active_universe_report.csv",
         ПАПКА_ДАННЫХ / "storage_manifest.txt",
     ]
+    runtime_files = [
+        RUNTIME_REPORTS_DIR / "runtime_health.json",
+        RUNTIME_REPORTS_DIR / "cycle_status.json",
+        RUNTIME_REPORTS_DIR / "watchdog_status.txt",
+        RUNTIME_REPORTS_DIR / "snapshot_status.txt",
+        RUNTIME_REPORTS_DIR / "runtime_health.txt",
+        RUNTIME_REPORTS_DIR / "cycle_status.txt",
+    ]
 
+    added = 0
     with zipfile.ZipFile(report_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for path in files:
+        for path in data_files:
             if path.exists():
                 z.write(path, arcname=path.name)
+                added += 1
+        for path in runtime_files:
+            if path.exists():
+                z.write(path, arcname=f"runtime_reports/{path.name}")
+                added += 1
+
+    if added == 0:
+        raise FileNotFoundError("runtime reports are missing")
 
     return report_path
 
@@ -234,8 +308,8 @@ def _fmt_file(path: Path) -> str:
 
 
 def _runtime_snapshot() -> tuple[dict, dict]:
-    runtime = _read_json_file(Path("runtime_reports/runtime_health.json"))
-    cycle = _read_json_file(Path("runtime_reports/cycle_status.json"))
+    runtime = _read_json_file(RUNTIME_REPORTS_DIR / "runtime_health.json")
+    cycle = _read_json_file(RUNTIME_REPORTS_DIR / "cycle_status.json")
     return runtime, cycle
 
 
@@ -322,8 +396,10 @@ def _build_help_text() -> str:
         "/coin SYMBOL",
         "/feedback SYMBOL текст",
         "/feedback SYMBOL TF текст",
-        "/reset_stage3 SYMBOL TF reason",
-        "/confirm_reset SYMBOL TF",
+        "/debug_cases [SYMBOL]",
+        "/post_stage [SYMBOL]",
+        "/reset_stage3 SYMBOL reason",
+        "/confirm_reset SYMBOL",
         "/cancel_reset",
         "/download filename",
         "/backup_db",
@@ -331,8 +407,8 @@ def _build_help_text() -> str:
         "/download backup_latest",
         "/health",
         "",
-        "Фазы читаются только из market_phase.",
-        "Метрики открываются через /coin SYMBOL.",
+        "Фазы читаются из oi_core_state / oi_window_state / oi_stage_history.",
+        "Карточка монеты и top OI работают на каноническом OI-only контуре.",
     ])
 
 
@@ -390,6 +466,28 @@ def _tf_sql(value) -> str | None:
     return aliases.get(v, v)
 
 
+def _window_rank_sql(column: str = "window_code") -> str:
+    return (
+        f"CASE {column} "
+        "WHEN '15м' THEN 1 "
+        "WHEN '30м' THEN 2 "
+        "WHEN '1ч' THEN 3 "
+        "WHEN '4ч' THEN 4 "
+        "WHEN '12ч' THEN 5 "
+        "WHEN '24ч' THEN 6 "
+        "ELSE 9 END"
+    )
+
+
+def _stage_label(stage: int | None) -> str:
+    return {
+        0: "вне сценария",
+        1: "тихое накопление",
+        2: "развивающийся набор",
+        3: "подтвержденный набор",
+    }.get(int(stage or 0), "неизвестно")
+
+
 def _exchange_code(exchange) -> str:
     return "BY" if str(exchange).upper() == "BYBIT" else "BN"
 
@@ -409,6 +507,19 @@ def _short_ts(value) -> str:
 
 
 def _table_health(table: str, ts_col: str, stale_minutes: int = 15) -> dict:
+    allowed = {
+        ("oi_raw", "ts_close"),
+        ("aggregate_windows", "ts_close"),
+        ("oi_core_state", "latest_cycle_ts"),
+        ("oi_window_state", "cycle_ts"),
+        ("oi_stage_history", "cycle_ts"),
+        ("core_state_v2", "latest_cycle_ts"),
+        ("window_state_v2", "cycle_ts"),
+        ("transition_history_v2", "cycle_ts"),
+    }
+    if (table, ts_col) not in allowed:
+        return {"table": table, "status": "ERROR", "rows": 0, "latest": None, "age_minutes": None}
+
     rows = _safe_rows(f"""
         SELECT
             COUNT(*) AS rows,
@@ -443,16 +554,48 @@ def _table_health(table: str, ts_col: str, stale_minutes: int = 15) -> dict:
     }
 
 
+def _sync_health_pair(
+    legacy_table: str,
+    legacy_ts_col: str,
+    v2_table: str,
+    v2_ts_col: str,
+    label: str,
+) -> dict:
+    legacy = _table_health(legacy_table, legacy_ts_col, 15)
+    v2 = _table_health(v2_table, v2_ts_col, 15)
+
+    if legacy["status"] != "OK" or v2["status"] != "OK":
+        status = "DEGRADED"
+    elif int(legacy["rows"] or 0) != int(v2["rows"] or 0):
+        status = "DRIFT"
+    elif str(legacy["latest"]) != str(v2["latest"]):
+        status = "DRIFT"
+    else:
+        status = "OK"
+
+    return {
+        "label": label,
+        "status": status,
+        "legacy_rows": legacy["rows"],
+        "v2_rows": v2["rows"],
+        "legacy_latest": legacy["latest"],
+        "v2_latest": v2["latest"],
+    }
+
+
 def _build_health_text() -> str:
     checks = [
-        ("market_phase", "phase_updated_at", 10),
-        ("market_oi_slope", "ts_close", 10),
-        ("market_price_state", "ts_close", 10),
-        ("market_volume_state", "ts_close", 10),
-        ("market_phase_source", "ts_close", 10),
+        ("oi_raw", "ts_close", 15),
+        ("aggregate_windows", "ts_close", 15),
+        ("oi_core_state", "latest_cycle_ts", 15),
+        ("core_state_v2", "latest_cycle_ts", 15),
+        ("oi_window_state", "cycle_ts", 15),
+        ("window_state_v2", "cycle_ts", 15),
+        ("oi_stage_history", "cycle_ts", 60),
+        ("transition_history_v2", "cycle_ts", 60),
     ]
 
-    lines = ["🩺 Health — core tables", ""]
+    lines = ["🩺 Health — OI runtime", ""]
 
     for table, ts_col, stale_min in checks:
         h = _table_health(table, ts_col, stale_min)
@@ -461,8 +604,29 @@ def _build_health_text() -> str:
             f"latest={_short_ts(h['latest'])} | age_min={h['age_minutes']}"
         )
 
+    parity = [
+        _sync_health_pair("oi_core_state", "latest_cycle_ts", "core_state_v2", "latest_cycle_ts", "core"),
+        _sync_health_pair("oi_window_state", "cycle_ts", "window_state_v2", "cycle_ts", "window"),
+    ]
     lines.append("")
-    lines.append("OK <= 10m | STALE > 10m | EMPTY rows=0 | ERROR query failed")
+    lines.append("legacy-v2 parity:")
+    for item in parity:
+        lines.append(
+            f"{item['status']} | {item['label']} | "
+            f"legacy_rows={item['legacy_rows']} | v2_rows={item['v2_rows']} | "
+            f"legacy_latest={_short_ts(item['legacy_latest'])} | v2_latest={_short_ts(item['v2_latest'])}"
+        )
+
+    runtime, cycle = _runtime_snapshot()
+    lines.extend([
+        "",
+        f"runtime_rss={runtime.get('rss_mb', 'n/a')} MB / {runtime.get('rss_health', 'n/a')}",
+        f"watchdog={runtime.get('watchdog_health', 'n/a')}",
+        f"cycle={cycle.get('cycle_elapsed_seconds', 'n/a')}s / {cycle.get('cycle_health', 'n/a')}",
+        f"stop_reason={cycle.get('stop_reason', 'n/a')}",
+        "",
+        "OK <= stale window | STALE > stale window | EMPTY rows=0 | ERROR query failed",
+    ])
     return "\n".join(lines)
 
 
@@ -488,12 +652,11 @@ def _tf_rank_sql() -> str:
 def _build_phases_text(phase: int | None = None) -> str:
     if phase is None:
         rows = _safe_rows("""
-            SELECT phase, timeframe, COUNT(*) AS cnt, MAX(phase_updated_at) AS latest
-            FROM market_phase
-            WHERE phase > 0
-            GROUP BY phase, timeframe
-            ORDER BY phase DESC,
-                     CASE timeframe WHEN '4ч' THEN 1 WHEN '4h' THEN 1 WHEN '1ч' THEN 2 WHEN '1h' THEN 2 WHEN '30м' THEN 3 WHEN '30m' THEN 3 WHEN '15м' THEN 4 WHEN '15m' THEN 4 ELSE 9 END
+            SELECT current_stage, COUNT(*) AS cnt, MAX(latest_cycle_ts) AS latest
+            FROM core_state_v2
+            WHERE current_stage > 0
+            GROUP BY current_stage
+            ORDER BY current_stage DESC
         """)
         if not rows:
             return "⚙️ Фазы\n\nАктивных фаз нет."
@@ -501,18 +664,16 @@ def _build_phases_text(phase: int | None = None) -> str:
         lines = ["⚙️ Фазы", ""]
         for r in rows:
             lines.append(
-                f"phase={r.get('phase')} | {r.get('timeframe')} | cnt={r.get('cnt')} | latest={_short_ts(r.get('latest'))}"
+                f"phase={r.get('current_stage')} {_stage_label(r.get('current_stage'))} | cnt={r.get('cnt')} | latest={_short_ts(r.get('latest'))}"
             )
         lines.extend(["", "Открыть: Фаза 1 / Фаза 2 / Фаза 3"])
         return "\n".join(lines)
 
     rows = _safe_rows("""
         SELECT *
-        FROM market_phase
-        WHERE phase = %s
-        ORDER BY CASE timeframe WHEN '4ч' THEN 1 WHEN '4h' THEN 1 WHEN '1ч' THEN 2 WHEN '1h' THEN 2 WHEN '30м' THEN 3 WHEN '30m' THEN 3 WHEN '15м' THEN 4 WHEN '15m' THEN 4 ELSE 9 END,
-                 priority ASC,
-                 phase_updated_at DESC
+        FROM core_state_v2
+        WHERE current_stage = %s
+        ORDER BY stage_age_minutes DESC, latest_cycle_ts DESC, exchange, symbol
         LIMIT 80
     """, (phase,))
 
@@ -523,10 +684,20 @@ def _build_phases_text(phase: int | None = None) -> str:
     lines = [title, "Детали: /coin SYMBOL", ""]
     for r in rows:
         symbol = r.get("symbol")
-        tf = r.get("timeframe")
         ex = r.get("exchange")
-        lines.append(f"{symbol} [{tf}]")
+        oi = r.get("oi_summary") or {}
+        price = r.get("price_summary") or {}
+        volume = r.get("volume_summary") or {}
+        lines.append(f"{symbol} [{ex}]")
         lines.append(f"🔗 {_symbol_links(symbol, ex)} | /coin {symbol} | /feedback {symbol} текст")
+        lines.append(
+            f"pattern={oi.get('oi_pattern_label') or oi.get('oi_pattern_code')} | "
+            f"price={price.get('price_state') or 'n/a'} | volume={volume.get('volume_state') or 'n/a'}"
+        )
+        lines.append(
+            f"age={r.get('stage_age_minutes')}m | "
+            f"transition={r.get('transition_permission')} | latest={_short_ts(r.get('latest_cycle_ts'))}"
+        )
         lines.append("")
 
     return "\n".join(lines)
@@ -536,49 +707,72 @@ def _build_stage3_text() -> str:
     return _build_phases_text(3)
 
 
+def _parse_top_oi_args(text: str) -> tuple[str | None, str | None]:
+    exchange = None
+    timeframe = None
+
+    for part in (text or "").split():
+        token = str(part or "").strip()
+        upper = token.upper()
+        tf = _tf_sql(token)
+
+        if upper in {"BINANCE", "BYBIT"} and exchange is None:
+            exchange = upper
+        elif tf in {"15м", "30м", "1ч", "4ч", "12ч", "24ч"} and timeframe is None:
+            timeframe = tf
+
+    return timeframe, exchange
+
+
 def _build_top_oi_text(timeframe: str | None = None, exchange: str | None = None) -> str:
     timeframe = _tf_sql(timeframe) if timeframe else None
     exchange = str(exchange or "").upper().strip() or None
 
     params = []
-    where = ["stage >= 1"]
+    where = ["COALESCE(oi_slope_value, 1.0) <> 1.0"]
 
     if exchange in {"BINANCE", "BYBIT"}:
-        where.append("exchange = %s")
+        where.append("w.exchange = %s")
         params.append(exchange)
 
-    if timeframe in {"15м", "30м", "1ч"}:
-        aliases = {
-            "15м": ["15м", "15m"],
-            "30м": ["30м", "30m"],
-            "1ч": ["1ч", "1h"],
-        }[timeframe]
-        where.append("timeframe = ANY(%s)")
-        params.append(aliases)
-
-    elif timeframe == "4ч":
-        where.append("oi_trend_4h IS NOT NULL AND oi_trend_4h <> ''")
-
-    elif timeframe == "24ч":
-        where.append("oi_trend_24h IS NOT NULL AND oi_trend_24h <> ''")
+    if timeframe in {"15м", "30м", "1ч", "4ч", "12ч", "24ч"}:
+        where.append("w.window_code = %s")
+        params.append(timeframe)
 
     where_sql = "WHERE " + " AND ".join(where)
 
     rows = _safe_rows(f"""
-        SELECT DISTINCT ON (exchange, symbol)
-               exchange, symbol, timeframe, stage, stage_name,
-               oi_delta_pct, oi_acceleration, oi_structure,
-               oi_trend_15m, oi_trend_30m, oi_trend_1h, oi_trend_4h, oi_trend_24h,
-               ts_close
-        FROM market_oi_slope
+        SELECT
+            w.exchange,
+            w.symbol,
+            w.window_code,
+            w.oi_slope_class,
+            w.oi_slope_value,
+            w.price_regime,
+            w.price_direction,
+            w.volume_class,
+            w.cycle_ts,
+            c.current_stage,
+            c.stage_age_minutes,
+            c.oi_summary,
+            c.price_summary,
+            c.volume_summary
+        FROM window_state_v2 w
+        LEFT JOIN core_state_v2 c
+          ON c.exchange = w.exchange
+         AND c.symbol = w.symbol
         {where_sql}
-        ORDER BY exchange, symbol, ABS(oi_delta_pct) DESC, ABS(oi_acceleration) DESC, ts_close DESC
+        ORDER BY ABS(COALESCE(w.oi_slope_value, 1.0) - 1.0) DESC,
+                 c.current_stage DESC,
+                 w.cycle_ts DESC,
+                 w.exchange,
+                 w.symbol
         LIMIT 80
     """, tuple(params))
 
     rows = sorted(
         rows,
-        key=lambda r: (abs(float(r.get("oi_delta_pct") or 0)), abs(float(r.get("oi_acceleration") or 0))),
+        key=lambda r: (abs(float(r.get("oi_slope_value") or 1.0) - 1.0), int(r.get("current_stage") or 0)),
         reverse=True,
     )[:10]
 
@@ -587,111 +781,253 @@ def _build_top_oi_text(timeframe: str | None = None, exchange: str | None = None
     title = f"🏆 TOP OI за {tf_title} — {ex_title}"
 
     if not rows:
-        return f"{title}\n\nНет строк в market_oi_slope."
+        return f"{title}\n\nНет строк в window_state_v2."
 
-    lines = [title, "_market_oi_slope snapshot_"]
+    lines = [title, "_window_state_v2 snapshot_"]
 
     for i, r in enumerate(rows, 1):
         symbol = r.get("symbol")
         ex = r.get("exchange")
-        oi = _fmt_pct(r.get("oi_delta_pct"))
-        acc = _fmt_pct(r.get("oi_acceleration"))
+        oi = r.get("oi_slope_value")
+        try:
+            oi_text = f"{float(oi):.6f}"
+        except Exception:
+            oi_text = "n/a"
+        oi_summary = r.get("oi_summary") or {}
+        price_summary = r.get("price_summary") or {}
+        volume_summary = r.get("volume_summary") or {}
         links = _symbol_links(symbol, ex)
 
         lines.append(
-            f"{i}. `{symbol}` — OI {oi} | acc {acc} | {links}"
+            f"{i}. `{symbol}` — OI {r.get('oi_slope_class')} ({oi_text}) | phase={r.get('current_stage')} {_stage_label(r.get('current_stage'))} | "
+            f"pattern={oi_summary.get('oi_pattern_label') or oi_summary.get('oi_pattern_code')} | "
+            f"price={price_summary.get('price_state') or (str(r.get('price_regime')) + '/' + str(r.get('price_direction')))} | "
+            f"volume={volume_summary.get('volume_state') or r.get('volume_class')} | {links}"
         )
 
     return "\n".join(lines)
-
-
-
-def _latest_metric_row(table: str, symbol: str, exchange: str, timeframe: str) -> dict:
-    ts_col = "phase_updated_at" if table == "market_phase" else "ts_close"
-    rows = _safe_rows(f"""
-        SELECT *
-        FROM {table}
-        WHERE symbol = %s
-          AND exchange = %s
-          AND timeframe = %s
-        ORDER BY {ts_col} DESC
-        LIMIT 1
-    """, (symbol, exchange, timeframe))
-    return rows[0] if rows else {}
-
-
 def _build_coin_card(symbol: str) -> str:
     symbol = symbol.upper().strip()
 
-    phase_rows = _safe_rows("""
+    core_rows = _safe_rows("""
         SELECT *
-        FROM market_phase
+        FROM core_state_v2
         WHERE symbol = %s
-        ORDER BY
-            phase DESC,
-            CASE timeframe
-                WHEN '4h' THEN 1
-                WHEN '1h' THEN 2
-                WHEN '30m' THEN 3
-                WHEN '15m' THEN 4
-                ELSE 9
-            END,
-            priority ASC,
-            phase_updated_at DESC
+        ORDER BY current_stage DESC, stage_age_minutes DESC, latest_cycle_ts DESC, exchange
         LIMIT 20
     """, (symbol,))
 
-    oi_rows = _safe_rows("""
-        SELECT DISTINCT ON (exchange, symbol, timeframe)
-            *
-        FROM market_oi_slope
+    window_rows = _safe_rows(f"""
+        SELECT *
+        FROM window_state_v2
         WHERE symbol = %s
-        ORDER BY exchange, symbol, timeframe, ts_close DESC
+        ORDER BY exchange, {_window_rank_sql()}, cycle_ts DESC
     """, (symbol,))
 
-    if not phase_rows and not oi_rows:
+    history_rows = _safe_rows("""
+        SELECT *
+        FROM transition_history_v2
+        WHERE symbol = %s
+        ORDER BY cycle_ts DESC
+        LIMIT 12
+    """, (symbol,))
+
+    if not core_rows and not window_rows:
         return f"🪙 {symbol}\n\nНет данных. Формат: /coin BTCUSDT"
 
     lines = [f"🪙 {symbol}", ""]
 
-    if phase_rows:
-        lines.append("PHASE / HYBRID:")
-        for r in phase_rows:
+    if core_rows:
+        lines.append("OI CORE V2:")
+        for r in core_rows:
             ex = r.get("exchange")
-            tf = r.get("timeframe")
-            link = _exchange_code(ex)
-
-            price = _latest_metric_row("market_price_state", symbol, ex, tf)
-            volume = _latest_metric_row("market_volume_state", symbol, ex, tf)
-            oi = _latest_metric_row("market_oi_slope", symbol, ex, tf)
+            ex_windows = [row for row in window_rows if row.get("exchange") == ex]
+            oi = r.get("oi_summary") or {}
+            price = r.get("price_summary") or {}
+            volume = r.get("volume_summary") or {}
 
             lines.extend([
                 "",
-                f"{symbol} [{tf}]",
+                f"{symbol} [{ex}]",
                 _symbol_links(symbol, ex),
-                f"phase={r.get('phase')} {r.get('phase_name')} | status={r.get('phase_status')} | prio={r.get('priority')} | conf={r.get('confidence')}",
-                f"updated={_short_ts(r.get('phase_updated_at'))}",
-                f"OI: structure={r.get('oi_structure')} | priority={r.get('oi_priority')} | hold={r.get('oi_hold_state')}",
-                f"OI trends: 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')} | 24h={r.get('oi_trend_24h')}",
-                f"OI slope: stage={oi.get('stage')} {oi.get('stage_name')} | delta={_fmt_pct(oi.get('oi_delta_pct'))} | acc={_fmt_pct(oi.get('oi_acceleration'))}",
-                f"PRICE: structure={r.get('price_structure')} | quality={r.get('price_quality')} | slope={r.get('price_slope_state')} | delta={_fmt_pct(price.get('price_delta_pct'))} | range={_fmt_pct(price.get('range_width_pct'))}",
-                f"VOLUME: structure={r.get('volume_structure')} | quality={r.get('volume_quality')} | hold={r.get('volume_hold_state')} | norm={volume.get('normalized_volume')} | pct={volume.get('volume_percentile')}",
-                f"transition={r.get('transition_reason')}",
+                f"phase={r.get('current_stage')} {_stage_label(r.get('current_stage'))} | latest={_short_ts(r.get('latest_cycle_ts'))}",
+                f"pattern={oi.get('oi_pattern_label') or oi.get('oi_pattern_code')}",
+                f"OI summary: dir={oi.get('oi_direction_summary')} | angle={oi.get('oi_angle_summary')} | hold={oi.get('oi_retention_summary')} | stability={oi.get('oi_stability_summary')}",
+                f"OI slopes: 1h={oi.get('oi_slope_class_1h')} ({oi.get('oi_slope_ratio_1h')}) | 4h={oi.get('oi_slope_class_4h')} ({oi.get('oi_slope_ratio_4h')})",
+                f"PRICE: {price.get('price_state')} | block={price.get('price_block')} | hard_ban={r.get('price_hard_ban')}",
+                f"VOLUME: {volume.get('volume_state')} | confirm={volume.get('volume_confidence')}",
+                f"age={r.get('stage_age_minutes')}m | transition={r.get('transition_permission')} | manual_reset_required={r.get('manual_reset_required')}",
+                f"reason={r.get('phase_reason')}",
                 f"Feedback: /feedback {symbol} текст",
+                f"Debug: /debug_cases {symbol} | Analytics: /post_stage {symbol}",
             ])
+            if ex_windows:
+                lines.append("windows_v2:")
+                for w in ex_windows:
+                    slope_value = w.get('oi_slope_value')
+                    try:
+                        slope_text = f"{float(slope_value):.6f}"
+                    except Exception:
+                        slope_text = 'n/a'
+                    lines.append(
+                        f"{w.get('window_code')}: oi={w.get('oi_slope_class')} ({slope_text}) "
+                        f"| hold={w.get('oi_hold_class')} | pullback={w.get('oi_pullback_class')} "
+                        f"| smooth={w.get('oi_smoothness_class')} | price={w.get('price_regime')}/{w.get('price_direction')} "
+                        f"| volume={w.get('volume_class')} | v10x={w.get('volume_10x_confirmed')}"
+                    )
 
-    if oi_rows:
-        lines.extend(["", "LATEST OI ENGINE:"])
-        for r in oi_rows[:8]:
+    if history_rows:
+        lines.extend(["", "STAGE HISTORY V2:"])
+        for r in history_rows[:8]:
             lines.append(
-                f"{r.get('exchange')} {r.get('timeframe')} | stage={r.get('stage')} {r.get('stage_name')} | "
-                f"OI={_fmt_pct(r.get('oi_delta_pct'))} | acc={_fmt_pct(r.get('oi_acceleration'))} | "
-                f"{r.get('oi_structure')} | hold={r.get('oi_hold_state')}"
+                f"{r.get('exchange')} | {r.get('from_stage')} -> {r.get('to_stage')} | "
+                f"allowed={r.get('transition_allowed')} | age_before={r.get('stage_age_before_transition')}m | "
+                f"{_short_ts(r.get('cycle_ts'))} | reason={r.get('reason')}"
             )
 
     return "\n".join(lines)
 
+def _save_debug_cases(symbol: str, comment: str, core_rows: list[dict], window_rows: list[dict], history_rows: list[dict]) -> int:
+    written = 0
+    for r in core_rows:
+        execute(
+            """
+            INSERT INTO debug_cases_v2(
+                exchange, symbol, cycle_ts, current_stage,
+                oi_summary, price_summary, volume_summary,
+                user_comment, status, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, NOW(), NOW())
+            """,
+            (
+                r.get("exchange"),
+                symbol,
+                r.get("latest_cycle_ts"),
+                r.get("current_stage"),
+                json.dumps(r.get("oi_summary") or {}, ensure_ascii=False, default=str),
+                json.dumps(r.get("price_summary") or {}, ensure_ascii=False, default=str),
+                json.dumps(r.get("volume_summary") or {}, ensure_ascii=False, default=str),
+                comment,
+                "new",
+            ),
+        )
+        written += 1
+    return written
 
+def _build_debug_cases_text(symbol: str | None = None) -> str:
+    symbol = str(symbol or "").upper().strip() or None
+    params = []
+    where = ""
+    title = "🧪 Debug cases"
+    if symbol:
+        where = "WHERE symbol = %s"
+        params.append(symbol)
+        title = f"🧪 Debug cases — {symbol}"
+
+    rows = _safe_rows(
+        f"""
+        SELECT exchange, symbol, cycle_ts, current_stage, oi_summary, user_comment, status, created_at
+        FROM debug_cases_v2
+        {where}
+        ORDER BY created_at DESC
+        LIMIT 12
+        """,
+        tuple(params),
+    )
+
+    if not rows:
+        return f"{title}\n\nНет строк в debug_cases_v2."
+
+    lines = [title, "_latest v2 debug snapshots_"]
+    for idx, row in enumerate(rows, 1):
+        oi = row.get("oi_summary") or {}
+        lines.append(
+            f"{idx}. {row.get('symbol')} [{row.get('exchange')}] | "
+            f"stage={row.get('current_stage')} | pattern={oi.get('oi_pattern_label') or oi.get('oi_pattern_code')} | "
+            f"status={row.get('status') or 'n/a'} | cycle={_short_ts(row.get('cycle_ts'))}"
+        )
+        comment = str(row.get("user_comment") or "").strip()
+        if comment:
+            lines.append(f"   comment={comment[:180]}")
+    return "\n".join(lines)
+
+def _fmt_post_stage_delta(trigger_price, future_price) -> str:
+    if trigger_price in (None, 0) or future_price is None:
+        return "n/a"
+    try:
+        delta_pct = ((float(future_price) - float(trigger_price)) / float(trigger_price)) * 100.0
+    except Exception:
+        return "n/a"
+    return f"{delta_pct:+.2f}%"
+
+
+def _post_stage_quality_ru(value: str | None) -> str:
+    mapping = {
+        "positive": "positive",
+        "negative": "negative",
+        "flat": "flat",
+        "partial": "partial",
+        "pending_24h": "pending_24h",
+        "pending": "pending",
+    }
+    return mapping.get(str(value or "").strip(), str(value or "n/a"))
+
+
+def _build_post_stage_text(symbol: str | None = None) -> str:
+    symbol = str(symbol or "").upper().strip() or None
+    params = []
+    where = ""
+    title = "📊 Post-stage analytics"
+    if symbol:
+        where = "WHERE symbol = %s"
+        params.append(symbol)
+        title = f"📊 Post-stage analytics — {symbol}"
+
+    rows = _safe_rows(
+        f"""
+        SELECT exchange, symbol, stage_triggered, triggered_at, trigger_price,
+               price_after_1h, price_after_4h, price_after_12h, price_after_24h,
+               quality_label, notes
+        FROM post_stage_analytics_v2
+        {where}
+        ORDER BY triggered_at DESC
+        LIMIT 12
+        """,
+        tuple(params),
+    )
+
+    if not rows:
+        return f"{title}\n\nНет строк в post_stage_analytics_v2."
+
+    quality_counts = {}
+    matured_24h = 0
+    for row in rows:
+        quality = str(row.get("quality_label") or "n/a")
+        quality_counts[quality] = quality_counts.get(quality, 0) + 1
+        if row.get("price_after_24h") is not None:
+            matured_24h += 1
+
+    summary = ", ".join(f"{k}={v}" for k, v in sorted(quality_counts.items()))
+    lines = [
+        title,
+        f"rows={len(rows)} | matured_24h={matured_24h} | {summary}",
+        "_latest v2 post-stage outcomes_",
+    ]
+    for idx, row in enumerate(rows, 1):
+        lines.append(
+            f"{idx}. {row.get('symbol')} [{row.get('exchange')}] | stage={row.get('stage_triggered')} | "
+            f"trigger={_short_ts(row.get('triggered_at'))} | quality={_post_stage_quality_ru(row.get('quality_label'))}"
+        )
+        lines.append(
+            f"   1h={_fmt_post_stage_delta(row.get('trigger_price'), row.get('price_after_1h'))} | "
+            f"4h={_fmt_post_stage_delta(row.get('trigger_price'), row.get('price_after_4h'))} | "
+            f"12h={_fmt_post_stage_delta(row.get('trigger_price'), row.get('price_after_12h'))} | "
+            f"24h={_fmt_post_stage_delta(row.get('trigger_price'), row.get('price_after_24h'))}"
+        )
+        notes = str(row.get("notes") or "").strip()
+        if notes:
+            lines.append(f"   notes={notes[:180]}")
+    return "\n".join(lines)
 def _feedback_path() -> Path:
     return ПАПКА_ДАННЫХ / "telegram_feedback.csv"
 
@@ -705,16 +1041,33 @@ def _save_feedback(text: str) -> str:
     _, symbol, comment = parts
     symbol = symbol.upper().strip()
 
-    phase_rows = _safe_rows("""
+    core_rows = _safe_rows("""
         SELECT *
-        FROM market_phase
+        FROM core_state_v2
         WHERE symbol = %s
-        ORDER BY phase DESC, priority ASC, phase_updated_at DESC
+        ORDER BY current_stage DESC, stage_age_minutes DESC, latest_cycle_ts DESC, exchange
         LIMIT 20
     """, (symbol,))
 
-    if not phase_rows:
-        return f"Нет phase snapshot для {symbol}. Комментарий не сохранён."
+    if not core_rows:
+        return f"Нет core_state_v2 snapshot для {symbol}. Комментарий не сохранён."
+
+    window_rows = _safe_rows(f"""
+        SELECT *
+        FROM window_state_v2
+        WHERE symbol = %s
+        ORDER BY exchange, {_window_rank_sql()}, cycle_ts DESC
+    """, (symbol,))
+
+    history_rows = _safe_rows("""
+        SELECT *
+        FROM transition_history_v2
+        WHERE symbol = %s
+        ORDER BY cycle_ts DESC
+        LIMIT 20
+    """, (symbol,))
+
+    debug_written = _save_debug_cases(symbol, comment, core_rows, window_rows, history_rows)
 
     path = _feedback_path()
     new_file = not path.exists()
@@ -723,30 +1076,19 @@ def _save_feedback(text: str) -> str:
         "created_at_utc",
         "symbol",
         "exchange",
-        "timeframe",
-        "phase",
-        "phase_name",
-        "phase_status",
-        "priority",
-        "confidence",
-        "phase_updated_at",
-        "oi_structure",
-        "oi_priority",
-        "oi_hold_state",
-        "oi_trend_1h",
-        "oi_trend_4h",
-        "oi_trend_24h",
-        "price_structure",
-        "price_quality",
-        "price_slope_state",
-        "volume_structure",
-        "volume_quality",
-        "volume_hold_state",
-        "transition_reason",
-        "full_reason",
-        "latest_oi_json",
-        "latest_price_json",
-        "latest_volume_json",
+        "current_stage",
+        "oi_pattern_code",
+        "oi_pattern_label",
+        "price_state_summary",
+        "volume_state_summary",
+        "oi_stage_age_minutes",
+        "oi_transition_permission",
+        "blocked_stage_max",
+        "latest_cycle_ts",
+        "decision_reason",
+        "core_state_json",
+        "window_state_json",
+        "stage_history_json",
         "user_comment",
     ]
 
@@ -759,47 +1101,36 @@ def _save_feedback(text: str) -> str:
             if new_file:
                 w.writerow(header)
 
-            for r in phase_rows:
+            for r in core_rows:
                 ex = r.get("exchange")
-                tf = r.get("timeframe")
-
-                oi = _latest_metric_row("market_oi_slope", symbol, ex, tf)
-                price = _latest_metric_row("market_price_state", symbol, ex, tf)
-                volume = _latest_metric_row("market_volume_state", symbol, ex, tf)
+                ex_windows = [row for row in window_rows if row.get("exchange") == ex]
+                ex_history = [row for row in history_rows if row.get("exchange") == ex]
+                oi = r.get("oi_summary") or {}
+                price = r.get("price_summary") or {}
+                volume = r.get("volume_summary") or {}
 
                 w.writerow([
                     now,
                     symbol,
                     ex,
-                    tf,
-                    r.get("phase"),
-                    r.get("phase_name"),
-                    r.get("phase_status"),
-                    r.get("priority"),
-                    r.get("confidence"),
-                    r.get("phase_updated_at"),
-                    r.get("oi_structure"),
-                    r.get("oi_priority"),
-                    r.get("oi_hold_state"),
-                    r.get("oi_trend_1h"),
-                    r.get("oi_trend_4h"),
-                    r.get("oi_trend_24h"),
-                    r.get("price_structure"),
-                    r.get("price_quality"),
-                    r.get("price_slope_state"),
-                    r.get("volume_structure"),
-                    r.get("volume_quality"),
-                    r.get("volume_hold_state"),
-                    r.get("transition_reason"),
-                    r.get("reason"),
-                    json.dumps(oi, ensure_ascii=False, default=str),
-                    json.dumps(price, ensure_ascii=False, default=str),
-                    json.dumps(volume, ensure_ascii=False, default=str),
+                    r.get("current_stage"),
+                    oi.get("oi_pattern_code"),
+                    oi.get("oi_pattern_label"),
+                    price.get("price_state"),
+                    volume.get("volume_state"),
+                    r.get("stage_age_minutes"),
+                    r.get("transition_permission"),
+                    price.get("blocked_stage_max"),
+                    r.get("latest_cycle_ts"),
+                    r.get("phase_reason"),
+                    json.dumps(r, ensure_ascii=False, default=str),
+                    json.dumps(ex_windows, ensure_ascii=False, default=str),
+                    json.dumps(ex_history, ensure_ascii=False, default=str),
                     comment,
                 ])
                 written += 1
 
-    return f"✅ Feedback snapshot сохранён: {symbol}, rows={written}"
+    return f"✅ Feedback snapshot v2 сохранён: {symbol}, rows={written}, debug_cases={debug_written}"
 
 def _download_files() -> list[tuple[str, str]]:
     return [
@@ -876,23 +1207,25 @@ def _send_download(name: str) -> None:
         send_document(Path(last["file"]), "latest postgres backup")
         return
 
-    allowed = {
-        "bundle": "market_research_bundle.zip",
-        "reports": "runtime_reports.zip",
-        "manifest": "storage_manifest.txt",
-        "health": "runtime_health_report.txt",
-        "timing": "runtime_timing_report.txt",
-        "failures": "request_failure_report.csv",
-        "gaps": "gap_report.csv",
-        "active": "active_universe_report.csv",
-        "feedback": "telegram_feedback.csv",
-        "quarantine": "telegram_quarantine.csv",
-    }
+    allowed = _download_name_map()
+    allowed["active"] = "active_universe_report.csv"
     filename = allowed.get(name)
     if not filename:
-        send_message("Формат: /download bundle|reports|manifest|health|timing|failures|gaps|active|feedback|quarantine", _main_keyboard())
+        send_message(
+            "Формат: /download bundle|reports|manifest|health|timing|failures|gaps|universe|feedback|quarantine|q_history|stage3_alerts|pending_reset",
+            _main_keyboard(),
+        )
         return
-    send_document(ПАПКА_ДАННЫХ / filename, filename)
+
+    path = ПАПКА_ДАННЫХ / filename
+    if filename == "runtime_reports.zip":
+        try:
+            path = _build_runtime_reports_zip()
+        except FileNotFoundError:
+            send_message("Runtime reports пока не собраны.", _main_keyboard())
+            return
+
+    send_document(path, filename)
 
 def _quarantine_path() -> Path:
     return ПАПКА_ДАННЫХ / "telegram_quarantine.csv"
@@ -1017,11 +1350,10 @@ def _pending_reset_path() -> Path:
     return ПАПКА_ДАННЫХ / "telegram_pending_reset_stage3.json"
 
 
-def _save_pending_reset(symbol: str, timeframe: str, reason: str) -> None:
+def _save_pending_reset(symbol: str, reason: str) -> None:
     payload = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "symbol": symbol.upper(),
-        "timeframe": timeframe,
         "reason": reason,
     }
     _pending_reset_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1047,26 +1379,25 @@ def _handle_stage3_reset(text: str, chat_id=None) -> None:
     if not _admin_only(chat_id):
         return
 
-    parts = text.split(maxsplit=3)
-    if len(parts) < 4:
-        send_message("Формат: /reset_stage3 SYMBOL TIMEFRAME reason", _main_keyboard())
+    parts = text.split(maxsplit=2)
+    if len(parts) < 3:
+        send_message("Формат: /reset_stage3 SYMBOL reason", _main_keyboard())
         return
 
-    _, symbol, timeframe, reason = parts
+    _, symbol, reason = parts
     symbol = symbol.upper().strip()
-    timeframe = timeframe.strip()
+    reason = reason.strip()
 
-    _save_pending_reset(symbol, timeframe, reason)
+    _save_pending_reset(symbol, reason)
 
     send_message(
         "\n".join([
             "⚠️ Pending Stage3 reset создан",
             "",
             f"symbol={symbol}",
-            f"timeframe={timeframe}",
             f"reason={reason}",
             "",
-            f"Подтвердить: /confirm_reset {symbol} {timeframe}",
+            f"Подтвердить: /confirm_reset {symbol}",
             "Отменить: /cancel_reset",
         ]),
         _main_keyboard(),
@@ -1082,18 +1413,17 @@ def _handle_confirm_reset(text: str, chat_id=None) -> None:
         send_message("Нет pending reset.", _main_keyboard())
         return
 
-    parts = text.split(maxsplit=2)
-    if len(parts) < 3:
-        send_message("Формат: /confirm_reset SYMBOL TIMEFRAME", _main_keyboard())
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        send_message("Формат: /confirm_reset SYMBOL", _main_keyboard())
         return
 
-    _, symbol, timeframe = parts
+    _, symbol = parts
     symbol = symbol.upper().strip()
-    timeframe = timeframe.strip()
 
-    if symbol != pending.get("symbol") or timeframe != pending.get("timeframe"):
+    if symbol != pending.get("symbol"):
         send_message(
-            f"Pending не совпадает. Сейчас pending: {pending.get('symbol')} {pending.get('timeframe')}",
+            f"Pending не совпадает. Сейчас pending: {pending.get('symbol')}",
             _main_keyboard(),
         )
         return
@@ -1103,14 +1433,14 @@ def _handle_confirm_reset(text: str, chat_id=None) -> None:
 
     for exchange in ("BYBIT", "BINANCE"):
         try:
-            total += reset_stage3(exchange, symbol, timeframe, reason, dry_run=False)
+            total += max(reset_stage3(exchange, symbol, "n/a", reason, dry_run=False), 0)
         except Exception as exc:
             log(f"telegram confirm_reset error: {exc}")
 
     _clear_pending_reset()
 
     send_message(
-        f"✅ Stage3 reset confirmed: {symbol} {timeframe}, rows={total}",
+        f"✅ Stage3 reset confirmed: {symbol}, rows={total}",
         _main_keyboard(),
     )
 
@@ -1124,15 +1454,11 @@ def _handle_cancel_reset(text: str, chat_id=None) -> None:
 
     if pending:
         send_message(
-            f"✅ Pending reset отменён: {pending.get('symbol')} {pending.get('timeframe')}",
+            f"✅ Pending reset отменён: {pending.get('symbol')}",
             _main_keyboard(),
         )
     else:
         send_message("Pending reset не найден.", _main_keyboard())
-
-
-
-
 def _stage3_alert_history_path() -> Path:
     return ПАПКА_ДАННЫХ / "telegram_stage3_alert_history.csv"
 
@@ -1160,21 +1486,14 @@ def _append_stage3_alert_history(row: dict, alert_key: str) -> None:
         "alert_key",
         "exchange",
         "symbol",
-        "timeframe",
-        "phase",
-        "phase_name",
-        "phase_status",
-        "priority",
-        "confidence",
-        "phase_updated_at",
-        "oi_structure",
-        "oi_priority",
-        "oi_hold_state",
-        "price_structure",
-        "price_quality",
-        "volume_structure",
-        "volume_quality",
-        "transition_reason",
+        "current_stage",
+        "oi_pattern_code",
+        "oi_pattern_label",
+        "price_state_summary",
+        "volume_state_summary",
+        "oi_stage_age_minutes",
+        "latest_cycle_ts",
+        "decision_reason",
     ]
 
     with _csv_lock:
@@ -1188,58 +1507,60 @@ def _append_stage3_alert_history(row: dict, alert_key: str) -> None:
                 alert_key,
                 row.get("exchange"),
                 row.get("symbol"),
-                row.get("timeframe"),
-                row.get("phase"),
-                row.get("phase_name"),
-                row.get("phase_status"),
-                row.get("priority"),
-                row.get("confidence"),
-                row.get("phase_updated_at"),
-                row.get("oi_structure"),
-                row.get("oi_priority"),
-                row.get("oi_hold_state"),
-                row.get("price_structure"),
-                row.get("price_quality"),
-                row.get("volume_structure"),
-                row.get("volume_quality"),
-                row.get("transition_reason"),
+                row.get("current_stage"),
+                row.get("oi_pattern_code"),
+                row.get("oi_pattern_label"),
+                row.get("price_state_summary"),
+                row.get("volume_state_summary"),
+                row.get("oi_stage_age_minutes"),
+                row.get("latest_cycle_ts"),
+                row.get("decision_reason"),
             ])
 
 
 def _build_stage3_alert_text(r: dict) -> str:
     symbol = r.get("symbol")
-    timeframe = r.get("timeframe")
     ex = r.get("exchange")
-    link = _exchange_code(ex)
+    oi = r.get("oi_summary") or {}
+    price = r.get("price_summary") or {}
+    volume = r.get("volume_summary") or {}
+    ex_windows = _safe_rows(f"""
+        SELECT *
+        FROM window_state_v2
+        WHERE exchange = %s
+          AND symbol = %s
+        ORDER BY {_window_rank_sql()}, cycle_ts DESC
+    """, (ex, symbol))
+    window_line = " | ".join(
+        f"{w.get('window_code')}={w.get('oi_slope_class')}"
+        for w in ex_windows[:4]
+    )
 
     return "\n".join([
         "🥇 NEW STAGE 3",
         "",
-        f"{symbol} [{timeframe}]",
-        f"🔗 CG | {link}",
-        f"`{symbol}`",
-        f"phase={r.get('phase')} {r.get('phase_name')} | status={r.get('phase_status')} | prio={r.get('priority')} | conf={r.get('confidence')}",
-        f"updated={_short_ts(r.get('phase_updated_at'))}",
-        f"OI: {r.get('oi_structure')} | p={r.get('oi_priority')} | hold={r.get('oi_hold_state')} | 1h={r.get('oi_trend_1h')} | 4h={r.get('oi_trend_4h')}",
-        f"PRICE: {r.get('price_structure')} | {r.get('price_quality')} | slope={r.get('price_slope_state')}",
-        f"VOL: {r.get('volume_structure')} | {r.get('volume_quality')} | hold={r.get('volume_hold_state')}",
-        f"transition={r.get('transition_reason')}",
+        f"{symbol} [{ex}]",
+        _symbol_links(symbol, ex),
+        f"phase={r.get('current_stage')} {_stage_label(r.get('current_stage'))} | updated={_short_ts(r.get('latest_cycle_ts'))}",
+        f"pattern={oi.get('oi_pattern_label') or oi.get('oi_pattern_code')}",
+        f"PRICE: {price.get('price_state')}",
+        f"VOL: {volume.get('volume_state')}",
+        f"age={r.get('stage_age_minutes')}m",
+        f"reason={r.get('phase_reason')}",
+        f"windows={window_line or 'n/a'}",
         "",
         f"Card: /coin {symbol}",
         f"Feedback: /feedback {symbol} текст",
-        f"Reset: /reset_stage3 {symbol} {timeframe} reason",
+        f"Reset: /reset_stage3 {symbol} reason",
     ])
-
-
 def check_stage3_alerts() -> int:
     alerted = _read_stage3_alerted_keys()
 
     rows = _safe_rows("""
         SELECT *
-        FROM market_phase
-        WHERE phase = 3
-          AND COALESCE(phase_status, '') IN ('active', 'holding')
-        ORDER BY phase_updated_at DESC
+        FROM core_state_v2
+        WHERE current_stage = 3
+        ORDER BY latest_cycle_ts DESC
         LIMIT 50
     """)
 
@@ -1249,8 +1570,7 @@ def check_stage3_alerts() -> int:
         key = "|".join([
             str(r.get("exchange")),
             str(r.get("symbol")),
-            str(r.get("timeframe")),
-            "phase=3",
+            "stage=3",
         ])
 
         if key in alerted:
@@ -1261,10 +1581,6 @@ def check_stage3_alerts() -> int:
         sent += 1
 
     return sent
-
-
-
-
 def _archive_index_path() -> Path:
     return Path("archive") / "manifests" / "archive_index.json"
 
@@ -1364,6 +1680,10 @@ def _run_backup_db() -> str:
 def _handle(text: str, chat_id=None) -> None:
     text = text.strip()
 
+    if not _is_admin_chat(chat_id):
+        log(f"telegram unauthorized chat ignored: chat_id={chat_id} text={text[:120]}")
+        return
+
     if text in {"/start", "/help", "❓ Помощь"}:
         send_message(_build_help_text(), _main_keyboard())
 
@@ -1393,10 +1713,10 @@ def _handle(text: str, chat_id=None) -> None:
         send_message("Сброс фазы 3", _stage3_reset_keyboard())
 
     elif text == "Сбросить по тикеру":
-        send_message("Формат: /reset_stage3 SYMBOL TF reason", _stage3_reset_keyboard())
+        send_message("Формат: /reset_stage3 SYMBOL reason", _stage3_reset_keyboard())
 
     elif text == "Сбросить все":
-        send_message("Массовый reset пока не исполняется из кнопки. Используй точечно: /reset_stage3 SYMBOL TF reason", _stage3_reset_keyboard())
+        send_message("Массовый reset пока не исполняется из кнопки. Используй точечно: /reset_stage3 SYMBOL reason", _stage3_reset_keyboard())
 
     elif text in {"15м", "30м", "4ч", "24ч"}:
         send_message(_build_top_oi_text(text), _top_oi_keyboard())
@@ -1424,8 +1744,9 @@ def _handle(text: str, chat_id=None) -> None:
         send_message(_build_top_oi_text("24ч", "BYBIT"), _top_oi_keyboard())
 
     elif text.startswith("/top_oi "):
+        timeframe, exchange = _parse_top_oi_args(text.split(maxsplit=1)[1].strip())
         send_message(
-            _build_top_oi_text(text.split(maxsplit=1)[1].strip()),
+            _build_top_oi_text(timeframe, exchange),
             _main_keyboard()
         )
 
@@ -1437,6 +1758,18 @@ def _handle(text: str, chat_id=None) -> None:
 
     elif text.startswith("/feedback "):
         send_message(_save_feedback(text), _main_keyboard())
+
+    elif text == "/debug_cases":
+        send_message(_build_debug_cases_text(), _main_keyboard())
+
+    elif text.startswith("/debug_cases "):
+        send_message(_build_debug_cases_text(text.split(maxsplit=1)[1]), _main_keyboard())
+
+    elif text == "/post_stage":
+        send_message(_build_post_stage_text(), _main_keyboard())
+
+    elif text.startswith("/post_stage "):
+        send_message(_build_post_stage_text(text.split(maxsplit=1)[1]), _main_keyboard())
 
     elif text in {"/downloads", "⬇️ Скачать"}:
         send_message(_build_downloads_text(), _downloads_keyboard())
@@ -1546,5 +1879,13 @@ def start_polling() -> None:
     if _polling_started or not TELEGRAM_BOT_TOKEN:
         return
 
+    if not _acquire_polling_lock():
+        return
+
     _polling_started = True
-    threading.Thread(target=_loop, daemon=True).start()
+    try:
+        threading.Thread(target=_loop, daemon=True).start()
+    except Exception:
+        _polling_started = False
+        _release_polling_lock()
+        raise
