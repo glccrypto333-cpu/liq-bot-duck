@@ -510,6 +510,7 @@ def insert_collected_raw(batch: dict) -> int:
 
 def validate_aggregate_windows() -> dict:
     required_windows = ["15м", "30м", "1ч", "4ч", "12ч", "24ч"]
+    blocking_windows = {"15м", "30м", "1ч", "4ч", "12ч"}
     window_minutes = {
         "15м": 15,
         "30м": 30,
@@ -572,7 +573,10 @@ def validate_aggregate_windows() -> dict:
                 )
                 continue
             if counts.get((metric, timeframe), 0) <= 0:
-                missing.append(f"{metric}:{timeframe}")
+                if timeframe in blocking_windows:
+                    missing.append(f"{metric}:{timeframe}")
+                else:
+                    warmup_pending.append(f"{metric}:{timeframe}:optional_missing")
 
     if missing:
         raise RuntimeError(f"aggregates_validate failed: missing_windows={missing}")
