@@ -58,7 +58,7 @@ def _has_mature_build(oi_summary: dict) -> bool:
         _is_mature_growth(oi_30m)
         and _is_growth(oi_1h)
         and not _is_15m_hard_negative_for_fresh_stage3(oi_15m)
-        and not _is_4h_hard_decline(oi_4h)
+        and not _is_decline(oi_4h)
     )
 
 

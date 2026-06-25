@@ -92,9 +92,20 @@ def test_strong_15m_without_30m_confirmation_does_not_create_stage_2() -> None:
     assert reason == "удержание_1:нет_живого_набора"
 
 
-def test_2_to_3_requires_mature_30m_and_positive_1h() -> None:
+def test_2_to_3_is_blocked_by_4h_oi_weak_down() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_15m="flat", oi_30m="good_up", oi_1h="weak_up", oi_4h="weak_down")
+    target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+
+    stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 30.0, 60.0)
+    assert target_stage == 2
+    assert stage == 2
+    assert reason == "удержание_2:30м_или_1ч_еще_не_созрели"
+
+
+def test_2_to_3_requires_mature_30m_and_positive_1h() -> None:
+    previous_state = {"current_stage": 2}
+    summary = make_oi_summary(oi_15m="flat", oi_30m="good_up", oi_1h="weak_up", oi_4h="flat")
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
 
     stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 29.0, 59.0)
