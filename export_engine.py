@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+from time_utils import iso_мск
 from pathlib import Path
 import csv
 import json
@@ -276,7 +277,7 @@ def _table_health_rows() -> list[dict]:
 
 def _storage_manifest_text(files: list[Path], mode: str, range_label: str) -> str:
     lines = [
-        f"generated_at_utc={datetime.now(timezone.utc).isoformat()}",
+        f"generated_at_utc={iso_мск()}",
         f"app_version={APP_VERSION}",
         f"mode={mode}",
         f"range={range_label}",
@@ -319,7 +320,7 @@ def _runtime_health_text(table_health: list[dict], core_rows: list[dict], stage_
     stage3_rows = [row for row in core_rows if int(row.get("current_stage") or 0) == 3]
 
     lines = [
-        f"generated_at_utc={datetime.now(timezone.utc).isoformat()}",
+        f"generated_at_utc={iso_мск()}",
         f"app_version={APP_VERSION}",
         f"canonical_tables_ok={sum(1 for row in table_health if row.get('status') == 'OK')}",
         f"canonical_tables_stale={sum(1 for row in table_health if row.get('status') == 'STALE')}",
@@ -367,7 +368,7 @@ def _research_report_text(
     ))[:15]
 
     lines = [
-        f"generated_at_utc={datetime.now(timezone.utc).isoformat()}",
+        f"generated_at_utc={iso_мск()}",
         f"app_version={APP_VERSION}",
         f"mode={mode}",
         f"range={range_label}",
@@ -494,7 +495,7 @@ def rebuild_exports(mode: str = "quick") -> Path:
     runtime_timing_text = _read_text(runtime_timing_source)
     if not runtime_timing_text:
         runtime_timing_text = (
-            f"generated_at={datetime.now(timezone.utc).isoformat()}\n"
+            f"generated_at={iso_мск()}\n"
             f"status=missing_runtime_timing_source\n"
         )
     _write_text(runtime_timing_path, runtime_timing_text)

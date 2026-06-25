@@ -19,7 +19,7 @@ if [[ "${DUCK_VERIFICATION_DB_TARGET}" == "hot" ]]; then
     CLEAN_URL="${CLEAN_URL/@127.0.0.1:5432/@127.0.0.1:6543}"
     export DATABASE_URL="${CLEAN_URL}"
   fi
-elif [[ "${DUCK_VERIFICATION_DB_TARGET}" =~ ^mduck_cal_ ]]; then
+elif [[ "${DUCK_VERIFICATION_DB_TARGET}" =~ ^mduck_cal_[0-9]{8}$ ]]; then
   DB_HOST="${DUCK_CAL_DB_HOST:-127.0.0.1}"
   DB_PORT="${DUCK_CAL_DB_PORT:-5432}"
   DB_USER="${DUCK_CAL_DB_USER:-postgres}"

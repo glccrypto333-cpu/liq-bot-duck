@@ -1,5 +1,5 @@
-from datetime import datetime, timezone
+from time_utils import текст_мск
 
 def log(message: str) -> None:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ts = текст_мск()
     print(f"{ts} | {message}", flush=True)

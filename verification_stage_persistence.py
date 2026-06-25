@@ -10,13 +10,10 @@ measures sustained stage-2 / stage-3 streaks for tracked symbols.
 import argparse
 from collections import defaultdict
 
-from autonomous_oi_replay import _parse_ts, load_cycle_timestamps
+from autonomous_oi_replay import _parse_ts, load_cycle_timestamps, load_latest_window_map_for_replay, load_batch_window_updates
 from autonomous_oi_service import (
-    WINDOWS,
     compute_autonomous_oi_snapshot_from_latest_window_map,
-    load_latest_window_map,
 )
-from db import fetch
 
 
 def build_updates(cycles):
@@ -74,14 +71,14 @@ def main() -> None:
     parser.add_argument("--symbols", nargs="+", required=True)
     args = parser.parse_args()
 
-    cycles = load_cycle_timestamps(args.hours, args.limit_cycles, to_ts=_parse_ts(args.to_ts))
+    cycles, resolved_window_source = load_cycle_timestamps(args.hours, args.limit_cycles, to_ts=_parse_ts(args.to_ts))
     if not cycles:
         print("NO_CYCLES")
         return
 
     tracked = {symbol.upper() for symbol in args.symbols}
-    latest_window_map = load_latest_window_map(cycles[0])
-    updates_by_cycle = build_updates(cycles)
+    latest_window_map = load_latest_window_map_for_replay(cycles[0], window_source=resolved_window_source)
+    updates_by_cycle = load_batch_window_updates(cycles, window_source=resolved_window_source)
     state_map = {}
     per_symbol_rows: dict[tuple[str, str], list[tuple]] = defaultdict(list)
 

@@ -90,6 +90,17 @@ def _conn():
 
             time.sleep(2)
 
+
+def _fresh_conn():
+    conn = psycopg.connect(
+        DATABASE_URL,
+        autocommit=True,
+        row_factory=dict_row,
+        connect_timeout=5,
+    )
+    _apply_session_settings(conn)
+    return conn
+
 def init_db() -> None:
     if not DATABASE_URL:
         log("DATABASE_URL не задан, пропускаю init_db")
@@ -159,6 +170,26 @@ def init_db() -> None:
         )
         """)
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS aggregate_windows_history(
+            metric TEXT NOT NULL,
+            window_code TEXT NOT NULL,
+            ts_open TIMESTAMPTZ NOT NULL,
+            ts_close TIMESTAMPTZ NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            open_value DOUBLE PRECISION,
+            high_value DOUBLE PRECISION,
+            low_value DOUBLE PRECISION,
+            close_value DOUBLE PRECISION,
+            sum_value DOUBLE PRECISION,
+            avg_value DOUBLE PRECISION,
+            delta_pct DOUBLE PRECISION,
+            unique_candles INTEGER NOT NULL,
+            source_cycle_ts TIMESTAMPTZ,
+            built_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS oi_core_state(
             exchange TEXT NOT NULL,
             symbol TEXT NOT NULL,
@@ -188,6 +219,11 @@ def init_db() -> None:
             decision_reason TEXT,
             block_reason TEXT,
             breakdown_reason TEXT,
+            growth_trigger_ts TIMESTAMPTZ,
+            oi_slope_class_15m TEXT,
+            oi_slope_class_30m TEXT,
+            oi_slope_class_1h TEXT,
+            oi_slope_class_4h TEXT,
             latest_cycle_ts TIMESTAMPTZ,
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )
@@ -359,6 +395,24 @@ def init_db() -> None:
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_stage3_alert_history(
+            id BIGSERIAL PRIMARY KEY,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            created_at_text TEXT,
+            alert_key TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            current_stage INTEGER,
+            oi_pattern_code TEXT,
+            oi_pattern_label TEXT,
+            price_state_summary TEXT,
+            volume_state_summary TEXT,
+            oi_stage_age_minutes DOUBLE PRECISION,
+            latest_cycle_ts TIMESTAMPTZ,
+            decision_reason TEXT
+        )
+        """)
 
         run_runtime_ddl = _runtime_ddl_enabled()
 
@@ -366,6 +420,9 @@ def init_db() -> None:
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_price_raw_candle ON price_raw(exchange, symbol, ts_open)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_volume_raw_candle ON volume_raw(exchange, symbol, ts_open)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_aggregate_windows_key ON aggregate_windows(metric, window_code, exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_aggregate_windows_history_key ON aggregate_windows_history(metric, window_code, exchange, symbol, ts_open)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_aggregate_windows_history_latest ON aggregate_windows_history(exchange, symbol, window_code, ts_close DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_aggregate_windows_history_ts_close ON aggregate_windows_history(ts_close)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_oi_core_state_key ON oi_core_state(exchange, symbol)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_oi_window_state_key ON oi_window_state(exchange, symbol, window_code)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_core_state_v2_key ON core_state_v2(exchange, symbol)")
@@ -383,6 +440,11 @@ def init_db() -> None:
         safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS volume_state_summary TEXT")
         safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS volume_confidence_summary TEXT")
         safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS blocked_stage_max INTEGER")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS growth_trigger_ts TIMESTAMPTZ")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_slope_class_15m TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_slope_class_30m TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_slope_class_1h TEXT")
+        safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_slope_class_4h TEXT")
         safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS oi_pattern_code TEXT")
         safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS oi_pattern_label TEXT")
         safe_ddl(cur, "ALTER TABLE oi_window_state ADD COLUMN IF NOT EXISTS price_state_code TEXT")
@@ -694,6 +756,8 @@ def init_db() -> None:
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_market_volume_state_latest ON market_volume_state(exchange, symbol, timeframe, ts_close DESC)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_request_failure_report_main ON request_failure_report(exchange, symbol, data_type)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_aggregate_windows_latest ON aggregate_windows(exchange, symbol, window_code, ts_close DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_aggregate_windows_history_latest ON aggregate_windows_history(exchange, symbol, window_code, ts_close DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_aggregate_windows_history_ts_close ON aggregate_windows_history(ts_close)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_oi_core_stage ON oi_core_state(current_stage)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_oi_stage_history_main ON oi_stage_history(exchange, symbol, created_at DESC)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_oi_debug_cases_main ON oi_debug_cases(exchange, symbol, created_at DESC)")
@@ -702,6 +766,8 @@ def init_db() -> None:
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_transition_history_v2_main ON transition_history_v2(exchange, symbol, created_at DESC)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_debug_cases_v2_main ON debug_cases_v2(exchange, symbol, created_at DESC)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_post_stage_v2_main ON post_stage_analytics_v2(exchange, symbol, triggered_at DESC)")
+        safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_telegram_stage3_alert_history_key ON telegram_stage3_alert_history(alert_key)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_telegram_stage3_alert_history_created ON telegram_stage3_alert_history(created_at DESC)")
 
 
     log("Postgres: canonical schema + derived tables готовы")
@@ -808,20 +874,143 @@ def upsert_volume(rows: list[tuple], cycle_ts=None, source: str = "collect") -> 
             source=EXCLUDED.source,
             collected_at=NOW()
         """, canonical_rows)
+def _derived_retention_hours() -> int:
+    return int(os.getenv("DERIVED_RETENTION_HOURS", "72"))
+
+
+def history_retention_hours() -> int:
+    return int(os.getenv("AGGREGATE_HISTORY_RETENTION_HOURS", "168"))
+
+
+def upsert_aggregate_history_rows(rows: list[tuple]) -> int:
+    if not DATABASE_URL or not rows:
+        return 0
+
+    inserted = 0
+    with _conn() as conn, conn.cursor() as cur:
+        batch_size = int(os.getenv("AGGREGATE_INSERT_BATCH_SIZE", "5000"))
+        insert_sql = """
+        INSERT INTO aggregate_windows_history(
+            metric, window_code, ts_open, ts_close, exchange, symbol,
+            open_value, high_value, low_value, close_value,
+            sum_value, avg_value, delta_pct, unique_candles,
+            source_cycle_ts, built_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (metric, window_code, exchange, symbol, ts_open)
+        DO UPDATE SET
+            ts_close=EXCLUDED.ts_close,
+            open_value=EXCLUDED.open_value,
+            high_value=EXCLUDED.high_value,
+            low_value=EXCLUDED.low_value,
+            close_value=EXCLUDED.close_value,
+            sum_value=EXCLUDED.sum_value,
+            avg_value=EXCLUDED.avg_value,
+            delta_pct=EXCLUDED.delta_pct,
+            unique_candles=EXCLUDED.unique_candles,
+            source_cycle_ts=EXCLUDED.source_cycle_ts,
+            built_at=NOW()
+        """
+
+        for i in range(0, len(rows), batch_size):
+            batch = [
+                (
+                    metric, timeframe, ts_open, ts_close, exchange, symbol,
+                    open_value, high_value, low_value, close_value,
+                    sum_value, avg_value, delta_pct, unique_candles,
+                    ts_close,
+                )
+                for (
+                    metric, timeframe, ts_open, ts_close, exchange, symbol,
+                    open_value, high_value, low_value, close_value,
+                    sum_value, avg_value, delta_pct, unique_candles,
+                ) in rows[i:i + batch_size]
+            ]
+            cur.executemany(insert_sql, batch)
+            inserted += len(batch)
+        conn.commit()
+    return inserted
+
+
+def upsert_aggregate_hot_rows(rows: list[tuple]) -> int:
+    if not DATABASE_URL or not rows:
+        return 0
+
+    inserted = 0
+    with _conn() as conn, conn.cursor() as cur:
+        batch_size = int(os.getenv("AGGREGATE_INSERT_BATCH_SIZE", "5000"))
+        insert_sql = """
+        INSERT INTO aggregate_windows(
+            metric, window_code, ts_open, ts_close, exchange, symbol,
+            open_value, high_value, low_value, close_value,
+            sum_value, avg_value, delta_pct, unique_candles,
+            source_cycle_ts, built_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (metric, window_code, exchange, symbol, ts_open)
+        DO UPDATE SET
+            ts_close=EXCLUDED.ts_close,
+            open_value=EXCLUDED.open_value,
+            high_value=EXCLUDED.high_value,
+            low_value=EXCLUDED.low_value,
+            close_value=EXCLUDED.close_value,
+            sum_value=EXCLUDED.sum_value,
+            avg_value=EXCLUDED.avg_value,
+            delta_pct=EXCLUDED.delta_pct,
+            unique_candles=EXCLUDED.unique_candles,
+            source_cycle_ts=EXCLUDED.source_cycle_ts,
+            built_at=NOW()
+        """
+
+        for i in range(0, len(rows), batch_size):
+            batch = [
+                (
+                    metric, timeframe, ts_open, ts_close, exchange, symbol,
+                    open_value, high_value, low_value, close_value,
+                    sum_value, avg_value, delta_pct, unique_candles,
+                    ts_close,
+                )
+                for (
+                    metric, timeframe, ts_open, ts_close, exchange, symbol,
+                    open_value, high_value, low_value, close_value,
+                    sum_value, avg_value, delta_pct, unique_candles,
+                ) in rows[i:i + batch_size]
+            ]
+            cur.executemany(insert_sql, batch)
+            inserted += len(batch)
+        conn.commit()
+    return inserted
+
+
+def prune_aggregate_history(hours: int | None = None) -> int:
+    retention_hours = int(hours or history_retention_hours())
+    rows = execute(
+        "DELETE FROM aggregate_windows_history WHERE ts_close < NOW() - (%s || ' hours')::interval",
+        (retention_hours,),
+    )
+    return int(rows or 0)
+
+
 def replace_aggregate_layers_atomically(rows: list[tuple]) -> None:
     if not DATABASE_URL:
         return
     if not rows:
         raise RuntimeError("replace_aggregate_layers_atomically failed: empty rows")
 
-    conn = _conn()
+    conn = _fresh_conn()
     prev_autocommit = conn.autocommit
 
     try:
         conn.autocommit = False
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM aggregate_windows WHERE ts_close < NOW() - INTERVAL '72 hours'")
-            cur.execute("DELETE FROM aggregate_windows WHERE ts_close >= NOW() - INTERVAL '72 hours'")
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('aggregate_windows_replace'))")
+            retention_hours = _derived_retention_hours()
+            cur.execute(
+                "DELETE FROM aggregate_windows WHERE ts_close < NOW() - (%s || ' hours')::interval",
+                (retention_hours,),
+            )
+            cur.execute(
+                "DELETE FROM aggregate_windows WHERE ts_close >= NOW() - (%s || ' hours')::interval",
+                (retention_hours,),
+            )
 
             batch_size = int(os.getenv("AGGREGATE_INSERT_BATCH_SIZE", "5000"))
             insert_sql = """
@@ -831,6 +1020,19 @@ def replace_aggregate_layers_atomically(rows: list[tuple]) -> None:
                 sum_value, avg_value, delta_pct, unique_candles,
                 source_cycle_ts, built_at
             ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (metric, window_code, exchange, symbol, ts_open)
+            DO UPDATE SET
+                ts_close=EXCLUDED.ts_close,
+                open_value=EXCLUDED.open_value,
+                high_value=EXCLUDED.high_value,
+                low_value=EXCLUDED.low_value,
+                close_value=EXCLUDED.close_value,
+                sum_value=EXCLUDED.sum_value,
+                avg_value=EXCLUDED.avg_value,
+                delta_pct=EXCLUDED.delta_pct,
+                unique_candles=EXCLUDED.unique_candles,
+                source_cycle_ts=EXCLUDED.source_cycle_ts,
+                built_at=NOW()
             """
 
             for i in range(0, len(rows), batch_size):
@@ -968,9 +1170,14 @@ def replace_oi_core_state(rows: list[tuple]) -> None:
             decision_reason,
             block_reason,
             breakdown_reason,
+            growth_trigger_ts,
+            oi_slope_class_15m,
+            oi_slope_class_30m,
+            oi_slope_class_1h,
+            oi_slope_class_4h,
             latest_cycle_ts,
             updated_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
         ON CONFLICT (exchange, symbol)
         DO UPDATE SET
             current_stage = EXCLUDED.current_stage,
@@ -999,6 +1206,11 @@ def replace_oi_core_state(rows: list[tuple]) -> None:
             decision_reason = EXCLUDED.decision_reason,
             block_reason = EXCLUDED.block_reason,
             breakdown_reason = EXCLUDED.breakdown_reason,
+            growth_trigger_ts = EXCLUDED.growth_trigger_ts,
+            oi_slope_class_15m = EXCLUDED.oi_slope_class_15m,
+            oi_slope_class_30m = EXCLUDED.oi_slope_class_30m,
+            oi_slope_class_1h = EXCLUDED.oi_slope_class_1h,
+            oi_slope_class_4h = EXCLUDED.oi_slope_class_4h,
             latest_cycle_ts = EXCLUDED.latest_cycle_ts,
             updated_at = NOW()
         """, rows)
@@ -1197,6 +1409,70 @@ def active_universe_sql(alias: str = "") -> str:
 
 
 
+
+
+
+def prune_inactive_state_rows() -> dict[str, int]:
+    if not DATABASE_URL:
+        return {}
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM active_symbol_universe")
+        active_count_row = cur.fetchone()
+        active_count = int((active_count_row or {}).get("count", 0))
+        if active_count <= 0:
+            return {}
+
+        counts: dict[str, int] = {}
+        delete_specs = [
+            (
+                "oi_window_state",
+                """
+                DELETE FROM oi_window_state w
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM active_symbol_universe au
+                    WHERE au.exchange = w.exchange
+                      AND au.symbol = w.symbol
+                )
+                """,
+            ),
+            (
+                "window_state_v2",
+                """
+                DELETE FROM window_state_v2 w
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM active_symbol_universe au
+                    WHERE au.exchange = w.exchange
+                      AND au.symbol = w.symbol
+                )
+                """,
+            ),
+            (
+                "oi_core_state",
+                """
+                DELETE FROM oi_core_state c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM active_symbol_universe au
+                    WHERE au.exchange = c.exchange
+                      AND au.symbol = c.symbol
+                )
+                """,
+            ),
+            (
+                "core_state_v2",
+                """
+                DELETE FROM core_state_v2 c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM active_symbol_universe au
+                    WHERE au.exchange = c.exchange
+                      AND au.symbol = c.symbol
+                )
+                """,
+            ),
+        ]
+        for label, sql in delete_specs:
+            cur.execute(sql)
+            counts[label] = cur.rowcount
+        return counts
 
 
 def replace_market_phase(rows: list[tuple]) -> None:
@@ -1503,7 +1779,7 @@ def cleanup_old(days: int) -> None:
         )
         print(f"RAW_CLEANUP_TABLE table={table} rows_deleted={int(rows or 0)} retention_days={raw_days}")
 
-    derived_hours = int(os.getenv("DERIVED_RETENTION_HOURS", "72"))
+    derived_hours = _derived_retention_hours()
     derived_tables = ["aggregate_windows"]
 
     if os.getenv("CLEANUP_LEGACY_DERIVED_TABLES") == "1":
@@ -1526,6 +1802,16 @@ def cleanup_old(days: int) -> None:
             print(f"DERIVED_CLEANUP_TABLE table={table} rows_deleted={int(rows or 0)} retention_hours={derived_hours}")
         except Exception as e:
             print(f"DERIVED_CLEANUP_TABLE_ERROR table={table} error={type(e).__name__}: {e}")
+
+    try:
+        history_hours = history_retention_hours()
+        rows = execute(
+            "DELETE FROM aggregate_windows_history WHERE ts_close < NOW() - (%s || ' hours')::interval",
+            (history_hours,),
+        )
+        print(f"HISTORY_CLEANUP_TABLE table=aggregate_windows_history rows_deleted={int(rows or 0)} retention_hours={history_hours}")
+    except Exception as e:
+        print(f"HISTORY_CLEANUP_TABLE_ERROR table=aggregate_windows_history error={type(e).__name__}: {e}")
 
 def migrate_canonical_ts_close() -> None:
     """

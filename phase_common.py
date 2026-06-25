@@ -26,45 +26,45 @@ OI_SLOPE_THRESHOLDS = {
     "15м": {
         "strong_down": 0.97,
         "weak_down": 0.995,
-        "flat_high": 1.01,
-        "weak_up": 1.03,
-        "good_up": 1.08,
+        "flat_high": 1.0027,
+        "weak_up": 1.012,
+        "good_up": 1.035,
     },
     "30м": {
         "strong_down": 0.96,
         "weak_down": 0.99,
-        "flat_high": 1.015,
-        "weak_up": 1.04,
-        "good_up": 1.10,
+        "flat_high": 1.0044,
+        "weak_up": 1.016,
+        "good_up": 1.05,
     },
     "1ч": {
         "strong_down": 0.95,
         "weak_down": 0.99,
-        "flat_high": 1.02,
-        "weak_up": 1.05,
-        "good_up": 1.12,
+        "flat_high": 1.0040,
+        "weak_up": 1.015,
+        "good_up": 1.05,
     },
     "4ч": {
         "strong_down": 0.94,
         "weak_down": 0.99,
-        "flat_high": 1.03,
-        "weak_up": 1.08,
-        "good_up": 1.18,
+        "flat_high": 1.01,
+        "weak_up": 1.035,
+        "good_up": 1.095,
     },
     # Пока повторяем 4ч как временный safe fallback до отдельной калибровки 12ч/24ч.
     "12ч": {
         "strong_down": 0.94,
         "weak_down": 0.99,
-        "flat_high": 1.03,
-        "weak_up": 1.08,
-        "good_up": 1.18,
+        "flat_high": 1.018,
+        "weak_up": 1.05,
+        "good_up": 1.13,
     },
     "24ч": {
         "strong_down": 0.94,
         "weak_down": 0.99,
-        "flat_high": 1.03,
-        "weak_up": 1.08,
-        "good_up": 1.18,
+        "flat_high": 1.018,
+        "weak_up": 1.05,
+        "good_up": 1.13,
     },
 }
 
@@ -235,3 +235,12 @@ def smoothness_ratio_from_points(points: list[float]) -> float:
     if path <= 0:
         return 1.0
     return max(0.0, min(1.0, net / path))
+
+
+def silent_build_ratio_from_points(points: list[float]) -> float:
+    if len(points) < 2:
+        return 1.0
+    floor = min(points)
+    if floor <= 0:
+        return 1.0
+    return points[-1] / floor

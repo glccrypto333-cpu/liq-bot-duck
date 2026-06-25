@@ -8,52 +8,16 @@ core state details for tracked symbols, with optional per-window breakdown.
 """
 
 import argparse
-from collections import defaultdict
 
-from autonomous_oi_replay import _parse_ts, load_cycle_timestamps
-from autonomous_oi_service import (
-    WINDOWS,
-    compute_autonomous_oi_snapshot_from_latest_window_map,
-    load_latest_window_map,
+from autonomous_oi_replay import (
+    _parse_ts,
+    load_batch_window_updates,
+    load_cycle_timestamps,
+    load_latest_window_map_for_replay,
 )
-from db import fetch
-
-
-def build_updates(cycles):
-    updates = fetch(
-        """
-        SELECT
-            metric,
-            window_code,
-            ts_open,
-            ts_close,
-            exchange,
-            symbol,
-            open_value,
-            high_value,
-            low_value,
-            close_value,
-            sum_value,
-            avg_value,
-            delta_pct,
-            unique_candles,
-            source_cycle_ts,
-            built_at
-        FROM aggregate_windows
-        WHERE metric IN ('OI', 'PRICE', 'VOLUME')
-          AND window_code = ANY(%s)
-          AND source_cycle_ts IS NOT NULL
-          AND source_cycle_ts > %s
-          AND source_cycle_ts <= %s
-        ORDER BY source_cycle_ts ASC, metric, window_code, exchange, symbol
-        """,
-        (WINDOWS, cycles[0], cycles[-1]),
-    )
-    updates_by_cycle = defaultdict(list)
-    for row in updates:
-        updates_by_cycle[row["source_cycle_ts"]].append(row)
-    return updates_by_cycle
-
+from autonomous_oi_service import (
+    compute_autonomous_oi_snapshot_from_latest_window_map,
+)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare stage snapshots for tracked symbols across replay cycles")
@@ -65,18 +29,24 @@ def main() -> None:
     parser.add_argument("--show-windows", action="store_true")
     parser.add_argument("--only-cycles", nargs="*", default=[])
     parser.add_argument("--to-ts")
+    parser.add_argument("--window-source", choices=["auto", "hot", "history"], default="auto")
     args = parser.parse_args()
 
     tracked = {symbol.upper() for symbol in args.symbols}
     only_cycles = set(args.only_cycles)
     exchange_filter = (args.exchange or "BYBIT").upper()
-    cycles = load_cycle_timestamps(args.hours, args.limit_cycles, to_ts=_parse_ts(args.to_ts))
+    cycles, resolved_window_source = load_cycle_timestamps(
+        args.hours,
+        args.limit_cycles,
+        to_ts=_parse_ts(args.to_ts),
+        window_source=args.window_source,
+    )
     if not cycles:
         print("NO_CYCLES")
         return
 
-    latest_window_map = load_latest_window_map(cycles[0])
-    updates_by_cycle = build_updates(cycles)
+    latest_window_map = load_latest_window_map_for_replay(cycles[0], window_source=resolved_window_source)
+    updates_by_cycle = load_batch_window_updates(cycles, window_source=resolved_window_source)
     state_map = {}
 
     for cycle_ts in cycles:

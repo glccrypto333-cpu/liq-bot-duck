@@ -10,13 +10,10 @@ each cycle so stage-2 candidates can be scanned before deeper compare/trace.
 import argparse
 from collections import defaultdict
 
-from autonomous_oi_replay import _parse_ts, load_cycle_timestamps
+from autonomous_oi_replay import _parse_ts, load_cycle_timestamps, load_latest_window_map_for_replay, load_batch_window_updates
 from autonomous_oi_service import (
-    WINDOWS,
     compute_autonomous_oi_snapshot_from_latest_window_map,
-    load_latest_window_map,
 )
-from db import fetch
 
 
 CORE_EXCHANGE_IDX = 0
@@ -28,45 +25,6 @@ CORE_VOLUME_IDX = 18
 CORE_AGE_IDX = 20
 CORE_PERMISSION_IDX = 21
 CORE_REASON_IDX = 25
-
-
-def build_updates(cycles):
-    if not cycles:
-        return defaultdict(list)
-
-    updates = fetch(
-        """
-        SELECT
-            metric,
-            window_code,
-            ts_open,
-            ts_close,
-            exchange,
-            symbol,
-            open_value,
-            high_value,
-            low_value,
-            close_value,
-            sum_value,
-            avg_value,
-            delta_pct,
-            unique_candles,
-            source_cycle_ts,
-            built_at
-        FROM aggregate_windows
-        WHERE metric IN ('OI', 'PRICE', 'VOLUME')
-          AND window_code = ANY(%s)
-          AND source_cycle_ts IS NOT NULL
-          AND source_cycle_ts > %s
-          AND source_cycle_ts <= %s
-        ORDER BY source_cycle_ts ASC, metric, window_code, exchange, symbol
-        """,
-        (WINDOWS, cycles[0], cycles[-1]),
-    )
-    updates_by_cycle = defaultdict(list)
-    for row in updates:
-        updates_by_cycle[row["source_cycle_ts"]].append(row)
-    return updates_by_cycle
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,15 +40,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    cycles = load_cycle_timestamps(args.hours, args.limit_cycles, to_ts=_parse_ts(args.to_ts))
+    cycles, resolved_window_source = load_cycle_timestamps(args.hours, args.limit_cycles, to_ts=_parse_ts(args.to_ts))
     if not cycles:
         print("NO_CYCLES")
         return
 
     tracked = {symbol.upper() for symbol in args.symbols}
     exchange_filter = (args.exchange or "ALL").upper()
-    latest_window_map = load_latest_window_map(cycles[0])
-    updates_by_cycle = build_updates(cycles)
+    latest_window_map = load_latest_window_map_for_replay(cycles[0], window_source=resolved_window_source)
+    updates_by_cycle = load_batch_window_updates(cycles, window_source=resolved_window_source)
     state_map = {}
 
     for cycle_ts in cycles:

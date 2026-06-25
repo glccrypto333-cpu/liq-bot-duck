@@ -8,15 +8,20 @@ import zipfile
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+import re
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
 import csv
 from pathlib import Path
 import requests
 
+from card_renderers import build_phase_history_lines
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ПАПКА_ДАННЫХ, APP_VERSION
 from logger import log
 from db import fetch, execute
+from phase_common import value_slope_ratio
 from reset_stage3 import reset_stage3
+from time_utils import iso_мск
 
 BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 _polling_started = False
@@ -26,6 +31,1138 @@ _csv_lock = threading.Lock()
 RUNTIME_REPORTS_DIR = Path(__file__).resolve().parent / "runtime_reports"
 POLLING_LOCK_PATH = ПАПКА_ДАННЫХ / "telegram_polling.lock"
 _polling_lock_file = None
+BYBIT_SYMBOL_ALIASES = {
+    "CHIPPUSDT": "CHIPUSDT",
+}
+BINANCE_FAPI_BASE = "https://fapi.binance.com"
+BYBIT_API_BASE = "https://api.bybit.com"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+МОСКВА = timezone(timedelta(hours=3))
+_api_cache_lock = threading.Lock()
+_api_cache: dict[str, dict] = {}
+_rank_cache: dict[str, object] = {"ts": 0.0, "data": {}}
+
+
+def _cache_get(key: str, ttl: int = 20):
+    with _api_cache_lock:
+        row = _api_cache.get(key)
+        if not row:
+            return None
+        if time.time() - float(row.get("ts") or 0.0) >= ttl:
+            return None
+        return row.get("data")
+
+
+def _cache_set(key: str, data) -> None:
+    with _api_cache_lock:
+        _api_cache[key] = {"ts": time.time(), "data": data}
+
+
+def _http_json(url: str, params: dict | None = None, *, ttl: int = 20, cache_key: str | None = None):
+    key = cache_key or f"{url}?{json.dumps(params or {}, sort_keys=True, ensure_ascii=False)}"
+    cached = _cache_get(key, ttl=ttl)
+    if cached is not None:
+        return cached
+    try:
+        response = requests.get(url, params=params or {}, timeout=12)
+        response.raise_for_status()
+        data = response.json()
+        _cache_set(key, data)
+        return data
+    except Exception as exc:
+        log(f"telegram live metrics api error: url={url} exc={exc}")
+        return None
+
+
+def _inline_keyboard(rows: list[list[tuple[str, str]]]) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": text, "callback_data": data} for text, data in row]
+            for row in rows
+        ]
+    }
+
+
+def _coin_actions_keyboard(symbol: str, stage: int | None = None) -> dict | None:
+    del symbol, stage
+    return None
+
+
+def _feedback_prompt_keyboard(symbol: str) -> dict | None:
+    del symbol
+    return None
+
+
+def _stage3_reset_actions_keyboard(symbol: str | None = None, allow_all: bool = False) -> dict:
+    rows: list[list[tuple[str, str]]] = []
+    if symbol:
+        rows.append([("✅ Подтвердить reset", f"rstconfirm:{symbol}"), ("🚫 Отмена", "rstcancel")])
+    if allow_all:
+        rows.append([("🧨 Сбросить все Stage 3", "rstall:create")])
+    return _inline_keyboard(rows or [[("🚫 Отмена", "rstcancel")]])
+
+
+def _fmt_minutes(value) -> str:
+    try:
+        total = int(round(float(value or 0.0)))
+    except Exception:
+        return "n/a"
+    hours, minutes = divmod(max(total, 0), 60)
+    if hours <= 0:
+        return f"{minutes}м"
+    return f"{hours}ч {minutes}м"
+
+
+def _fmt_ratio(value) -> str:
+    try:
+        return f"{float(value):.6f}"
+    except Exception:
+        return "n/a"
+
+
+def _fmt_pct_signed(value) -> str:
+    try:
+        num = float(value)
+    except Exception:
+        return "n/a"
+    arrow = "⬆️" if num > 0 else ("⬇️" if num < 0 else "➡️")
+    return f"{arrow} {num:+.2f}%"
+
+
+def _fmt_pct_plain(value) -> str:
+    try:
+        return f"{float(value):+.2f}%"
+    except Exception:
+        return "n/a"
+
+
+def _fmt_usd(value) -> str:
+    try:
+        num = float(value or 0.0)
+    except Exception:
+        return "н/д"
+    if abs(num) >= 1_000_000_000:
+        return f"${num / 1_000_000_000:.2f}B"
+    if abs(num) >= 1_000_000:
+        return f"${num / 1_000_000:.2f}M"
+    if abs(num) >= 1_000:
+        return f"${num / 1_000:.2f}K"
+    return f"${num:.2f}"
+
+
+def _fmt_usd_or_na(value) -> str:
+    try:
+        num = float(value)
+    except Exception:
+        return "н/д"
+    if num <= 0:
+        return "н/д"
+    return _fmt_usd(num)
+
+
+def _fmt_pct_or_na(value) -> str:
+    try:
+        return f"{float(value):+.2f}%"
+    except Exception:
+        return "н/д"
+
+
+def _human_oi_slope(value: str | None) -> str:
+    return {
+        "flat": "плоско",
+        "weak_up": "слабый рост",
+        "good_up": "хороший рост",
+        "strong_up": "сильный рост",
+        "weak_down": "слабое снижение",
+        "strong_down": "сильное снижение",
+    }.get(str(value or "").strip(), str(value or "н/д"))
+
+
+def _visual_oi_slope(value: str | None) -> str:
+    return {
+        "strong_down": "⬜️⬜️⬜️⬜️⬜️",
+        "weak_down": "1️⃣⬜️⬜️⬜️⬜️",
+        "flat": "1️⃣2️⃣⬜️⬜️⬜️",
+        "weak_up": "1️⃣2️⃣3️⃣⬜️⬜️",
+        "good_up": "1️⃣2️⃣3️⃣4️⃣⬜️",
+        "strong_up": "1️⃣2️⃣3️⃣4️⃣5️⃣",
+    }.get(str(value or "").strip(), "⬜️⬜️⬜️⬜️⬜️")
+
+
+def _visual_strength_token(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "⬜️⬜️⬜️⬜️⬜️"
+    if text in {"сильное", "сильный", "очень_гладко", "очень гладко", "подтвержденное", "подтвержденный"}:
+        return "1️⃣2️⃣3️⃣4️⃣5️⃣"
+    if text in {"хорошая", "хороший", "почти_нет", "почти нет"}:
+        return "1️⃣2️⃣3️⃣4️⃣⬜️"
+    if text in {"замедляется, но держится", "ровно / без явного ускорения"}:
+        return "1️⃣2️⃣3️⃣4️⃣⬜️"
+    if text in {"средняя", "рабочая", "рабочий"}:
+        return "1️⃣2️⃣3️⃣⬜️⬜️"
+    if text in {"нет", "срыв", "рвано", "ускоряется вниз", "плоско"}:
+        return "1️⃣2️⃣⬜️⬜️⬜️"
+    if text in {"слабая", "слабый"}:
+        return "1️⃣2️⃣⬜️⬜️⬜️"
+    return "1️⃣2️⃣3️⃣⬜️⬜️"
+
+
+def _price_arrow(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"сильно вниз", "вниз", "падение", "strong_down", "weak_down"} or "вниз" in text or "down" in text:
+        return "⬇️"
+    if text in {"сильный рост", "рост", "вверх", "strong_up", "good_up", "weak_up"} or "рост" in text or "up" in text or "вверх" in text:
+        return "⬆️"
+    return "➡️"
+
+
+def _volume_icon(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"подтверждающий", "рабочий"}:
+        return "🟢"
+    if text in {"слабый"}:
+        return "🟡"
+    return "🔴"
+
+
+def _bang_marks(metric_kind: str, value) -> str:
+    try:
+        num = float(value)
+    except Exception:
+        return ""
+    key = str(metric_kind or "").lower()
+    if key == "funding":
+        if num <= -1.0:
+            return "❗️❗️❗️"
+        if num <= -0.5:
+            return "❗️❗️"
+        if num <= -0.1:
+            return "❗️"
+        return ""
+    if num <= 0:
+        return ""
+    thresholds = {
+        "volume": (100.0, 1000.0, 10000.0),
+        "price": (10.0, 25.0, 100.0),
+        "oi": (10.0, 25.0, 100.0),
+    }.get(key)
+    if not thresholds:
+        return ""
+    if num > thresholds[2]:
+        return "❗️❗️❗️"
+    if num > thresholds[1]:
+        return "❗️❗️"
+    if num > thresholds[0]:
+        return "❗️"
+    return ""
+
+
+def _format_ts_compact(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "н/д"
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(МОСКВА).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return text
+
+
+def _format_ts_moscow_short(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "н/д"
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(МОСКВА).strftime("%d.%m %H:%M МСК")
+    except Exception:
+        return text
+
+
+def _phase_history_age(history_rows: list[dict], stage: int, fallback) -> str:
+    age = _find_transition_age(history_rows, stage)
+    if age == "n/a":
+        return _fmt_minutes(fallback)
+    return age
+
+
+def _find_transition_ts(history_rows: list[dict], to_stage: int):
+    for row in history_rows:
+        if int(row.get("to_stage") or -1) == to_stage:
+            return row.get("cycle_ts")
+    return None
+
+
+def _phase_history_line(history_rows: list[dict], *, phase_number: int, age_stage: int, entry_stage: int, fallback) -> str:
+    age_text = _phase_history_age(history_rows, age_stage, fallback)
+    entry_ts = _find_transition_ts(history_rows, entry_stage)
+    if entry_ts:
+        return f"Фаза {phase_number} - {age_text} | вход: {_format_ts_moscow_short(entry_ts)}"
+    return f"Фаза {phase_number} - {age_text}"
+
+
+def _phase_zero_history_line(history_rows: list[dict]) -> str | None:
+    for row in history_rows:
+        try:
+            raw_from = row.get("from_stage")
+            raw_to = row.get("to_stage")
+            from_stage = int(-1 if raw_from is None else raw_from)
+            to_stage = int(-1 if raw_to is None else raw_to)
+        except Exception:
+            continue
+        if from_stage == 0 and to_stage >= 1:
+            age = _fmt_minutes(row.get("stage_age_before_transition"))
+            ts = _format_ts_moscow_short(row.get("cycle_ts"))
+            reason = _human_phase_reason(row.get("reason"))
+            if reason and reason != "n/a":
+                return f"Фаза 0 - {age} | запрет снят: {ts} | до этого: {reason}"
+            return f"Фаза 0 - {age} | запрет снят: {ts}"
+    for row in history_rows:
+        try:
+            raw_to = row.get("to_stage")
+            to_stage = int(-1 if raw_to is None else raw_to)
+        except Exception:
+            continue
+        if to_stage == 0:
+            reason = _human_phase_reason(row.get("reason"))
+            ts = _format_ts_moscow_short(row.get("cycle_ts"))
+            return f"Фаза 0 - был запрет | вход: {ts} | {reason}"
+    return None
+
+
+def _oi_ratio_note(row: dict) -> str:
+    for key in ("oi_slope_ratio", "slope_ratio", "value_slope_ratio"):
+        value = row.get(key)
+        if value is None:
+            continue
+        try:
+            return f" (K={float(value):.3f})"
+        except Exception:
+            continue
+    return ""
+
+
+def _stage_entry_ts(history_rows: list[dict], stage: int):
+    ts = _find_transition_ts(history_rows, stage)
+    return _format_ts_moscow_short(ts) if ts else "н/д"
+
+
+def _current_stage_line(history_rows: list[dict], current_stage: int, current_age_minutes) -> str:
+    age = _fmt_minutes(current_age_minutes)
+    ts = _stage_entry_ts(history_rows, current_stage)
+    return f"Фаза {current_stage} - {age} | вход: {ts} | текущая стадия"
+
+
+def _pullback_ratio_from_window(row: dict) -> float:
+    try:
+        open_value = float(row.get("open_value") or 0.0)
+        high_value = float(row.get("high_value") or 0.0)
+        close_value = float(row.get("close_value") or 0.0)
+    except Exception:
+        return 0.0
+    if high_value <= open_value:
+        return 0.0
+    return max(0.0, (high_value - close_value) / (high_value - open_value))
+
+
+def _oi_window_explanation(row: dict) -> str:
+    if not row:
+        return "нет окна для пояснения"
+    slope_class = str(row.get("oi_slope_class") or "").strip()
+    ratio = _pullback_ratio_from_window(row)
+    if slope_class in {"strong_up", "good_up", "weak_up"}:
+        if ratio >= 0.60:
+            return "рост уже с откатом внутри окна"
+        if ratio >= 0.25:
+            return "рост есть, но конец окна уже остыл"
+        return "рост держится до конца окна"
+    if slope_class == "flat":
+        return "окно без выраженного набора"
+    if slope_class in {"weak_down", "strong_down"}:
+        return "внутри окна набор ослаб"
+    return "нет пояснения"
+
+
+def _volume_window_base_note(metric_windows: dict[tuple[str, str], dict], window_code: str) -> str:
+    row = metric_windows.get(("VOLUME", window_code)) or {}
+    if not row:
+        return "нет сравнения с тихой базой Ф1"
+    ratio = value_slope_ratio(row)
+    if ratio >= 1.05:
+        return f"выше тихой базы Ф1 в {ratio:.1f}x"
+    if ratio <= 0.95:
+        return f"ниже тихой базы Ф1, только {ratio:.1f}x"
+    return f"около тихой базы Ф1, {ratio:.1f}x"
+
+
+def _phase_reason_lines(value: str | None) -> list[str]:
+    human = _human_phase_reason(value)
+    if human == "n/a":
+        return ["n/a"]
+    parts = [chunk.strip() for chunk in human.split(";") if chunk.strip()]
+    return parts or [human]
+
+
+def _prefer_metric_exchange(symbol: str, current_exchange: str) -> str:
+    symbol = str(symbol or "").upper().strip()
+    current_exchange = str(current_exchange or "").upper().strip() or "BINANCE"
+    if _symbol_exists_on_exchange("BINANCE", symbol):
+        return "BINANCE"
+    return current_exchange
+
+
+def _metric_row(metric_windows: dict[tuple[str, str], dict], metric: str, window_code: str) -> dict:
+    return metric_windows.get((metric, window_code)) or {}
+
+
+def _strip_symbol_quote(symbol: str) -> str:
+    sym = str(symbol or "").upper().strip()
+    for suffix in ("USDT", "PERP", "USD"):
+        if sym.endswith(suffix):
+            sym = sym[: -len(suffix)]
+            break
+    if sym.startswith("1000"):
+        sym = sym[4:]
+    return sym
+
+
+def _coingecko_rank(symbol: str) -> str:
+    now = time.time()
+    with _api_cache_lock:
+        data = _rank_cache.get("data") or {}
+        ts = float(_rank_cache.get("ts") or 0.0)
+        if data and now - ts < 60:
+            rank = data.get(_strip_symbol_quote(symbol))
+            return f"#{rank}" if rank else ">250 / н/д"
+    rows = _http_json(
+        f"{COINGECKO_BASE}/coins/markets",
+        {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 250,
+            "page": 1,
+            "sparkline": "false",
+        },
+        ttl=60,
+        cache_key="coingecko_top250",
+    ) or []
+    mapping: dict[str, int] = {}
+    for row in rows if isinstance(rows, list) else []:
+        base = str(row.get("symbol") or "").upper().strip()
+        rank = row.get("market_cap_rank")
+        try:
+            if base and rank:
+                mapping[base] = int(rank)
+        except Exception:
+            continue
+    with _api_cache_lock:
+        _rank_cache["ts"] = now
+        _rank_cache["data"] = mapping
+    rank = mapping.get(_strip_symbol_quote(symbol))
+    return f"#{rank}" if rank else ">250 / н/д"
+
+
+def _resolve_binance_symbol(symbol: str) -> str:
+    sym = str(symbol or "").upper().strip()
+    if _symbol_exists_on_exchange("BINANCE", sym):
+        return sym
+    if sym.startswith("1000"):
+        base = sym[4:]
+        if _symbol_exists_on_exchange("BINANCE", base):
+            return base
+    return ""
+
+
+def _pct_change(current, previous):
+    try:
+        cur = float(current)
+        prev = float(previous)
+        if prev == 0:
+            return None
+        return ((cur - prev) / prev) * 100.0
+    except Exception:
+        return None
+
+
+def _sum_quote_volume(rows: list, start: int, end: int | None = None):
+    try:
+        sliced = rows[start:end]
+        if not sliced:
+            return None
+        return sum(float(row[7]) for row in sliced)
+    except Exception:
+        return None
+
+
+def _fetch_binance_kline_metrics(symbol: str) -> dict:
+    sym = _resolve_binance_symbol(symbol)
+    if not sym:
+        return {
+            "price_pct_1h": None,
+            "price_pct_4h": None,
+            "vol_1h_usd": None,
+            "vol_4h_usd": None,
+            "vol_pct_1h": None,
+            "vol_pct_4h": None,
+        }
+    data = _http_json(
+        f"{BINANCE_FAPI_BASE}/fapi/v1/klines",
+        {"symbol": sym, "interval": "1m", "limit": 480},
+        ttl=20,
+        cache_key=f"binance_klines_1m:{sym}",
+    )
+    rows = data if isinstance(data, list) else []
+    out = {
+        "price_pct_1h": None,
+        "price_pct_4h": None,
+        "vol_1h_usd": None,
+        "vol_4h_usd": None,
+        "vol_pct_1h": None,
+        "vol_pct_4h": None,
+    }
+    if len(rows) < 60:
+        return out
+    try:
+        close_now = float(rows[-1][4])
+        open_1h = float(rows[-60][1])
+        out["price_pct_1h"] = _pct_change(close_now, open_1h)
+        out["vol_1h_usd"] = _sum_quote_volume(rows, -60, None)
+    except Exception:
+        pass
+    if len(rows) >= 240:
+        try:
+            open_4h = float(rows[-240][1])
+            out["price_pct_4h"] = _pct_change(close_now, open_4h)
+            out["vol_4h_usd"] = _sum_quote_volume(rows, -240, None)
+        except Exception:
+            pass
+    if len(rows) >= 120:
+        prev_1h = _sum_quote_volume(rows, -120, -60)
+        out["vol_pct_1h"] = _pct_change(out["vol_1h_usd"], prev_1h)
+    if len(rows) >= 480:
+        prev_4h = _sum_quote_volume(rows, -480, -240)
+        out["vol_pct_4h"] = _pct_change(out["vol_4h_usd"], prev_4h)
+    return out
+
+
+def _fetch_binance_24h_metrics(symbol: str) -> dict:
+    sym = _resolve_binance_symbol(symbol)
+    if not sym:
+        return {"price_pct_24h": None, "vol_usd_24h": None}
+    data = _http_json(
+        f"{BINANCE_FAPI_BASE}/fapi/v1/ticker/24hr",
+        {"symbol": sym},
+        ttl=20,
+        cache_key=f"binance_24h:{sym}",
+    ) or {}
+    return {
+        "price_pct_24h": _safe_float(data.get("priceChangePercent")),
+        "vol_usd_24h": _safe_float(data.get("quoteVolume")),
+    }
+
+
+def _fetch_binance_oi_metrics(symbol: str) -> dict:
+    sym = _resolve_binance_symbol(symbol)
+    if not sym:
+        return {
+            "oi_now_usd": None,
+            "oi_pct_5m": None,
+            "oi_pct_4h": None,
+        }
+    hist_5m = _http_json(
+        f"{BINANCE_FAPI_BASE}/futures/data/openInterestHist",
+        {"symbol": sym, "period": "5m", "limit": 2},
+        ttl=20,
+        cache_key=f"binance_oi_hist_5m:{sym}",
+    )
+    hist_4h = _http_json(
+        f"{BINANCE_FAPI_BASE}/futures/data/openInterestHist",
+        {"symbol": sym, "period": "4h", "limit": 2},
+        ttl=20,
+        cache_key=f"binance_oi_hist_4h:{sym}",
+    )
+    out = {
+        "oi_now_usd": None,
+        "oi_pct_5m": None,
+        "oi_pct_4h": None,
+    }
+    rows_5m = hist_5m if isinstance(hist_5m, list) else []
+    rows_4h = hist_4h if isinstance(hist_4h, list) else []
+    if rows_5m:
+        out["oi_now_usd"] = _safe_float(rows_5m[-1].get("sumOpenInterestValue"))
+    if len(rows_5m) >= 2:
+        out["oi_pct_5m"] = _pct_change(rows_5m[-1].get("sumOpenInterest"), rows_5m[-2].get("sumOpenInterest"))
+    if len(rows_4h) >= 2:
+        out["oi_pct_4h"] = _pct_change(rows_4h[-1].get("sumOpenInterest"), rows_4h[-2].get("sumOpenInterest"))
+    return out
+
+
+def _fetch_binance_account_ratio(symbol: str) -> dict:
+    sym = _resolve_binance_symbol(symbol)
+    if not sym:
+        return {"long_pct": None, "short_pct": None}
+    data = _http_json(
+        f"{BINANCE_FAPI_BASE}/futures/data/globalLongShortAccountRatio",
+        {"symbol": sym, "period": "5m", "limit": 1},
+        ttl=20,
+        cache_key=f"binance_long_short:{sym}",
+    )
+    rows = data if isinstance(data, list) else []
+    if not rows:
+        return {"long_pct": None, "short_pct": None}
+    row = rows[-1]
+    return {
+        "long_pct": _safe_float(row.get("longAccount"), scale=100.0),
+        "short_pct": _safe_float(row.get("shortAccount"), scale=100.0),
+    }
+
+
+def _fetch_bybit_funding(symbol: str, exchange: str) -> dict:
+    ex = str(exchange or "").upper().strip()
+    bybit_symbol = str(symbol or "").upper().strip() if ex == "BYBIT" else _resolve_bybit_symbol(symbol)[0]
+    if not bybit_symbol:
+        return {"funding_pct": None}
+    data = _http_json(
+        f"{BYBIT_API_BASE}/v5/market/tickers",
+        {"category": "linear", "symbol": bybit_symbol},
+        ttl=20,
+        cache_key=f"bybit_funding:{bybit_symbol}",
+    ) or {}
+    rows = (((data.get("result") or {}).get("list")) or [])
+    first = rows[0] if rows else {}
+    return {"funding_pct": _safe_float(first.get("fundingRate"), scale=100.0)}
+
+
+def _safe_float(value, scale: float = 1.0):
+    try:
+        return float(value) * scale
+    except Exception:
+        return None
+
+
+def _pct_with_marks(value, thresholds: tuple[float, float, float], *, negative_only: bool = False) -> str:
+    if value is None:
+        return "н/д"
+    try:
+        num = float(value)
+    except Exception:
+        return "н/д"
+    arrow = "⬆️" if num > 0 else ("⬇️" if num < 0 else "")
+    base = f"{num:+.2f}%"
+    av = abs(num)
+    marks = ""
+    if negative_only:
+        if num < thresholds[2]:
+            marks = "❗️❗️❗️"
+        elif num < thresholds[1]:
+            marks = "❗️❗️"
+        elif num < thresholds[0]:
+            marks = "❗️"
+    else:
+        if av > thresholds[2]:
+            marks = "❗️❗️❗️"
+        elif av > thresholds[1]:
+            marks = "❗️❗️"
+        elif av > thresholds[0]:
+            marks = "❗️"
+    if arrow and marks:
+        return f"{arrow} {base}{marks}"
+    if arrow:
+        return f"{arrow} {base}"
+    return base
+
+
+def _live_market_metrics(symbol: str, exchange: str) -> dict:
+    cache_key = f"duck_live_metrics:{exchange}:{symbol}"
+    cached = _cache_get(cache_key, ttl=20)
+    if cached is not None:
+        return cached
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            "rank": executor.submit(_coingecko_rank, symbol),
+            "klines": executor.submit(_fetch_binance_kline_metrics, symbol),
+            "ticker24": executor.submit(_fetch_binance_24h_metrics, symbol),
+            "oi": executor.submit(_fetch_binance_oi_metrics, symbol),
+            "accounts": executor.submit(_fetch_binance_account_ratio, symbol),
+            "funding": executor.submit(_fetch_bybit_funding, symbol, exchange),
+        }
+        out = {}
+        for key, future in futures.items():
+            try:
+                out[key] = future.result(timeout=15)
+            except Exception as exc:
+                log(f"telegram live metrics future error: key={key} exc={exc}")
+                out[key] = {} if key != "rank" else ">250 / н/д"
+    _cache_set(cache_key, out)
+    return out
+
+
+def _human_price_window(regime: str | None, direction: str | None) -> str:
+    direction = str(direction or "").strip()
+    regime = str(regime or "").strip()
+    if direction and direction != "ignored":
+        return direction
+    if regime and regime != "ignored":
+        return regime
+    return "n/a"
+
+
+def _human_acceleration(window_map: dict[str, dict]) -> str:
+    rank = {
+        "strong_down": -2,
+        "weak_down": -1,
+        "flat": 0,
+        "weak_up": 1,
+        "good_up": 2,
+        "strong_up": 3,
+    }
+    r15 = rank.get((window_map.get("15м") or {}).get("oi_slope_class"), 0)
+    r30 = rank.get((window_map.get("30м") or {}).get("oi_slope_class"), 0)
+    r1h = rank.get((window_map.get("1ч") or {}).get("oi_slope_class"), 0)
+    if r15 > r30 >= r1h and r15 > 0:
+        return "ускоряется вверх"
+    if r15 < r30 <= r1h and r1h > 0:
+        return "замедляется, но держится"
+    if r15 == r30 == r1h == 0:
+        return "плоско"
+    if r15 < 0 and r30 < 0:
+        return "ускоряется вниз"
+    return "ровно / без явного ускорения"
+
+
+def _human_text_token(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "н/д"
+    return text.replace("_", " ")
+
+
+def _human_price_state(value: str | None) -> str:
+    return {
+        "поддерживает_набор": "поддерживает набор",
+        "ломает_набор": "ломает набор",
+        "нейтрально": "нейтрально",
+    }.get(str(value or "").strip(), _human_text_token(value))
+
+
+def _human_transition_permission(value: str | None) -> str:
+    return {
+        "manual_only_stage_3": "третью фазу можно снять только вручную",
+        "сброс_3_0_по_oi_4ч": "третья стадия сбрасывается из-за слабого OI 4ч",
+        "блок_цены_4ч": "переход заблокирован ценой 4ч",
+        "блок_oi_4ч": "переход заблокирован слабым OI 4ч",
+        "снижение_2_1": "монета уходит из второй стадии в первую",
+        "сброс_1_0": "монета сбрасывается из первой стадии в ноль",
+        "удержание_2_по_15м": "вторая стадия удерживается, но 15м уже слабеет",
+        "удержание_2": "вторая стадия удерживается",
+        "ждем_60_минут_в_1": "первая стадия еще не прожила обязательный час",
+        "удержание_1": "первая стадия удерживается",
+        "фаза_0": "нулевая стадия",
+        "разрешен_вход_в_1": "разрешен вход в первую стадию",
+        "разрешен_вход_в_2": "разрешен вход во вторую стадию",
+        "разрешен_вход_в_3": "разрешен вход в третью стадию",
+        "неизвестно": "условие перехода не определено",
+    }.get(str(value or "").strip(), _human_text_token(value))
+
+
+def _human_transition_guard(value: str | None) -> str:
+    return {
+        "manual_hold_stage_3": "третья фаза удерживается вручную",
+        "удержание_3:только_ручной_или_по_oi_4ч": "третья стадия удерживается до ручного сброса или слабого OI 4ч",
+        "сброс_3_0:oi_4ч=weak_down": "третья стадия сброшена: OI 4ч ушел в слабое падение",
+        "сброс_3_0:oi_4ч=strong_down": "третья стадия сброшена: OI 4ч ушел в сильное падение",
+        "разрешен_вход_в_1": "вход в первую стадию",
+        "разрешен_вход_в_2": "вход во вторую стадию",
+        "разрешен_вход_в_3": "вход в третью стадию",
+        "снижение_2_1": "откат из второй стадии в первую",
+        "сброс_1_0": "сброс в нулевую стадию",
+    }.get(str(value or "").strip(), _human_text_token(value))
+
+
+def _human_phase_reason(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "n/a"
+
+    parts: list[str] = []
+    for chunk in raw.split(";"):
+        token = chunk.strip()
+        if not token:
+            continue
+        if token.startswith("oi_30m="):
+            parts.append(f"OI 30м: {_human_oi_slope(token.split('=', 1)[1])}")
+            continue
+        if token.startswith("oi_1h="):
+            parts.append(f"OI 1ч: {_human_oi_slope(token.split('=', 1)[1])}")
+            continue
+        if token.startswith("oi_4h="):
+            parts.append(f"OI 4ч: {_human_oi_slope(token.split('=', 1)[1])}")
+            continue
+        if token.startswith("guard="):
+            parts.append(_human_transition_guard(token.split("=", 1)[1]))
+            continue
+        if token.startswith("price_hard_ban:"):
+            parts.append(f"жесткий блок цены: {_human_price_state(token.split(':', 1)[1])}")
+            continue
+        if token == "outside":
+            continue
+        if token == "working":
+            parts.append("рабочая структура")
+            continue
+        if token == "no_hard_ban":
+            parts.append("жесткого запрета нет")
+            continue
+        if token == "weak":
+            parts.append("слабая структура")
+            continue
+        parts.append(_human_text_token(token))
+
+    return "; ".join(parts) if parts else _human_text_token(raw)
+
+
+def _normalize_cycle_ts_text(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return datetime.fromisoformat(text).isoformat()
+    except Exception:
+        pass
+    if " " in text and "T" not in text:
+        left, right = text.split(" ", 1)
+        alt = f"{left}T{right}"
+        try:
+            return datetime.fromisoformat(alt).isoformat()
+        except Exception:
+            return alt
+    return text
+
+
+def _parse_iso_dt(value: str | None):
+    text = _normalize_cycle_ts_text(value)
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _is_canonical_stage3_alert_key(alert_key: str | None) -> bool:
+    parts = str(alert_key or "").split("|")
+    if len(parts) != 3:
+        return False
+    return _parse_iso_dt(parts[2]) is not None
+
+
+def _stage3_alert_key_age_minutes(alert_key: str | None) -> float | None:
+    parts = str(alert_key or "").split("|")
+    if len(parts) != 3:
+        return None
+    alert_dt = _parse_iso_dt(parts[2])
+    if alert_dt is None:
+        return None
+    now_dt = datetime.now(alert_dt.tzinfo or timezone.utc)
+    return max(0.0, (now_dt - alert_dt).total_seconds() / 60.0)
+
+_PHASE_PAGE_SIZE = 18
+
+
+def _phase_rows(phase: int, offset: int = 0, limit: int = _PHASE_PAGE_SIZE) -> list[dict]:
+    return _safe_rows("""
+        SELECT *
+        FROM core_state_v2
+        WHERE current_stage = %s
+        ORDER BY stage_age_minutes DESC, latest_cycle_ts DESC, exchange, symbol
+        LIMIT %s
+        OFFSET %s
+    """, (phase, limit, max(offset, 0)))
+
+
+def _phase_total_count(phase: int) -> int:
+    rows = _safe_rows(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM core_state_v2
+        WHERE current_stage = %s
+        """,
+        (phase,),
+    )
+    if not rows:
+        return 0
+    try:
+        return int(rows[0].get("cnt") or 0)
+    except Exception:
+        return 0
+
+
+def _phase_list_keyboard(rows: list[dict], phase: int, offset: int = 0, total: int | None = None) -> dict | None:
+    if not rows:
+        return None
+    buttons: list[list[tuple[str, str]]] = []
+    current_row: list[tuple[str, str]] = []
+    for row in rows[:_PHASE_PAGE_SIZE]:
+        symbol = str(row.get("symbol") or "").upper()
+        exchange = str(row.get("exchange") or "").upper()
+        label = f"{symbol} [{_exchange_code(exchange)}]"
+        current_row.append((label, f"coinx:{exchange}:{symbol}"))
+        if len(current_row) == 2:
+            buttons.append(current_row)
+            current_row = []
+    if current_row:
+        buttons.append(current_row)
+    shown = offset + len(rows)
+    if total is not None and total > shown:
+        buttons.append([("Ещё", f"phmore:{phase}:{shown}")])
+    buttons.append([("⚙️ Фазы", "phases")])
+    return _inline_keyboard(buttons)
+
+
+def _phase_page_text(phase: int, offset: int, total: int) -> str:
+    base_text = _build_stage3_text() if phase == 3 else _build_phases_text(phase)
+    if total <= 0:
+        return "\n".join([base_text, "", "Монет в этой фазе сейчас нет."])
+    page = offset // _PHASE_PAGE_SIZE + 1
+    shown_to = min(total, offset + _PHASE_PAGE_SIZE)
+    return "\n".join([
+        base_text,
+        "",
+        f"Страница: {page}",
+        f"Показано: {offset + 1}-{shown_to} из {total}",
+    ])
+
+
+def _latest_metric_windows(symbol: str, exchange: str, as_of_ts=None) -> dict[tuple[str, str], dict]:
+    params: list = [symbol, exchange]
+    as_of_sql = ""
+    if as_of_ts:
+        as_of_sql = "AND ts_close <= %s"
+        params.append(as_of_ts)
+    rows = _safe_rows(f"""
+        SELECT DISTINCT ON (metric, window_code)
+            metric, window_code, ts_open, ts_close, open_value, high_value, low_value, close_value, delta_pct
+        FROM aggregate_windows
+        WHERE symbol = %s
+          AND exchange = %s
+          {as_of_sql}
+          AND metric IN ('OI', 'PRICE', 'VOLUME')
+          AND window_code IN ('15м', '30м', '1ч', '4ч', '24ч')
+        ORDER BY metric, window_code, ts_close DESC
+    """, tuple(params))
+    out: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        out[(str(row.get("metric")), str(row.get("window_code")))] = row
+    return out
+
+
+def _price_slope_text(metric_windows: dict[tuple[str, str], dict], window_code: str) -> str:
+    row = metric_windows.get(("PRICE", window_code)) or {}
+    if not row:
+        return "n/a"
+    slope_ratio = value_slope_ratio(row)
+    if slope_ratio < 0.98:
+        return "сильно вниз"
+    if slope_ratio < 0.995:
+        return "вниз"
+    if slope_ratio <= 1.005:
+        return "боковик"
+    if slope_ratio <= 1.02:
+        return "рост"
+    return "сильный рост"
+
+
+def _collect_transition_history(symbol: str, exchange: str, as_of_ts=None) -> list[dict]:
+    params: list = [symbol, exchange]
+    as_of_sql = ""
+    if as_of_ts:
+        as_of_sql = "AND cycle_ts <= %s"
+        params.append(as_of_ts)
+    return _safe_rows(f"""
+        SELECT *
+        FROM transition_history_v2
+        WHERE symbol = %s
+          AND exchange = %s
+          {as_of_sql}
+        ORDER BY cycle_ts DESC
+        LIMIT 20
+    """, tuple(params))
+
+
+def _load_window_rows(symbol: str, exchange: str, as_of_ts=None) -> list[dict]:
+    params: list = [symbol, exchange]
+    as_of_sql = ""
+    if as_of_ts:
+        as_of_sql = "AND cycle_ts <= %s"
+        params.append(as_of_ts)
+    return _safe_rows(f"""
+        SELECT DISTINCT ON (window_code) *
+        FROM window_state_v2
+        WHERE symbol = %s
+          AND exchange = %s
+          {as_of_sql}
+        ORDER BY window_code, cycle_ts DESC
+    """, tuple(params))
+
+
+def _find_transition_age(history_rows: list[dict], to_stage: int) -> str:
+    for row in history_rows:
+        if int(row.get("to_stage") or -1) == to_stage:
+            return _fmt_minutes(row.get("stage_age_before_transition"))
+    return "n/a"
+
+
+def _build_symbol_header(symbol: str, exchange: str, ts_value) -> list[str]:
+    return [
+        f"{symbol} [{exchange}]",
+        _format_ts_compact(ts_value),
+    ]
+
+
+def _load_symbol_exchange_rows(symbol: str) -> list[dict]:
+    return _safe_rows("""
+        SELECT *
+        FROM core_state_v2
+        WHERE symbol = %s
+        ORDER BY current_stage DESC, stage_age_minutes DESC, latest_cycle_ts DESC, exchange
+        LIMIT 6
+    """, (symbol,))
+
+
+def _exchange_semantic_line(row: dict) -> str:
+    exchange = str(row.get("exchange") or "").upper()
+    stage = int(row.get("current_stage") or 0)
+    age = _fmt_minutes(row.get("stage_age_minutes"))
+    reason = _human_phase_reason(row.get("phase_reason"))
+    price = row.get("price_summary") or {}
+    price_state = _human_price_state(price.get("price_state"))
+    return f"{exchange} — Фаза {stage} | возраст {age} | цена: {price_state} | {reason}"
+
+
+def _build_exchange_semantic_block(symbol: str, current_exchange: str) -> list[str]:
+    rows = _load_symbol_exchange_rows(symbol)
+    if not rows:
+        return []
+
+    current_exchange = str(current_exchange or "").upper()
+    current_row = None
+    peer_rows: list[dict] = []
+    for row in rows:
+        ex = str(row.get("exchange") or "").upper()
+        if ex == current_exchange and current_row is None:
+            current_row = row
+        else:
+            peer_rows.append(row)
+
+    if not current_row and rows:
+        current_row = rows[0]
+        peer_rows = rows[1:]
+
+    if not peer_rows:
+        return []
+
+    lines = ["", "🌐 Контекст по биржам", _exchange_semantic_line(current_row)]
+    for row in peer_rows:
+        lines.append(_exchange_semantic_line(row))
+    return lines
+
+
+def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: list[dict], metric_windows: dict[tuple[str, str], dict], *, title: str, transition_ts=None, transition_reason: str | None = None) -> str:
+    symbol = str(core_row.get("symbol") or "").upper()
+    exchange = str(core_row.get("exchange") or "").upper()
+    oi = core_row.get("oi_summary") or {}
+    window_map = {str(row.get("window_code")): row for row in window_rows}
+    latest_ts = transition_ts or core_row.get("latest_cycle_ts")
+    row_1h = window_map.get("1ч") or {}
+
+    lines = [title, ""]
+    lines.extend(_build_symbol_header(symbol, exchange, latest_ts))
+    current_stage = int(core_row.get("current_stage") or 0)
+    lines.extend([""])
+    lines.extend(
+        build_phase_history_lines(
+            history_rows,
+            current_stage=current_stage,
+            current_age_minutes=core_row.get("stage_age_minutes"),
+            humanize_reason=_human_phase_reason,
+        )
+    )
+
+    lines.extend(["", "📊 Открытый интерес", "", "Наклонка OI", "по полному окну, не по одной свече"])
+    for tf in ("15м", "30м", "1ч", "4ч"):
+        row = window_map.get(tf) or {}
+        lines.append(
+            f"{_visual_oi_slope(row.get('oi_slope_class'))} - {tf} - "
+            f"{_human_oi_slope(row.get('oi_slope_class'))}{_oi_ratio_note(row)} | "
+            f"{_oi_window_explanation(row)}"
+        )
+
+    lines.extend(["", "Интерпретаторы OI"])
+    hold_text = row_1h.get("oi_hold_class") or oi.get("oi_retention_summary") or "n/a"
+    pullback_text = row_1h.get("oi_pullback_class") or "n/a"
+    smooth_text = row_1h.get("oi_smoothness_class") or oi.get("oi_stability_summary") or "n/a"
+    lines.append(f"{_visual_strength_token(hold_text)} - Удержание - {_human_text_token(hold_text)}")
+    lines.append(f"{_visual_strength_token(pullback_text)} - Откат - {_human_text_token(pullback_text)}")
+    lines.append(f"{_visual_strength_token(smooth_text)} - Гладкость - {_human_text_token(smooth_text)}")
+    lines.append(f"Итого по OI - {_human_text_token(oi.get('oi_pattern_label') or oi.get('oi_pattern_code') or 'n/a')}")
+    lines.extend(["", _symbol_links(symbol, exchange)])
+    return "\n".join(lines)
+
+
+def _pending_feedback_path() -> Path:
+    return ПАПКА_ДАННЫХ / "telegram_pending_feedback.json"
+
+
+def _save_pending_feedback(chat_id: str | int | None, symbol: str, seed: str | None = None) -> None:
+    payload = {
+        "created_at_utc": iso_мск(),
+        "chat_id": str(chat_id) if chat_id is not None else "",
+        "symbol": symbol.upper().strip(),
+        "seed": str(seed or "").strip(),
+    }
+    _pending_feedback_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _load_pending_feedback() -> dict:
+    path = _pending_feedback_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(errors="ignore"))
+    except Exception:
+        return {}
+
+
+def _clear_pending_feedback() -> None:
+    path = _pending_feedback_path()
+    if path.exists():
+        path.unlink()
+
+
+def _matches_pending_feedback(chat_id: str | int | None) -> bool:
+    pending = _load_pending_feedback()
+    if not pending:
+        return False
+    stored_chat_id = str(pending.get("chat_id") or "")
+    if not stored_chat_id:
+        return True
+    return str(chat_id) == stored_chat_id
+
+
+def _answer_callback_query(callback_id: str, text: str | None = None) -> None:
+    if not TELEGRAM_BOT_TOKEN or not callback_id:
+        return
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = _safe_tg_text(text, 180)
+    try:
+        requests.post(f"{BASE}/answerCallbackQuery", json=payload, timeout=15)
+    except Exception as exc:
+        log(f"telegram callback answer error: {exc}")
 
 
 
@@ -68,7 +1205,7 @@ def _acquire_polling_lock() -> bool:
     lock_file.seek(0)
     lock_file.truncate()
     lock_file.write(
-        f"pid={os.getpid()} started_at={datetime.now(timezone.utc).isoformat()}\n"
+        f"pid={os.getpid()} started_at={iso_мск()}\n"
     )
     lock_file.flush()
     _polling_lock_file = lock_file
@@ -81,9 +1218,8 @@ atexit.register(_release_polling_lock)
 def _main_keyboard() -> dict:
     return {
         "keyboard": [
-            ["⚙️ Фазы", "📈 Топ ОИ"],
-            ["⬇️ Скачать", "🧱 Карантин"],
-            ["❓ Помощь"],
+            ["⚙️ Фазы", "🩺 Система"],
+            ["🧨 Сброс всех Ф3", "❓ Помощь"],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -105,32 +1241,12 @@ def _phases_keyboard() -> dict:
 def _stage3_reset_keyboard() -> dict:
     return {
         "keyboard": [
-            ["Сбросить по тикеру", "Сбросить все"],
+            ["Сбросить по тикеру"],
             ["⬅️ Назад"],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
-
-
-def _top_oi_keyboard() -> dict:
-    return {
-        "keyboard": [
-            ["🏆 BINANCE /30м", "🏆 BYBIT /30м"],
-            ["🏆 BINANCE /4ч", "🏆 BYBIT /4ч"],
-            ["🏆 BINANCE /24ч", "🏆 BYBIT /24ч"],
-            ["⬅️ Назад"],
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-    }
-
-
-def _downloads_keyboard() -> dict:
-    buttons = [f"/download {alias}" for alias, _ in _download_files()]
-    keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    keyboard.append(["⬅️ Назад"])
-    return {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": False}
 
 
 def _safe_tg_text(text: str, limit: int = 3900) -> str:
@@ -140,22 +1256,37 @@ def _safe_tg_text(text: str, limit: int = 3900) -> str:
     return text[:limit - 80] + "\n\n... truncated. Use download/report for full output."
 
 
-def send_message(text: str, reply_markup: dict | None = None) -> None:
+def send_message(text: str, reply_markup: dict | None = None, parse_mode: str | None = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return False
 
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": _safe_tg_text(text)}
+    auto_parse_mode = parse_mode
+    if auto_parse_mode is None and ("<a href=" in str(text) or "<code>" in str(text)):
+        auto_parse_mode = "HTML"
+    if auto_parse_mode:
+        payload["parse_mode"] = auto_parse_mode
+        payload["disable_web_page_preview"] = True
     if reply_markup:
         payload["reply_markup"] = reply_markup
 
     try:
-        requests.post(
+        response = requests.post(
             f"{BASE}/sendMessage",
             json=payload,
             timeout=30,
         )
+        if not response.ok:
+            log(
+                "telegram send error: "
+                f"status={response.status_code} "
+                f"body={(response.text or '')[:500]}"
+            )
+            return False
+        return True
     except Exception as exc:
         log(f"telegram send error: {exc}")
+        return False
 
 
 def send_panel_message(text: str) -> None:
@@ -382,33 +1513,22 @@ def _build_help_text() -> str:
     return "\n".join([
         "❓ Помощь",
         "",
-        "Меню:",
-        "⚙️ Фазы — Фаза 1 / Фаза 2 / Фаза 3 / Сброс фазы 3",
-        "📈 Топ ОИ — BINANCE/BYBIT 30м / 4ч / 24ч",
-        "⬇️ Скачать — файлы по кнопкам + OK/STALE/EMPTY/MISSING",
-        "🧱 Карантин — управление видимостью/alerts",
+        "Простой операторский режим:",
+        "⚙️ Фазы — вход в меню фаз и ручного сброса фазы 3",
+        "🩺 Система — быстрый статус здоровья контура",
+        "🧨 Сброс всех Ф3 — мгновенно снимает все текущие фазы 3",
         "",
-        "Команды:",
+        "Основные команды:",
         "/phases",
         "/phase1 /phase2 /phase3",
-        "/top_oi BINANCE 30м",
-        "/top_oi BYBIT 4ч",
         "/coin SYMBOL",
-        "/feedback SYMBOL текст",
-        "/feedback SYMBOL TF текст",
-        "/debug_cases [SYMBOL]",
-        "/post_stage [SYMBOL]",
         "/reset_stage3 SYMBOL reason",
-        "/confirm_reset SYMBOL",
-        "/cancel_reset",
-        "/download filename",
-        "/backup_db",
-        "/archive",
-        "/download backup_latest",
         "/health",
+        "/system_health",
         "",
-        "Фазы читаются из oi_core_state / oi_window_state / oi_stage_history.",
-        "Карточка монеты и top OI работают на каноническом OI-only контуре.",
+        "Карточка монеты отражает канонический OI-only decision surface.",
+        "Reviewer-слой отключен и не участвует в рабочем Telegram-потоке.",
+        "Лишний UI убран: TOP OI / Скачать / Карантин отключены и не являются рабочей поверхностью.",
     ])
 
 
@@ -429,6 +1549,21 @@ def _safe_rows(sql: str, params: tuple = ()) -> list[dict]:
         return fetch(sql, params) or []
     except Exception as exc:
         log(f"telegram db fetch error: {exc}")
+        text = str(exc).lower()
+        if "connection is closed" in text or "nonetype" in text:
+            try:
+                import db as _db_module
+
+                conn = getattr(_db_module, "_DB_CONN", None)
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                setattr(_db_module, "_DB_CONN", None)
+                return fetch(sql, params) or []
+            except Exception as retry_exc:
+                log(f"telegram db fetch retry failed: {retry_exc}")
         return []
 
 
@@ -492,14 +1627,96 @@ def _exchange_code(exchange) -> str:
     return "BY" if str(exchange).upper() == "BYBIT" else "BN"
 
 
+def _esc_html(value: str) -> str:
+    return str(value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _coinglass_link(exchange: str, symbol: str) -> str:
+    ex = "Binance" if str(exchange or "").upper() == "BINANCE" else "Bybit"
+    return f"https://www.coinglass.com/tv/{ex}_{symbol}"
+
+
+def _bybit_link(symbol: str) -> str:
+    return f"https://www.bybit.com/trade/usdt/{symbol}"
+
+
+def _binance_link(symbol: str) -> str:
+    return f"https://www.binance.com/en/futures/{symbol}"
+
+
+def _symbol_exists_on_exchange(exchange: str, symbol: str) -> bool:
+    rows = _safe_rows("""
+        SELECT 1
+        FROM core_state_v2
+        WHERE exchange = %s
+          AND symbol = %s
+        LIMIT 1
+    """, (exchange, symbol))
+    if rows:
+        return True
+    rows = _safe_rows("""
+        SELECT 1
+        FROM aggregate_windows
+        WHERE exchange = %s
+          AND symbol = %s
+        LIMIT 1
+    """, (exchange, symbol))
+    return bool(rows)
+
+
+def _resolve_bybit_symbol(symbol: str) -> tuple[str, str]:
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return "", ""
+    alias = BYBIT_SYMBOL_ALIASES.get(sym)
+    if alias and _symbol_exists_on_exchange("BYBIT", alias):
+        return alias, "alias"
+    if _symbol_exists_on_exchange("BYBIT", sym):
+        return sym, "exact"
+    for suffix in ("USDT", "PERP", "USD"):
+        if sym.endswith(suffix):
+            continue
+        candidate = sym + suffix
+        if _symbol_exists_on_exchange("BYBIT", candidate):
+            return candidate, "mapped"
+    if sym.startswith("1000"):
+        base = sym[4:]
+        if _symbol_exists_on_exchange("BYBIT", base):
+            return base, "mapped"
+    return "", ""
+
+
+def _compact_links(exchange: str, symbol: str, elapsed_text: str = "", cycle_num=None) -> str:
+    sym = str(symbol or "").upper().strip()
+    ex = str(exchange or "").upper().strip() or "BINANCE"
+    cg = _coinglass_link(ex, sym)
+    copy_part = f"<code>{_esc_html(sym)}</code>"
+    by_sym, _ = _resolve_bybit_symbol(sym)
+
+    if ex == "BYBIT" and _symbol_exists_on_exchange("BYBIT", sym):
+        left = f'🔗 <a href="{cg}">CG</a> | <a href="{_bybit_link(sym)}">BY</a> | {copy_part}'
+    elif ex == "BYBIT" and by_sym:
+        left = f'🔗 <a href="{cg}">CG</a> | <a href="{_bybit_link(by_sym)}">BY</a> | {copy_part}'
+    elif ex == "BYBIT":
+        left = f'🔗 <a href="{cg}">CG</a> | BY n/a | {copy_part}'
+    elif by_sym:
+        left = f'🔗 <a href="{cg}">CG</a> | <a href="{_bybit_link(by_sym)}">BY</a> | {copy_part}'
+    else:
+        left = f'🔗 <a href="{cg}">CG</a> | <a href="{_binance_link(sym)}">BN</a> | {copy_part}'
+
+    parts = [left]
+    if elapsed_text:
+        parts.append("     " + _esc_html(elapsed_text))
+    if cycle_num is not None:
+        try:
+            parts.append("     " + f"{int(cycle_num)}🔄")
+        except Exception:
+            pass
+    return "".join(parts)
+
+
 def _symbol_links(symbol: str, exchange=None) -> str:
-    sym = str(symbol or "").upper()
-    ex_code = _exchange_code(exchange)
-    cg = f"https://www.coinglass.com/tv/Binance_{sym}"
-    by = f"https://www.bybit.com/trade/usdt/{sym}"
-    bn = f"https://www.binance.com/en/futures/{sym}"
-    ex_url = by if ex_code == "BY" else bn
-    return f'[CG]({cg}) | [{ex_code}]({ex_url}) | `{sym}`'
+    return _compact_links(str(exchange or ""), str(symbol or ""))
 
 
 def _short_ts(value) -> str:
@@ -630,6 +1847,106 @@ def _build_health_text() -> str:
     return "\n".join(lines)
 
 
+def _build_system_health_text() -> str:
+    runtime, cycle = _runtime_snapshot()
+    watchdog = _read_kv_file(RUNTIME_REPORTS_DIR / "watchdog_status.txt")
+    snapshot = _read_kv_file(RUNTIME_REPORTS_DIR / "snapshot_status.txt")
+
+    def process_alive() -> bool:
+        try:
+            pid = int(runtime.get("pid") or 0)
+        except Exception:
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    core = _table_health("core_state_v2", "latest_cycle_ts", 15)
+    windows = _table_health("window_state_v2", "cycle_ts", 15)
+    transitions = _table_health("transition_history_v2", "cycle_ts", 60)
+    parity_core = _sync_health_pair("oi_core_state", "latest_cycle_ts", "core_state_v2", "latest_cycle_ts", "core")
+    parity_window = _sync_health_pair("oi_window_state", "cycle_ts", "window_state_v2", "cycle_ts", "window")
+
+    def health_mark(value: str | None) -> str:
+        norm = str(value or "").strip().upper()
+        if norm in {"OK", "READY"}:
+            return "✅"
+        if norm in {"DEGRADED", "WARNING", "WARN"}:
+            return "⚠️"
+        if norm in {"CRITICAL", "ERROR", "STALE", "EMPTY", "DRIFT"}:
+            return "❌"
+        return "•"
+
+    def health_status_ru(value: str | None) -> str:
+        return {
+            "OK": "норма",
+            "READY": "готово",
+            "DEGRADED": "просадка",
+            "WARNING": "предупреждение",
+            "WARN": "предупреждение",
+            "CRITICAL": "критично",
+            "ERROR": "ошибка",
+            "STALE": "устарело",
+            "EMPTY": "пусто",
+            "DRIFT": "рассинхрон",
+            "OVERRUN": "цикл вышел за лимит",
+        }.get(str(value or "").strip().upper(), str(value or "n/a"))
+
+    def stop_reason_ru(value: str | None) -> str:
+        return {
+            "ok": "шаг завершен штатно",
+            "runtimeerror": "последний проход оборвался на runtime-проверке",
+            "collect_too_slow_for_aggregates": "сбор слишком долгий для агрегатов",
+            "aggregates_timeout": "агрегаты не уложились в лимит",
+            "watchdog_stop": "цикл остановлен сторожем",
+        }.get(str(value or "").strip().lower(), "нет оценки")
+
+    def health_line(label: str, status: str | None, extra: str = "") -> str:
+        tail = f" | {extra}" if extra else ""
+        return f"{health_mark(status)} {label}: {health_status_ru(status)}{tail}"
+
+    process_is_alive = process_alive()
+    cycle_status = cycle.get("cycle_health")
+    cycle_extra = f"цикл {cycle.get('cycle_elapsed_seconds', 'n/a')}с"
+    if str(cycle_status or "").strip().lower() == "stopped" and process_is_alive:
+        cycle_status = "WARNING"
+        cycle_extra = f"последний проход оборвался, процесс жив | цикл {cycle.get('cycle_elapsed_seconds', 'n/a')}с"
+
+    lines = [
+        "🩺 Состояние системы",
+        "",
+        "Основной цикл",
+        health_line("здоровье цикла", cycle_status, cycle_extra),
+        f"{'✅' if process_is_alive else '❌'} Процесс бота: {'жив' if process_is_alive else 'не найден'} | pid {runtime.get('pid', 'n/a')}",
+        f"⏱ Сон между циклами: {cycle.get('cycle_sleep_seconds', 'n/a')}с",
+        f"🪫 Резерв цикла: {cycle.get('cycle_reserve_pct', 'n/a')}%",
+        f"🛑 Причина остановки шага: {stop_reason_ru(cycle.get('stop_reason'))}",
+        "",
+        "Runtime",
+        health_line("память процесса", runtime.get("rss_health"), f"{runtime.get('rss_mb', 'n/a')} MB"),
+        health_line("сторож", runtime.get("watchdog_health", watchdog.get("watchdog_health", "n/a"))),
+        health_line("резерв сбора", runtime.get("collect_reserve_health")),
+        health_line("снимок runtime", runtime.get("snapshot_health", snapshot.get("snapshot_health", "n/a"))),
+        f"🚨 Активных runtime-alerts: {runtime.get('runtime_alert_count', len(runtime.get('runtime_alerts', []) or []))}",
+        "",
+        "Таблицы",
+        health_line("core_state_v2", core["status"], f"возраст {core['age_minutes']}м | строк {core['rows']}"),
+        health_line("window_state_v2", windows["status"], f"возраст {windows['age_minutes']}м | строк {windows['rows']}"),
+        health_line("transition_history_v2", transitions["status"], f"возраст {transitions['age_minutes']}м | строк {transitions['rows']}"),
+        "",
+        "Синхронность слоев",
+        health_line("legacy ↔ v2 core", parity_core["status"]),
+        health_line("legacy ↔ v2 window", parity_window["status"]),
+        "",
+        "Норма: цикл должен быть в норме или с мягкой просадкой, а core/window/transition таблицы должны быть свежими.",
+    ]
+    return "\n".join(lines)
+
+
 def _health_banner_for_table(table: str, ts_col: str, stale_minutes: int = 10) -> str:
     h = _table_health(table, ts_col, stale_minutes)
     return (
@@ -664,42 +1981,35 @@ def _build_phases_text(phase: int | None = None) -> str:
         lines = ["⚙️ Фазы", ""]
         for r in rows:
             lines.append(
-                f"phase={r.get('current_stage')} {_stage_label(r.get('current_stage'))} | cnt={r.get('cnt')} | latest={_short_ts(r.get('latest'))}"
+                f"Фаза {r.get('current_stage')} — {_stage_label(r.get('current_stage'))} | "
+                f"монет={r.get('cnt')} | latest={_short_ts(r.get('latest'))}"
             )
-        lines.extend(["", "Открыть: Фаза 1 / Фаза 2 / Фаза 3"])
+        lines.extend(["", "Выбери фазу кнопками ниже."])
         return "\n".join(lines)
 
-    rows = _safe_rows("""
-        SELECT *
-        FROM core_state_v2
-        WHERE current_stage = %s
-        ORDER BY stage_age_minutes DESC, latest_cycle_ts DESC, exchange, symbol
-        LIMIT 80
-    """, (phase,))
-
+    rows = _phase_rows(phase)
     title = f"Фаза {phase}"
     if not rows:
         return f"{title}\n\nСейчас монет в фазе нет."
 
-    lines = [title, "Детали: /coin SYMBOL", ""]
-    for r in rows:
-        symbol = r.get("symbol")
-        ex = r.get("exchange")
+    total_count = _phase_total_count(phase)
+    lines = [
+        f"⚙️ {title}",
+        f"Монет сейчас: {total_count}",
+        f"Показано в списке: {min(len(rows), 12)} из {len(rows)} загруженных",
+        "",
+        "Нажми на монету ниже, чтобы открыть карточку.",
+        "",
+    ]
+    for r in rows[:12]:
         oi = r.get("oi_summary") or {}
         price = r.get("price_summary") or {}
-        volume = r.get("volume_summary") or {}
-        lines.append(f"{symbol} [{ex}]")
-        lines.append(f"🔗 {_symbol_links(symbol, ex)} | /coin {symbol} | /feedback {symbol} текст")
         lines.append(
-            f"pattern={oi.get('oi_pattern_label') or oi.get('oi_pattern_code')} | "
-            f"price={price.get('price_state') or 'n/a'} | volume={volume.get('volume_state') or 'n/a'}"
+            f"{r.get('symbol')} [{r.get('exchange')}] — "
+            f"{oi.get('oi_pattern_label') or oi.get('oi_pattern_code') or 'n/a'} | "
+            f"цена={price.get('price_state') or 'n/a'} | "
+            f"возраст={_fmt_minutes(r.get('stage_age_minutes'))}"
         )
-        lines.append(
-            f"age={r.get('stage_age_minutes')}m | "
-            f"transition={r.get('transition_permission')} | latest={_short_ts(r.get('latest_cycle_ts'))}"
-        )
-        lines.append("")
-
     return "\n".join(lines)
 
 
@@ -707,185 +2017,44 @@ def _build_stage3_text() -> str:
     return _build_phases_text(3)
 
 
-def _parse_top_oi_args(text: str) -> tuple[str | None, str | None]:
-    exchange = None
-    timeframe = None
-
-    for part in (text or "").split():
-        token = str(part or "").strip()
-        upper = token.upper()
-        tf = _tf_sql(token)
-
-        if upper in {"BINANCE", "BYBIT"} and exchange is None:
-            exchange = upper
-        elif tf in {"15м", "30м", "1ч", "4ч", "12ч", "24ч"} and timeframe is None:
-            timeframe = tf
-
-    return timeframe, exchange
-
-
-def _build_top_oi_text(timeframe: str | None = None, exchange: str | None = None) -> str:
-    timeframe = _tf_sql(timeframe) if timeframe else None
+def _build_coin_card(symbol: str, exchange: str | None = None, as_of_ts=None) -> str:
+    symbol = symbol.upper().strip()
     exchange = str(exchange or "").upper().strip() or None
 
-    params = []
-    where = ["COALESCE(oi_slope_value, 1.0) <> 1.0"]
-
-    if exchange in {"BINANCE", "BYBIT"}:
-        where.append("w.exchange = %s")
+    params: list = [symbol]
+    exchange_sql = ""
+    if exchange:
+        exchange_sql = "AND exchange = %s"
         params.append(exchange)
 
-    if timeframe in {"15м", "30м", "1ч", "4ч", "12ч", "24ч"}:
-        where.append("w.window_code = %s")
-        params.append(timeframe)
-
-    where_sql = "WHERE " + " AND ".join(where)
-
-    rows = _safe_rows(f"""
-        SELECT
-            w.exchange,
-            w.symbol,
-            w.window_code,
-            w.oi_slope_class,
-            w.oi_slope_value,
-            w.price_regime,
-            w.price_direction,
-            w.volume_class,
-            w.cycle_ts,
-            c.current_stage,
-            c.stage_age_minutes,
-            c.oi_summary,
-            c.price_summary,
-            c.volume_summary
-        FROM window_state_v2 w
-        LEFT JOIN core_state_v2 c
-          ON c.exchange = w.exchange
-         AND c.symbol = w.symbol
-        {where_sql}
-        ORDER BY ABS(COALESCE(w.oi_slope_value, 1.0) - 1.0) DESC,
-                 c.current_stage DESC,
-                 w.cycle_ts DESC,
-                 w.exchange,
-                 w.symbol
-        LIMIT 80
-    """, tuple(params))
-
-    rows = sorted(
-        rows,
-        key=lambda r: (abs(float(r.get("oi_slope_value") or 1.0) - 1.0), int(r.get("current_stage") or 0)),
-        reverse=True,
-    )[:10]
-
-    ex_title = exchange or "ALL"
-    tf_title = timeframe or "ALL"
-    title = f"🏆 TOP OI за {tf_title} — {ex_title}"
-
-    if not rows:
-        return f"{title}\n\nНет строк в window_state_v2."
-
-    lines = [title, "_window_state_v2 snapshot_"]
-
-    for i, r in enumerate(rows, 1):
-        symbol = r.get("symbol")
-        ex = r.get("exchange")
-        oi = r.get("oi_slope_value")
-        try:
-            oi_text = f"{float(oi):.6f}"
-        except Exception:
-            oi_text = "n/a"
-        oi_summary = r.get("oi_summary") or {}
-        price_summary = r.get("price_summary") or {}
-        volume_summary = r.get("volume_summary") or {}
-        links = _symbol_links(symbol, ex)
-
-        lines.append(
-            f"{i}. `{symbol}` — OI {r.get('oi_slope_class')} ({oi_text}) | phase={r.get('current_stage')} {_stage_label(r.get('current_stage'))} | "
-            f"pattern={oi_summary.get('oi_pattern_label') or oi_summary.get('oi_pattern_code')} | "
-            f"price={price_summary.get('price_state') or (str(r.get('price_regime')) + '/' + str(r.get('price_direction')))} | "
-            f"volume={volume_summary.get('volume_state') or r.get('volume_class')} | {links}"
-        )
-
-    return "\n".join(lines)
-def _build_coin_card(symbol: str) -> str:
-    symbol = symbol.upper().strip()
-
-    core_rows = _safe_rows("""
+    core_rows = _safe_rows(f"""
         SELECT *
         FROM core_state_v2
         WHERE symbol = %s
+          {exchange_sql}
         ORDER BY current_stage DESC, stage_age_minutes DESC, latest_cycle_ts DESC, exchange
-        LIMIT 20
-    """, (symbol,))
+        LIMIT 5
+    """, tuple(params))
 
-    window_rows = _safe_rows(f"""
-        SELECT *
-        FROM window_state_v2
-        WHERE symbol = %s
-        ORDER BY exchange, {_window_rank_sql()}, cycle_ts DESC
-    """, (symbol,))
-
-    history_rows = _safe_rows("""
-        SELECT *
-        FROM transition_history_v2
-        WHERE symbol = %s
-        ORDER BY cycle_ts DESC
-        LIMIT 12
-    """, (symbol,))
-
-    if not core_rows and not window_rows:
+    if not core_rows:
         return f"🪙 {symbol}\n\nНет данных. Формат: /coin BTCUSDT"
 
-    lines = [f"🪙 {symbol}", ""]
+    core_row = core_rows[0]
+    exchange = str(core_row.get("exchange") or exchange or "").upper()
+    window_rows = _load_window_rows(symbol, exchange, as_of_ts=as_of_ts)
+    history_rows = _collect_transition_history(symbol, exchange, as_of_ts=as_of_ts)
+    metric_windows = _latest_metric_windows(symbol, exchange, as_of_ts=as_of_ts)
+    title = f"🪙 CARD — Фаза {core_row.get('current_stage')}"
+    return _build_coin_message(core_row, window_rows, history_rows, metric_windows, title=title, transition_ts=as_of_ts)
 
-    if core_rows:
-        lines.append("OI CORE V2:")
-        for r in core_rows:
-            ex = r.get("exchange")
-            ex_windows = [row for row in window_rows if row.get("exchange") == ex]
-            oi = r.get("oi_summary") or {}
-            price = r.get("price_summary") or {}
-            volume = r.get("volume_summary") or {}
 
-            lines.extend([
-                "",
-                f"{symbol} [{ex}]",
-                _symbol_links(symbol, ex),
-                f"phase={r.get('current_stage')} {_stage_label(r.get('current_stage'))} | latest={_short_ts(r.get('latest_cycle_ts'))}",
-                f"pattern={oi.get('oi_pattern_label') or oi.get('oi_pattern_code')}",
-                f"OI summary: dir={oi.get('oi_direction_summary')} | angle={oi.get('oi_angle_summary')} | hold={oi.get('oi_retention_summary')} | stability={oi.get('oi_stability_summary')}",
-                f"OI slopes: 1h={oi.get('oi_slope_class_1h')} ({oi.get('oi_slope_ratio_1h')}) | 4h={oi.get('oi_slope_class_4h')} ({oi.get('oi_slope_ratio_4h')})",
-                f"PRICE: {price.get('price_state')} | block={price.get('price_block')} | hard_ban={r.get('price_hard_ban')}",
-                f"VOLUME: {volume.get('volume_state')} | confirm={volume.get('volume_confidence')}",
-                f"age={r.get('stage_age_minutes')}m | transition={r.get('transition_permission')} | manual_reset_required={r.get('manual_reset_required')}",
-                f"reason={r.get('phase_reason')}",
-                f"Feedback: /feedback {symbol} текст",
-                f"Debug: /debug_cases {symbol} | Analytics: /post_stage {symbol}",
-            ])
-            if ex_windows:
-                lines.append("windows_v2:")
-                for w in ex_windows:
-                    slope_value = w.get('oi_slope_value')
-                    try:
-                        slope_text = f"{float(slope_value):.6f}"
-                    except Exception:
-                        slope_text = 'n/a'
-                    lines.append(
-                        f"{w.get('window_code')}: oi={w.get('oi_slope_class')} ({slope_text}) "
-                        f"| hold={w.get('oi_hold_class')} | pullback={w.get('oi_pullback_class')} "
-                        f"| smooth={w.get('oi_smoothness_class')} | price={w.get('price_regime')}/{w.get('price_direction')} "
-                        f"| volume={w.get('volume_class')} | v10x={w.get('volume_10x_confirmed')}"
-                    )
-
-    if history_rows:
-        lines.extend(["", "STAGE HISTORY V2:"])
-        for r in history_rows[:8]:
-            lines.append(
-                f"{r.get('exchange')} | {r.get('from_stage')} -> {r.get('to_stage')} | "
-                f"allowed={r.get('transition_allowed')} | age_before={r.get('stage_age_before_transition')}m | "
-                f"{_short_ts(r.get('cycle_ts'))} | reason={r.get('reason')}"
-            )
-
-    return "\n".join(lines)
+def _coin_stage(core_rows: list[dict]) -> int:
+    if not core_rows:
+        return 0
+    try:
+        return int(core_rows[0].get("current_stage") or 0)
+    except Exception:
+        return 0
 
 def _save_debug_cases(symbol: str, comment: str, core_rows: list[dict], window_rows: list[dict], history_rows: list[dict]) -> int:
     written = 0
@@ -1028,18 +2197,155 @@ def _build_post_stage_text(symbol: str | None = None) -> str:
         if notes:
             lines.append(f"   notes={notes[:180]}")
     return "\n".join(lines)
+
+
+def _stage3_policy_hint(current_stage, stage_age_minutes, pattern_code, manual_reset_required) -> str:
+    try:
+        stage = int(current_stage or 0)
+    except Exception:
+        stage = 0
+    try:
+        age = float(stage_age_minutes or 0.0)
+    except Exception:
+        age = 0.0
+    pattern = str(pattern_code or "").strip()
+    manual = bool(manual_reset_required)
+
+    stale_patterns = {"мертвая_форма", "ложный_всплеск", "поломка_набора"}
+    if stage != 3:
+        return "not_stage3"
+    if pattern in stale_patterns and age >= 120:
+        return "stale_stage3_reset_candidate"
+    if manual and age >= 240:
+        return "manual_hold_review_needed"
+    if age < 60:
+        return "fresh_stage3"
+    return "observe_stage3"
+
+
+def _build_review_case_text(symbol: str) -> str:
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return "Формат: /review BTCUSDT"
+
+    core_rows = _safe_rows("""
+        SELECT *
+        FROM core_state_v2
+        WHERE symbol = %s
+        ORDER BY current_stage DESC, stage_age_minutes DESC, latest_cycle_ts DESC, exchange
+        LIMIT 6
+    """, (symbol,))
+    feedback_rows = _safe_rows("""
+        SELECT exchange, symbol, cycle_ts, current_stage, user_comment, status, created_at
+        FROM debug_cases_v2
+        WHERE symbol = %s
+        ORDER BY created_at DESC
+        LIMIT 8
+    """, (symbol,))
+    history_rows = _safe_rows("""
+        SELECT exchange, symbol, from_stage, to_stage, cycle_ts, transition_allowed, stage_age_before_transition, reason
+        FROM transition_history_v2
+        WHERE symbol = %s
+        ORDER BY cycle_ts DESC
+        LIMIT 8
+    """, (symbol,))
+    post_rows = _safe_rows("""
+        SELECT exchange, symbol, stage_triggered, triggered_at, quality_label, notes,
+               trigger_price, price_after_1h, price_after_4h, price_after_12h, price_after_24h
+        FROM post_stage_analytics_v2
+        WHERE symbol = %s
+        ORDER BY triggered_at DESC
+        LIMIT 6
+    """, (symbol,))
+
+    if not core_rows and not feedback_rows and not history_rows and not post_rows:
+        return f"🧭 Review case — {symbol}\n\nНет данных."
+
+    lines = [f"🧭 Review case — {symbol}", ""]
+
+    if core_rows:
+        lines.append("CURRENT STATE:")
+        for row in core_rows[:3]:
+            oi = row.get("oi_summary") or {}
+            ex = row.get("exchange")
+            policy = _stage3_policy_hint(
+                row.get("current_stage"),
+                row.get("stage_age_minutes"),
+                oi.get("oi_pattern_code"),
+                row.get("manual_reset_required"),
+            )
+            lines.append(
+                f"{ex} | stage={row.get('current_stage')} {_stage_label(row.get('current_stage'))} | "
+                f"age={row.get('stage_age_minutes')}m | policy={policy}"
+            )
+            lines.append(
+                f"pattern={oi.get('oi_pattern_label') or oi.get('oi_pattern_code')} | "
+                f"reason={row.get('phase_reason')}"
+            )
+        lines.append("")
+
+        exchange_block = _build_exchange_semantic_block(symbol, str(core_rows[0].get("exchange") or ""))
+        if exchange_block:
+            lines.append("EXCHANGE SENSITIVITY:")
+            lines.extend(exchange_block[1:])
+            lines.append("")
+
+    if history_rows:
+        lines.append("LATEST TRANSITIONS:")
+        for row in history_rows[:5]:
+            lines.append(
+                f"{row.get('exchange')} | {row.get('from_stage')}->{row.get('to_stage')} | "
+                f"{_short_ts(row.get('cycle_ts'))} | age_before={row.get('stage_age_before_transition')}m"
+            )
+            lines.append(f"reason={row.get('reason')}")
+        lines.append("")
+
+    if feedback_rows:
+        lines.append("OPERATOR FEEDBACK:")
+        for row in feedback_rows[:5]:
+            comment = str(row.get("user_comment") or "").strip()
+            lines.append(
+                f"{row.get('exchange')} | stage={row.get('current_stage')} | "
+                f"created={_short_ts(row.get('created_at'))} | status={row.get('status') or 'n/a'}"
+            )
+            if comment:
+                lines.append(f"comment={comment[:220]}")
+        lines.append("")
+    else:
+        lines.append("OPERATOR FEEDBACK:\nнет комментариев\n")
+
+    if post_rows:
+        lines.append("POST-STAGE OUTCOMES:")
+        for row in post_rows[:4]:
+            lines.append(
+                f"{row.get('exchange')} | stage={row.get('stage_triggered')} | "
+                f"trigger={_short_ts(row.get('triggered_at'))} | quality={_post_stage_quality_ru(row.get('quality_label'))}"
+            )
+            lines.append(
+                f"1h={_fmt_post_stage_delta(row.get('trigger_price'), row.get('price_after_1h'))} | "
+                f"4h={_fmt_post_stage_delta(row.get('trigger_price'), row.get('price_after_4h'))} | "
+                f"12h={_fmt_post_stage_delta(row.get('trigger_price'), row.get('price_after_12h'))} | "
+                f"24h={_fmt_post_stage_delta(row.get('trigger_price'), row.get('price_after_24h'))}"
+            )
+            notes = str(row.get("notes") or "").strip()
+            if notes:
+                lines.append(f"notes={notes[:180]}")
+        lines.append("")
+    else:
+        lines.append("POST-STAGE OUTCOMES:\nнет строк\n")
+
+    lines.append(f"Actions: /coin {symbol} | /feedback {symbol} | /debug_cases {symbol} | /post_stage {symbol}")
+    return "\n".join(lines)
 def _feedback_path() -> Path:
     return ПАПКА_ДАННЫХ / "telegram_feedback.csv"
 
 
 
-def _save_feedback(text: str) -> str:
-    parts = text.split(maxsplit=2)
-    if len(parts) < 3:
-        return "Формат: /feedback SYMBOL текст"
-
-    _, symbol, comment = parts
+def _save_feedback_snapshot(symbol: str, comment: str, source: str = "text_command") -> str:
     symbol = symbol.upper().strip()
+    comment = str(comment or "").strip()
+    if not symbol or not comment:
+        return "Нужны SYMBOL и текст комментария."
 
     core_rows = _safe_rows("""
         SELECT *
@@ -1067,7 +2373,8 @@ def _save_feedback(text: str) -> str:
         LIMIT 20
     """, (symbol,))
 
-    debug_written = _save_debug_cases(symbol, comment, core_rows, window_rows, history_rows)
+    stored_comment = f"[source={source}] {comment}"
+    debug_written = _save_debug_cases(symbol, stored_comment, core_rows, window_rows, history_rows)
 
     path = _feedback_path()
     new_file = not path.exists()
@@ -1092,7 +2399,7 @@ def _save_feedback(text: str) -> str:
         "user_comment",
     ]
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = iso_мск()
     written = 0
 
     with _csv_lock:
@@ -1126,225 +2433,93 @@ def _save_feedback(text: str) -> str:
                     json.dumps(r, ensure_ascii=False, default=str),
                     json.dumps(ex_windows, ensure_ascii=False, default=str),
                     json.dumps(ex_history, ensure_ascii=False, default=str),
-                    comment,
+                    stored_comment,
                 ])
                 written += 1
 
     return f"✅ Feedback snapshot v2 сохранён: {symbol}, rows={written}, debug_cases={debug_written}"
 
-def _download_files() -> list[tuple[str, str]]:
-    return [
-        ("bundle", "market_research_bundle.zip"),
-        ("reports", "runtime_reports.zip"),
-        ("manifest", "storage_manifest.txt"),
-        ("health", "runtime_health_report.txt"),
-        ("timing", "runtime_timing_report.txt"),
-        ("failures", "request_failure_report.csv"),
-        ("gaps", "gap_report.csv"),
-        ("universe", "active_universe_report.csv"),
-        ("feedback", "telegram_feedback.csv"),
-        ("quarantine", "telegram_quarantine.csv"),
-        ("q_history", "telegram_quarantine_history.csv"),
-        ("stage3_alerts", "telegram_stage3_alert_history.csv"),
-        ("pending_reset", "telegram_pending_reset_stage3.json"),
-    ]
+
+def _save_feedback(text: str) -> str:
+    parts = text.split(maxsplit=2)
+    if len(parts) < 2:
+        return "Формат: /feedback SYMBOL текст"
+    if len(parts) == 2:
+        _, symbol = parts
+        return _begin_feedback_flow(None, symbol, source="slash_command")
+
+    _, symbol, comment = parts
+    return _save_feedback_snapshot(symbol, comment, source="slash_command")
 
 
-def _download_name_map() -> dict[str, str]:
-    out = {}
-    for alias, filename in _download_files():
-        out[alias] = filename
-        out[filename] = filename
-    return out
+def _begin_feedback_flow(chat_id: str | int | None, symbol: str, source: str = "inline_button", seed: str | None = None) -> str:
+    symbol = symbol.upper().strip()
+    core_rows = _safe_rows("""
+        SELECT *
+        FROM core_state_v2
+        WHERE symbol = %s
+        ORDER BY current_stage DESC, stage_age_minutes DESC, latest_cycle_ts DESC, exchange
+        LIMIT 2
+    """, (symbol,))
+    if not core_rows:
+        return f"Нет snapshot для {symbol}. Режим обратной связи не открыт."
 
-
-def _file_status(path: Path, stale_minutes: int = 60) -> dict:
-    if not path.exists():
-        return {"status": "MISSING", "size": 0, "rows": 0, "age_min": None, "mtime": None}
-
-    size = path.stat().st_size
-    mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-    age_min = round((datetime.now(timezone.utc) - mtime).total_seconds() / 60.0, 1)
-
-    if size <= 0:
-        status = "EMPTY"
-    elif age_min > stale_minutes:
-        status = "STALE"
-    else:
-        status = "OK"
-
-    rows = 0
-    if path.suffix.lower() in {".csv", ".txt"}:
-        try:
-            with path.open("r", encoding="utf-8", errors="ignore") as f:
-                rows = max(sum(1 for _ in f) - 1, 0) if path.suffix.lower() == ".csv" else sum(1 for _ in f)
-        except Exception:
-            rows = -1
-
-    return {"status": status, "size": size, "rows": rows, "age_min": age_min, "mtime": mtime}
-
-
-def _build_downloads_text() -> str:
-    lines = ["⬇️ Скачать файлы", "", "Статус runtime files:"]
-    for alias, filename in _download_files():
-        path = ПАПКА_ДАННЫХ / filename
-        st = _file_status(path)
-        age = "—" if st.get("age_min") is None else f'{st.get("age_min"):.1f}m'
-        size = st.get("size", 0)
-        rows = st.get("rows", 0)
-        lines.append(
-            f"/download {alias} — {st.get('status')} | rows={rows} | age={age} | size={size}"
-        )
-    return "\n".join(lines)
-
-
-def _send_download(name: str) -> None:
-    if name == "backup_latest":
-        last = _latest_archive_entry("backup_db")
-        if not last or not last.get("file"):
-            send_message("Файл backup_latest не найден.", _main_keyboard())
-            return
-        send_document(Path(last["file"]), "latest postgres backup")
-        return
-
-    allowed = _download_name_map()
-    allowed["active"] = "active_universe_report.csv"
-    filename = allowed.get(name)
-    if not filename:
-        send_message(
-            "Формат: /download bundle|reports|manifest|health|timing|failures|gaps|universe|feedback|quarantine|q_history|stage3_alerts|pending_reset",
-            _main_keyboard(),
-        )
-        return
-
-    path = ПАПКА_ДАННЫХ / filename
-    if filename == "runtime_reports.zip":
-        try:
-            path = _build_runtime_reports_zip()
-        except FileNotFoundError:
-            send_message("Runtime reports пока не собраны.", _main_keyboard())
-            return
-
-    send_document(path, filename)
-
-def _quarantine_path() -> Path:
-    return ПАПКА_ДАННЫХ / "telegram_quarantine.csv"
-
-
-def _quarantine_history_path() -> Path:
-    return ПАПКА_ДАННЫХ / "telegram_quarantine_history.csv"
-
-
-def _read_quarantine() -> dict[str, str]:
-    path = _quarantine_path()
-    data = {}
-    if not path.exists():
-        return data
-    with path.open("r", encoding="utf-8", newline="") as f:
-        for row in csv.DictReader(f):
-            data[row["symbol"]] = row.get("reason", "")
-    return data
-
-
-def _write_quarantine(data: dict[str, str]) -> None:
-    path = _quarantine_path()
-    with _csv_lock:
-        with path.open("w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["symbol", "reason", "updated_at_utc"])
-            now = datetime.now(timezone.utc).isoformat()
-            for symbol, reason in sorted(data.items()):
-                w.writerow([symbol, reason, now])
-
-
-def _append_quarantine_history(action: str, symbol: str, reason: str) -> None:
-    path = _quarantine_history_path()
-    new_file = not path.exists()
-    with _csv_lock:
-        with path.open("a", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            if new_file:
-                w.writerow(["created_at_utc", "action", "symbol", "reason"])
-            w.writerow([datetime.now(timezone.utc).isoformat(), action, symbol, reason])
-
-
-
-def _build_quarantine_status_text() -> str:
-    data = _read_quarantine()
-
-    code_hits = []
-    for path in Path(".").glob("*.py"):
-        if path.name == "telegram_bot.py":
-            continue
-        text = path.read_text(errors="ignore")
-        if "telegram_quarantine" in text or "_read_quarantine" in text or "quarantine" in text.lower():
-            code_hits.append(path.name)
-
-    mode = "CORE-LINKED" if code_hits else "UI-ONLY"
-
-    lines = [
-        "🧱 Quarantine status",
+    stage = _coin_stage(core_rows)
+    _save_pending_feedback(chat_id, symbol, seed=seed)
+    seed_line = f"\nШаблон: {seed}" if seed else ""
+    return "\n".join([
+        "🗣 Режим обратной связи открыт",
         "",
-        f"mode={mode}",
-        f"symbols={len(data)}",
-        f"file={_quarantine_path()}",
-        f"history={_quarantine_history_path()}",
+        f"Монета: {symbol}",
+        f"Текущая стадия: {stage} {_stage_label(stage)}",
+        f"Причина: {_human_phase_reason(core_rows[0].get('phase_reason'))}",
+        seed_line.strip(),
         "",
-    ]
-
-    if code_hits:
-        lines.append("Core references:")
-        lines.extend(f"- {name}" for name in sorted(set(code_hits)))
-    else:
-        lines.append("Core references: not found")
-        lines.append("Важно: quarantine сейчас не доказан как core-фильтр. UI-only до отдельной интеграции.")
-
-    if data:
-        lines.append("")
-        lines.append("Symbols:")
-        lines.extend(f"{s}: {r}" for s, r in sorted(data.items())[:50])
-
-    return "\n".join(lines)
+        "Следующее обычное сообщение в этот чат сохраню как комментарий к этой монете.",
+        "Отмена: /cancel_feedback",
+    ]).replace("\n\n\n", "\n\n")
 
 
-def _handle_quarantine(text: str, chat_id=None) -> None:
+def _handle_pending_feedback_message(text: str, chat_id: str | int | None) -> str | None:
+    if not _matches_pending_feedback(chat_id):
+        return None
+    pending = _load_pending_feedback()
+    if not pending:
+        return None
+    if not text or text.startswith("/") or text in {
+        "⬅️ Назад",
+        "⚙️ Фазы",
+        "❓ Помощь",
+        "🥉 Фаза 1",
+        "🥈 Фаза 2",
+        "🥇 Фаза 3",
+        "🧯 Сброс фазы 3",
+        "📈 Топ ОИ",
+        "📈 ТОП OI",
+        "⬇️ Скачать",
+        "🧱 Карантин",
+        "🧱 Quarantine",
+    }:
+        return None
+
+    comment = text
+    seed = str(pending.get("seed") or "").strip()
+    if seed:
+        comment = f"{seed} | {comment}"
+    result = _save_feedback_snapshot(pending.get("symbol") or "", comment, source="pending_button_flow")
+    _clear_pending_feedback()
+    return result
+
+
+def _handle_cancel_feedback(chat_id=None) -> None:
     if not _admin_only(chat_id):
         return
-
-    parts = text.split(maxsplit=3)
-    data = _read_quarantine()
-
-    if len(parts) >= 2 and parts[1] == "status":
-        send_message(_build_quarantine_status_text(), _main_keyboard())
-        return
-
-    if len(parts) == 1 or parts[1] == "list":
-        if not data:
-            send_message("🧱 Quarantine\n\nСписок пуст.", _main_keyboard())
-            return
-        send_message("🧱 Quarantine\n\n" + "\n".join(f"{s}: {r}" for s, r in sorted(data.items())), _main_keyboard())
-        return
-
-    action = parts[1]
-    symbol = parts[2].upper() if len(parts) >= 3 else ""
-    reason = parts[3] if len(parts) >= 4 else ""
-
-    if action == "add" and symbol:
-        data[symbol] = reason or "manual"
-        _write_quarantine(data)
-        _append_quarantine_history("add", symbol, data[symbol])
-        send_message(f"✅ Quarantine add: {symbol}", _main_keyboard())
-    elif action == "remove" and symbol:
-        old = data.pop(symbol, "")
-        _write_quarantine(data)
-        _append_quarantine_history("remove", symbol, old)
-        send_message(f"✅ Quarantine remove: {symbol}", _main_keyboard())
-    elif action == "history":
-        send_document(_quarantine_history_path(), "quarantine history")
+    pending = _load_pending_feedback()
+    _clear_pending_feedback()
+    if pending:
+        send_message(f"✅ Режим обратной связи отменён: {pending.get('symbol')}", _main_keyboard())
     else:
-        send_message("Формат: /quarantine list | add SYMBOL reason | remove SYMBOL | history", _main_keyboard())
-
-
+        send_message("Режим обратной связи не был открыт.", _main_keyboard())
 
 def _pending_reset_path() -> Path:
     return ПАПКА_ДАННЫХ / "telegram_pending_reset_stage3.json"
@@ -1352,7 +2527,7 @@ def _pending_reset_path() -> Path:
 
 def _save_pending_reset(symbol: str, reason: str) -> None:
     payload = {
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "created_at_utc": iso_мск(),
         "symbol": symbol.upper(),
         "reason": reason,
     }
@@ -1392,15 +2567,15 @@ def _handle_stage3_reset(text: str, chat_id=None) -> None:
 
     send_message(
         "\n".join([
-            "⚠️ Pending Stage3 reset создан",
+            "⚠️ Подготовлен ручной сброс фазы 3",
             "",
-            f"symbol={symbol}",
-            f"reason={reason}",
+            f"Монета: {symbol}",
+            f"Причина: {reason}",
             "",
             f"Подтвердить: /confirm_reset {symbol}",
             "Отменить: /cancel_reset",
         ]),
-        _main_keyboard(),
+        _stage3_reset_actions_keyboard(symbol=symbol),
     )
 
 
@@ -1410,7 +2585,7 @@ def _handle_confirm_reset(text: str, chat_id=None) -> None:
 
     pending = _load_pending_reset()
     if not pending:
-        send_message("Нет pending reset.", _main_keyboard())
+        send_message("Нет ожидающего ручного сброса.", _main_keyboard())
         return
 
     parts = text.split(maxsplit=1)
@@ -1423,7 +2598,7 @@ def _handle_confirm_reset(text: str, chat_id=None) -> None:
 
     if symbol != pending.get("symbol"):
         send_message(
-            f"Pending не совпадает. Сейчас pending: {pending.get('symbol')}",
+            f"Ожидающий сброс не совпадает. Сейчас выбран: {pending.get('symbol')}",
             _main_keyboard(),
         )
         return
@@ -1431,16 +2606,56 @@ def _handle_confirm_reset(text: str, chat_id=None) -> None:
     total = 0
     reason = pending.get("reason") or "confirmed_reset"
 
-    for exchange in ("BYBIT", "BINANCE"):
-        try:
-            total += max(reset_stage3(exchange, symbol, "n/a", reason, dry_run=False), 0)
-        except Exception as exc:
-            log(f"telegram confirm_reset error: {exc}")
+    if symbol == "ALL":
+        rows = _safe_rows("""
+            SELECT DISTINCT exchange, symbol
+            FROM core_state_v2
+            WHERE current_stage = 3
+            ORDER BY exchange, symbol
+        """)
+        for row in rows:
+            try:
+                total += max(
+                    reset_stage3(row.get("exchange"), row.get("symbol"), "n/a", reason, dry_run=False),
+                    0,
+                )
+            except Exception as exc:
+                log(f"telegram confirm_reset all error: {exc}")
+    else:
+        for exchange in ("BYBIT", "BINANCE"):
+            try:
+                total += max(reset_stage3(exchange, symbol, "n/a", reason, dry_run=False), 0)
+            except Exception as exc:
+                log(f"telegram confirm_reset error: {exc}")
 
     _clear_pending_reset()
 
     send_message(
-        f"✅ Stage3 reset confirmed: {symbol}, rows={total}",
+        f"✅ Ручной сброс фазы 3 подтвержден: {symbol} | затронуто строк: {total}",
+        _main_keyboard(),
+    )
+
+
+def _reset_stage3_all_now(reason: str, chat_id=None) -> None:
+    if not _admin_only(chat_id):
+        return
+    total = 0
+    rows = _safe_rows("""
+        SELECT DISTINCT exchange, symbol
+        FROM core_state_v2
+        WHERE current_stage = 3
+        ORDER BY exchange, symbol
+    """)
+    for row in rows:
+        try:
+            total += max(
+                reset_stage3(row.get("exchange"), row.get("symbol"), "n/a", reason, dry_run=False),
+                0,
+            )
+        except Exception as exc:
+            log(f"telegram reset all immediate error: {exc}")
+    send_message(
+        f"✅ Все текущие Фазы 3 сняты сразу | затронуто строк: {total}",
         _main_keyboard(),
     )
 
@@ -1454,26 +2669,41 @@ def _handle_cancel_reset(text: str, chat_id=None) -> None:
 
     if pending:
         send_message(
-            f"✅ Pending reset отменён: {pending.get('symbol')}",
+            f"✅ Ожидающий ручной сброс отменён: {pending.get('symbol')}",
             _main_keyboard(),
         )
     else:
-        send_message("Pending reset не найден.", _main_keyboard())
+        send_message("Ожидающий ручной сброс не найден.", _main_keyboard())
 def _stage3_alert_history_path() -> Path:
     return ПАПКА_ДАННЫХ / "telegram_stage3_alert_history.csv"
 
 
-def _read_stage3_alerted_keys() -> set[str]:
+def _read_stage3_alerted_keys(include_legacy: bool = False) -> set[str]:
+    keys: set[str] = set()
+    try:
+        rows = _safe_rows("SELECT alert_key FROM telegram_stage3_alert_history WHERE alert_key IS NOT NULL")
+        for row in rows:
+            key = row.get("alert_key")
+            if not key:
+                continue
+            if not include_legacy and not _is_canonical_stage3_alert_key(str(key)):
+                continue
+            keys.add(str(key))
+    except Exception as exc:
+        logger.warning("Не удалось прочитать историю stage3 alerts из БД: %s", exc)
+
     path = _stage3_alert_history_path()
     if not path.exists():
-        return set()
+        return keys
 
-    keys = set()
     with path.open("r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
             key = row.get("alert_key")
-            if key:
-                keys.add(key)
+            if not key:
+                continue
+            if not include_legacy and not _is_canonical_stage3_alert_key(key):
+                continue
+            keys.add(key)
     return keys
 
 
@@ -1502,8 +2732,9 @@ def _append_stage3_alert_history(row: dict, alert_key: str) -> None:
             if new_file:
                 w.writerow(header)
 
+            created_at_text = iso_мск()
             w.writerow([
-                datetime.now(timezone.utc).isoformat(),
+                created_at_text,
                 alert_key,
                 row.get("exchange"),
                 row.get("symbol"),
@@ -1517,66 +2748,121 @@ def _append_stage3_alert_history(row: dict, alert_key: str) -> None:
                 row.get("decision_reason"),
             ])
 
+    try:
+        execute(
+            """
+            INSERT INTO telegram_stage3_alert_history(
+                created_at_text,
+                alert_key,
+                exchange,
+                symbol,
+                current_stage,
+                oi_pattern_code,
+                oi_pattern_label,
+                price_state_summary,
+                volume_state_summary,
+                oi_stage_age_minutes,
+                latest_cycle_ts,
+                decision_reason
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (alert_key) DO NOTHING
+            """,
+            (
+                created_at_text,
+                alert_key,
+                row.get("exchange"),
+                row.get("symbol"),
+                row.get("current_stage"),
+                row.get("oi_pattern_code"),
+                row.get("oi_pattern_label"),
+                row.get("price_state_summary"),
+                row.get("volume_state_summary"),
+                row.get("oi_stage_age_minutes"),
+                row.get("latest_cycle_ts"),
+                row.get("decision_reason"),
+            ),
+        )
+    except Exception as exc:
+        logger.warning("Не удалось записать историю stage3 alerts в БД: %s", exc)
+
 
 def _build_stage3_alert_text(r: dict) -> str:
     symbol = r.get("symbol")
     ex = r.get("exchange")
-    oi = r.get("oi_summary") or {}
-    price = r.get("price_summary") or {}
-    volume = r.get("volume_summary") or {}
-    ex_windows = _safe_rows(f"""
-        SELECT *
-        FROM window_state_v2
-        WHERE exchange = %s
-          AND symbol = %s
-        ORDER BY {_window_rank_sql()}, cycle_ts DESC
-    """, (ex, symbol))
-    window_line = " | ".join(
-        f"{w.get('window_code')}={w.get('oi_slope_class')}"
-        for w in ex_windows[:4]
+    transition_ts = r.get("stage3_transition_ts") or r.get("latest_cycle_ts")
+    transition_reason = r.get("stage3_transition_reason") or r.get("phase_reason")
+    ex_windows = _load_window_rows(str(symbol), str(ex), as_of_ts=transition_ts)
+    history_rows = _collect_transition_history(str(symbol), str(ex), as_of_ts=transition_ts)
+    metric_windows = _latest_metric_windows(str(symbol), str(ex), as_of_ts=transition_ts)
+    if not ex_windows:
+        ex_windows = _load_window_rows(str(symbol), str(ex))
+    if not metric_windows:
+        metric_windows = _latest_metric_windows(str(symbol), str(ex))
+    return _build_coin_message(
+        r,
+        ex_windows,
+        history_rows,
+        metric_windows,
+        title="🥇 NEW STAGE 3",
+        transition_ts=transition_ts,
+        transition_reason=transition_reason,
     )
-
-    return "\n".join([
-        "🥇 NEW STAGE 3",
-        "",
-        f"{symbol} [{ex}]",
-        _symbol_links(symbol, ex),
-        f"phase={r.get('current_stage')} {_stage_label(r.get('current_stage'))} | updated={_short_ts(r.get('latest_cycle_ts'))}",
-        f"pattern={oi.get('oi_pattern_label') or oi.get('oi_pattern_code')}",
-        f"PRICE: {price.get('price_state')}",
-        f"VOL: {volume.get('volume_state')}",
-        f"age={r.get('stage_age_minutes')}m",
-        f"reason={r.get('phase_reason')}",
-        f"windows={window_line or 'n/a'}",
-        "",
-        f"Card: /coin {symbol}",
-        f"Feedback: /feedback {symbol} текст",
-        f"Reset: /reset_stage3 {symbol} reason",
-    ])
 def check_stage3_alerts() -> int:
     alerted = _read_stage3_alerted_keys()
 
     rows = _safe_rows("""
-        SELECT *
-        FROM core_state_v2
-        WHERE current_stage = 3
-        ORDER BY latest_cycle_ts DESC
+        SELECT
+            c.*,
+            th.cycle_ts AS stage3_transition_ts,
+            th.reason AS stage3_transition_reason,
+            EXTRACT(EPOCH FROM (NOW() - COALESCE(th.cycle_ts, c.latest_cycle_ts))) / 60.0 AS stage3_transition_age_minutes
+        FROM core_state_v2 c
+        LEFT JOIN LATERAL (
+            SELECT cycle_ts, reason
+            FROM transition_history_v2 th
+            WHERE th.exchange = c.exchange
+              AND th.symbol = c.symbol
+              AND th.to_stage = 3
+            ORDER BY th.cycle_ts DESC, th.created_at DESC
+            LIMIT 1
+        ) th ON TRUE
+        WHERE c.current_stage = 3
+        ORDER BY COALESCE(th.cycle_ts, c.latest_cycle_ts) DESC
         LIMIT 50
     """)
 
     sent = 0
 
     for r in rows:
+        try:
+            if float(r.get("stage3_transition_age_minutes") or 999999) > 30.0:
+                continue
+        except Exception:
+            continue
+        transition_ts = r.get("stage3_transition_ts")
+        if not transition_ts:
+            log(
+                "stage3 alert skipped: missing canonical 2->3 transition "
+                f"{r.get('exchange')} {r.get('symbol')}"
+            )
+            continue
         key = "|".join([
             str(r.get("exchange")),
             str(r.get("symbol")),
-            "stage=3",
+            str(transition_ts),
         ])
 
         if key in alerted:
             continue
 
-        send_message(_build_stage3_alert_text(r), _main_keyboard())
+        delivered = send_message(
+            _build_stage3_alert_text(r),
+            _main_keyboard(),
+        )
+        if not delivered:
+            log(f"stage3 alert delivery failed: {key}")
+            continue
+
         _append_stage3_alert_history(r, key)
         sent += 1
 
@@ -1633,7 +2919,6 @@ def _build_archive_text() -> str:
         "",
         "Commands:",
         "/backup_db",
-        "/download backup_latest",
     ]
 
     return "\n".join(lines)
@@ -1690,20 +2975,29 @@ def _handle(text: str, chat_id=None) -> None:
     elif text in {"/panel", "/control"}:
         send_message(_build_control_panel_text(), _main_keyboard())
 
+    elif text in {"/system_health", "🩺 Система"}:
+        send_message(_build_system_health_text(), _main_keyboard())
+
     elif text in {"/phases", "⚙️ Фазы"}:
         send_message(_build_phases_text(), _phases_keyboard())
 
     elif text in {"/phase1", "🥉 Фаза 1"}:
-        send_message(_build_phases_text(1), _phases_keyboard())
+        total = _phase_total_count(1)
+        rows = _phase_rows(1, 0, _PHASE_PAGE_SIZE)
+        send_message(_phase_page_text(1, 0, total), _phase_list_keyboard(rows, 1, 0, total) or _phases_keyboard())
 
     elif text in {"/phase2", "🥈 Фаза 2"}:
-        send_message(_build_phases_text(2), _phases_keyboard())
+        total = _phase_total_count(2)
+        rows = _phase_rows(2, 0, _PHASE_PAGE_SIZE)
+        send_message(_phase_page_text(2, 0, total), _phase_list_keyboard(rows, 2, 0, total) or _phases_keyboard())
 
     elif text in {"/phase3", "🥇 Фаза 3"}:
-        send_message(_build_stage3_text(), _phases_keyboard())
+        total = _phase_total_count(3)
+        rows = _phase_rows(3, 0, _PHASE_PAGE_SIZE)
+        send_message(_phase_page_text(3, 0, total), _phase_list_keyboard(rows, 3, 0, total) or _phases_keyboard())
 
     elif text in {"/top_oi", "📈 ТОП OI", "📈 Топ ОИ"}:
-        send_message("📈 Топ ОИ\n\nВыбери биржу и окно ниже.", _top_oi_keyboard())
+        send_message("⛔ TOP OI убран из рабочего Telegram UX.", _main_keyboard())
 
 
     elif text in {"⬅️ Назад", "/menu"}:
@@ -1715,49 +3009,39 @@ def _handle(text: str, chat_id=None) -> None:
     elif text == "Сбросить по тикеру":
         send_message("Формат: /reset_stage3 SYMBOL reason", _stage3_reset_keyboard())
 
-    elif text == "Сбросить все":
-        send_message("Массовый reset пока не исполняется из кнопки. Используй точечно: /reset_stage3 SYMBOL reason", _stage3_reset_keyboard())
+    elif text in {"Сбросить все", "🧨 Сброс всех Ф3"}:
+        _reset_stage3_all_now("mass_reset_from_button", chat_id)
 
-    elif text in {"15м", "30м", "4ч", "24ч"}:
-        send_message(_build_top_oi_text(text), _top_oi_keyboard())
+    elif text in {"15м", "30м", "4ч", "24ч"} or text.startswith("/top_oi ") or text in {
+        "🏆 BINANCE /30м", "🏆 BINANCE /30m",
+        "🏆 BYBIT /30м", "🏆 BYBIT /30m",
+        "🏆 BINANCE /4ч", "🏆 BINANCE /4h",
+        "🏆 BYBIT /4ч", "🏆 BYBIT /4h",
+        "🏆 BINANCE /24ч", "🏆 BINANCE /24h",
+        "🏆 BYBIT /24ч", "🏆 BYBIT /24h",
+    }:
+        send_message("⛔ TOP OI убран из рабочего Telegram UX.", _main_keyboard())
 
     elif text in {"🧱 Карантин", "🧱 Quarantine", "/quarantine"}:
-        send_message(_build_quarantine_status_text(), _main_keyboard())
-
-
-    elif text in {"🏆 BINANCE /30м", "🏆 BINANCE /30m"}:
-        send_message(_build_top_oi_text("30м", "BINANCE"), _top_oi_keyboard())
-
-    elif text in {"🏆 BYBIT /30м", "🏆 BYBIT /30m"}:
-        send_message(_build_top_oi_text("30м", "BYBIT"), _top_oi_keyboard())
-
-    elif text in {"🏆 BINANCE /4ч", "🏆 BINANCE /4h"}:
-        send_message(_build_top_oi_text("4ч", "BINANCE"), _top_oi_keyboard())
-
-    elif text in {"🏆 BYBIT /4ч", "🏆 BYBIT /4h"}:
-        send_message(_build_top_oi_text("4ч", "BYBIT"), _top_oi_keyboard())
-
-    elif text in {"🏆 BINANCE /24ч", "🏆 BINANCE /24h"}:
-        send_message(_build_top_oi_text("24ч", "BINANCE"), _top_oi_keyboard())
-
-    elif text in {"🏆 BYBIT /24ч", "🏆 BYBIT /24h"}:
-        send_message(_build_top_oi_text("24ч", "BYBIT"), _top_oi_keyboard())
-
-    elif text.startswith("/top_oi "):
-        timeframe, exchange = _parse_top_oi_args(text.split(maxsplit=1)[1].strip())
-        send_message(
-            _build_top_oi_text(timeframe, exchange),
-            _main_keyboard()
-        )
+        send_message("⛔ Карантин убран из рабочего Telegram UX.", _main_keyboard())
 
     elif text in {"/coin", "🪙 Coin"}:
         send_message("Формат: /coin BTCUSDT", _main_keyboard())
 
     elif text.startswith("/coin "):
-        send_message(_build_coin_card(text.split(maxsplit=1)[1]), _main_keyboard())
+        symbol = text.split(maxsplit=1)[1].upper().strip()
+        core_rows = _safe_rows("""
+            SELECT *
+            FROM core_state_v2
+            WHERE symbol = %s
+            ORDER BY current_stage DESC, stage_age_minutes DESC, latest_cycle_ts DESC, exchange
+            LIMIT 2
+        """, (symbol,))
+        best_exchange = str((core_rows[0] or {}).get("exchange") or "").upper() if core_rows else None
+        send_message(_build_coin_card(symbol, best_exchange), _main_keyboard())
 
-    elif text.startswith("/feedback "):
-        send_message(_save_feedback(text), _main_keyboard())
+    elif text.startswith("/feedback ") or text == "/cancel_feedback":
+        send_message("⛔ Обратная связь убрана из Telegram. Разбираем сигналы напрямую в рабочем чате.", _main_keyboard())
 
     elif text == "/debug_cases":
         send_message(_build_debug_cases_text(), _main_keyboard())
@@ -1771,11 +3055,15 @@ def _handle(text: str, chat_id=None) -> None:
     elif text.startswith("/post_stage "):
         send_message(_build_post_stage_text(text.split(maxsplit=1)[1]), _main_keyboard())
 
-    elif text in {"/downloads", "⬇️ Скачать"}:
-        send_message(_build_downloads_text(), _downloads_keyboard())
+    elif text == "/review":
+        send_message("Формат: /review BTCUSDT", _main_keyboard())
 
-    elif text.startswith("/download "):
-        _send_download(text.split(maxsplit=1)[1].strip())
+    elif text.startswith("/review "):
+        symbol = text.split(maxsplit=1)[1].upper().strip()
+        send_message(_build_review_case_text(symbol), _main_keyboard())
+
+    elif text in {"/downloads", "⬇️ Скачать"} or text.startswith("/download "):
+        send_message("⛔ Скачать убрано из рабочего Telegram UX.", _main_keyboard())
 
     elif text == "/backup_db":
         send_message(_run_backup_db(), _main_keyboard())
@@ -1784,7 +3072,7 @@ def _handle(text: str, chat_id=None) -> None:
         send_message(_build_archive_text(), _main_keyboard())
 
     elif text in {"/quarantine", "🧱 Quarantine"} or text.startswith("/quarantine "):
-        _handle_quarantine(text, chat_id)
+        send_message("⛔ Карантин убран из рабочего Telegram UX.", _main_keyboard())
 
     elif text.startswith("/reset_stage3 "):
         _handle_stage3_reset(text, chat_id)
@@ -1823,10 +3111,10 @@ def _handle(text: str, chat_id=None) -> None:
         send_document(ПАПКА_ДАННЫХ / "active_universe_report.csv", "active universe")
 
     elif text == "/export_quick":
-        send_message("⛔ Rebuild через Telegram отключён. Используй /download bundle.", _main_keyboard())
+        send_message("⛔ Rebuild через Telegram отключён.", _main_keyboard())
 
     elif text in {"/export_research_7d", "/export_research_30d"}:
-        send_message("⛔ Heavy export через Telegram отключён. Только готовые файлы через /downloads.", _main_keyboard())
+        send_message("⛔ Heavy export убран из рабочего Telegram UX.", _main_keyboard())
 
 
 def _reset() -> None:
@@ -1865,12 +3153,132 @@ def _loop() -> None:
                 message = item.get("message", {}) or {}
                 text = message.get("text", "")
                 chat_id = (message.get("chat", {}) or {}).get("id")
+                callback = item.get("callback_query", {}) or {}
+                callback_id = callback.get("id")
+                callback_data = str(callback.get("data") or "").strip()
+                callback_message = callback.get("message", {}) or {}
+                callback_chat_id = (callback_message.get("chat", {}) or {}).get("id")
 
                 if text:
                     _handle(text.strip(), chat_id)
+                elif callback_data:
+                    _handle_callback(callback_data, callback_id, callback_chat_id)
         except Exception as exc:
             log(f"telegram polling error: {exc}")
             time.sleep(10 if "409" in str(exc) else 5)
+
+
+def _handle_callback(data: str, callback_id: str | None, chat_id=None) -> None:
+    if not _is_admin_chat(chat_id):
+        _answer_callback_query(str(callback_id or ""), "⛔ Admin-only")
+        return
+
+    action, _, payload = data.partition(":")
+    payload = payload.strip()
+
+    if action == "coin" and payload:
+        _answer_callback_query(str(callback_id or ""), f"Карточка {payload}")
+        core_rows = _safe_rows("""
+            SELECT *
+            FROM core_state_v2
+            WHERE symbol = %s
+            ORDER BY current_stage DESC, stage_age_minutes DESC, latest_cycle_ts DESC, exchange
+            LIMIT 2
+        """, (payload.upper(),))
+        best_exchange = str((core_rows[0] or {}).get("exchange") or "").upper() if core_rows else None
+        send_message(_build_coin_card(payload, best_exchange), _main_keyboard())
+        return
+
+    if action == "coinx" and payload:
+        exchange, _, symbol = payload.partition(":")
+        symbol = symbol.upper().strip()
+        exchange = exchange.upper().strip()
+        _answer_callback_query(str(callback_id or ""), f"Карточка {symbol}")
+        send_message(_build_coin_card(symbol, exchange), _main_keyboard())
+        return
+
+    if action == "phases":
+        _answer_callback_query(str(callback_id or ""), "Список фаз")
+        send_message(_build_phases_text(), _phases_keyboard())
+        return
+
+    if action == "phmore" and payload:
+        try:
+            phase_text, offset_text = payload.split(":", 1)
+            phase = int(phase_text)
+            offset = max(0, int(offset_text))
+        except Exception:
+            _answer_callback_query(str(callback_id or ""), "Не удалось открыть следующую страницу")
+            return
+        total = _phase_total_count(phase)
+        rows = _phase_rows(phase, offset, _PHASE_PAGE_SIZE)
+        if not rows:
+            _answer_callback_query(str(callback_id or ""), "Дальше монет нет")
+            return
+        _answer_callback_query(str(callback_id or ""), f"Фаза {phase}: еще")
+        send_message(
+            _phase_page_text(phase, offset, total),
+            _phase_list_keyboard(rows, phase, offset, total) or _phases_keyboard(),
+        )
+        return
+
+    if action == "fb" and payload:
+        _answer_callback_query(str(callback_id or ""), "Обратная связь убрана")
+        send_message("⛔ Обратная связь убрана из Telegram. Разбираем сигналы напрямую в рабочем чате.", _main_keyboard())
+        return
+
+    if action == "fbcancel":
+        _answer_callback_query(str(callback_id or ""), "Обратная связь убрана")
+        return
+
+    if action == "post" and payload:
+        _answer_callback_query(str(callback_id or ""), f"Post-stage {payload}")
+        send_message(_build_post_stage_text(payload), _main_keyboard())
+        return
+
+    if action == "dbg" and payload:
+        _answer_callback_query(str(callback_id or ""), f"Debug {payload}")
+        send_message(_build_debug_cases_text(payload), _main_keyboard())
+        return
+
+    if action == "rv" and payload:
+        _answer_callback_query(str(callback_id or ""), f"Review {payload}")
+        send_message(_build_review_case_text(payload), _main_keyboard())
+        return
+
+    if action == "rst" and payload:
+        _answer_callback_query(str(callback_id or ""), f"Ручной сброс {payload}")
+        _save_pending_reset(payload.upper(), "button_reset_stage3")
+        send_message(
+            "\n".join([
+                "⚠️ Подготовлен ручной сброс фазы 3",
+                "",
+                f"Монета: {payload.upper()}",
+                "Причина: button_reset_stage3",
+                "",
+                f"Подтвердить: /confirm_reset {payload.upper()}",
+                "Отменить: /cancel_reset",
+            ]),
+            _stage3_reset_actions_keyboard(symbol=payload.upper()),
+        )
+        return
+
+    if action == "rstall":
+        _answer_callback_query(str(callback_id or ""), "Снимаю все Фазы 3")
+        _reset_stage3_all_now("mass_reset_from_inline_button", chat_id)
+        return
+
+    if action == "rstconfirm" and payload:
+        _answer_callback_query(str(callback_id or ""), f"Подтвердить сброс {payload}")
+        _handle_confirm_reset(f"/confirm_reset {payload}", chat_id)
+        return
+
+    if action == "rstcancel":
+        _answer_callback_query(str(callback_id or ""), "Сброс отменён")
+        _handle_cancel_reset("/cancel_reset", chat_id)
+        return
+
+    _answer_callback_query(str(callback_id or ""), "Неизвестное действие")
 
 
 def start_polling() -> None:

@@ -8,6 +8,7 @@ from phase_common import (
     pullback_ratio_from_points,
     retention_ratio_from_ohlc,
     retention_ratio_from_points,
+    silent_build_ratio_from_points,
     smoothness_ratio_from_points,
     smoothness_proxy_from_ohlc,
     trajectory_points,
@@ -25,6 +26,14 @@ def compute_oi_window_state(window_payload: dict[str, dict[str, dict] | None], w
     retention_ratio = retention_ratio_from_points(points) if points else retention_ratio_from_ohlc(row)
     pullback_ratio = pullback_ratio_from_points(points) if points else pullback_ratio_from_ohlc(row)
     smoothness_proxy = smoothness_ratio_from_points(points) if points else smoothness_proxy_from_ohlc(row)
+    silent_build_ratio = silent_build_ratio_from_points(points) if points else slope_ratio
+    silent_build_active = (
+        bool(points)
+        and silent_build_ratio >= 1.05
+        and retention_ratio >= 0.70
+        and pullback_ratio <= 0.30
+        and smoothness_proxy >= 0.45
+    )
 
     if slope_class in {"weak_up", "good_up", "strong_up"}:
         direction = "вверх"
@@ -92,6 +101,8 @@ def compute_oi_window_state(window_payload: dict[str, dict[str, dict] | None], w
         "oi_pullback_ratio": round(pullback_ratio, 6),
         "oi_retention_ratio": round(retention_ratio, 6),
         "oi_smoothness_proxy": round(smoothness_proxy, 6),
+        "oi_silent_build_ratio": round(silent_build_ratio, 6),
+        "oi_silent_build_active": silent_build_active,
         "oi_trajectory_points": len(points),
         "cycle_ts": row.get("source_cycle_ts") if row else None,
     }
@@ -114,8 +125,17 @@ def summarize_oi_window_states(oi_window_states: list[dict]) -> dict:
         "oi_stability_summary": _pick_summary(oi_window_states, "oi_stability", ["1ч", "4ч"]),
         "oi_retention_summary": _pick_summary(oi_window_states, "oi_retention", ["1ч", "4ч"]),
         "oi_breakdown_summary": _pick_summary(oi_window_states, "oi_breakdown", ["30м", "1ч", "4ч"]),
+        "oi_slope_class_15m": (by_window.get("15м") or {}).get("oi_slope_class", "flat"),
+        "oi_slope_class_30m": (by_window.get("30м") or {}).get("oi_slope_class", "flat"),
         "oi_slope_class_1h": (by_window.get("1ч") or {}).get("oi_slope_class", "flat"),
         "oi_slope_class_4h": (by_window.get("4ч") or {}).get("oi_slope_class", "flat"),
+        "oi_slope_ratio_15m": (by_window.get("15м") or {}).get("oi_slope_ratio", 1.0),
+        "oi_slope_ratio_30m": (by_window.get("30м") or {}).get("oi_slope_ratio", 1.0),
         "oi_slope_ratio_1h": (by_window.get("1ч") or {}).get("oi_slope_ratio", 1.0),
         "oi_slope_ratio_4h": (by_window.get("4ч") or {}).get("oi_slope_ratio", 1.0),
+        "oi_retention_ratio_1h": (by_window.get("1ч") or {}).get("oi_retention_ratio", 0.0),
+        "oi_pullback_ratio_1h": (by_window.get("1ч") or {}).get("oi_pullback_ratio", 1.0),
+        "oi_smoothness_proxy_1h": (by_window.get("1ч") or {}).get("oi_smoothness_proxy", 0.0),
+        "oi_silent_build_30m": bool((by_window.get("30м") or {}).get("oi_silent_build_active", False)),
+        "oi_silent_build_1h": bool((by_window.get("1ч") or {}).get("oi_silent_build_active", False)),
     }

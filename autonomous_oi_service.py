@@ -4,12 +4,16 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import json
 import math
+import time
+from pathlib import Path
 
 from db import (
+    active_universe_sql,
     execute,
     fetch,
     insert_oi_stage_history,
     insert_transition_history_v2,
+    prune_inactive_state_rows,
     replace_core_state_v2,
     replace_oi_core_state,
     replace_oi_window_state,
@@ -62,6 +66,9 @@ PATTERN_LABELS = {
     "рваный_хаос": "рваный_хаос",
     "поломка_набора": "поломка_набора",
 }
+
+RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
+AUTONOMOUS_OI_PROGRESS_PATH = RUNTIME_DIR / "autonomous_oi_progress.json"
 
 
 def attach_oi_trajectory_points(window_map_by_symbol: dict[tuple[str, str], dict[str, dict[str, dict]]]) -> None:
@@ -132,12 +139,36 @@ def attach_oi_trajectory_points(window_map_by_symbol: dict[tuple[str, str], dict
         oi_row["trajectory_candles"] = len(candles)
 
 
-def load_latest_window_map(cycle_ts: datetime | None = None) -> dict[tuple[str, str], dict[str, dict[str, dict]]]:
+def _window_source_table(window_source: str) -> str:
+    if window_source == "history":
+        return "aggregate_windows_history"
+    return "aggregate_windows"
+
+
+def _symbol_filter_sql(tracked_pairs: list[tuple[str, str]] | None) -> tuple[str, tuple]:
+    tracked = list(tracked_pairs or [])
+    if not tracked:
+        return "", ()
+    clauses = []
+    params: list[str] = []
+    for exchange, symbol in tracked:
+        clauses.append("(exchange = %s AND symbol = %s)")
+        params.extend([exchange, symbol])
+    return "AND (" + " OR ".join(clauses) + ")", tuple(params)
+
+
+def load_latest_window_map(
+    cycle_ts: datetime | None = None,
+    window_source: str = "hot",
+    tracked_pairs: list[tuple[str, str]] | None = None,
+) -> dict[tuple[str, str], dict[str, dict[str, dict]]]:
     params: tuple = ()
     cycle_filter = ""
     if cycle_ts is not None:
         cycle_filter = "AND (source_cycle_ts <= %s OR source_cycle_ts IS NULL)"
         params = (cycle_ts,)
+    symbol_filter_sql, symbol_filter_params = _symbol_filter_sql(tracked_pairs)
+    table_name = _window_source_table(window_source)
 
     rows = fetch(
         f"""
@@ -163,16 +194,18 @@ def load_latest_window_map(cycle_ts: datetime | None = None) -> dict[tuple[str, 
                     PARTITION BY metric, window_code, exchange, symbol
                     ORDER BY ts_close DESC
                 ) AS rn
-            FROM aggregate_windows
+            FROM {table_name}
             WHERE metric IN ('OI', 'PRICE', 'VOLUME')
               AND window_code = ANY(%s)
+              AND {active_universe_sql()}
+              {symbol_filter_sql}
               {cycle_filter}
         )
         SELECT *
         FROM ranked
         WHERE rn = 1
         """,
-        (WINDOWS, *params),
+        (WINDOWS, *symbol_filter_params, *params),
     )
 
     window_map: dict[tuple[str, str], dict[str, dict[str, dict]]] = defaultdict(lambda: defaultdict(dict))
@@ -181,6 +214,103 @@ def load_latest_window_map(cycle_ts: datetime | None = None) -> dict[tuple[str, 
         window_map[key][row["window_code"]][row["metric"]] = row
     attach_oi_trajectory_points(window_map)
     return window_map
+
+
+def load_source_cycle_timestamps(
+    end_ts: datetime,
+    start_exclusive: datetime | None = None,
+    window_source: str = "hot",
+    tracked_pairs: list[tuple[str, str]] | None = None,
+) -> list[datetime]:
+    symbol_filter_sql, symbol_filter_params = _symbol_filter_sql(tracked_pairs)
+    table_name = _window_source_table(window_source)
+    lower_filter = ""
+    params: list = list(symbol_filter_params)
+    if start_exclusive is not None:
+        lower_filter = "AND source_cycle_ts > %s"
+        params.append(start_exclusive)
+    params.append(end_ts)
+    rows = fetch(
+        f"""
+        SELECT source_cycle_ts
+        FROM {table_name}
+        WHERE source_cycle_ts IS NOT NULL
+          {symbol_filter_sql}
+          {lower_filter}
+          AND source_cycle_ts <= %s
+        GROUP BY source_cycle_ts
+        ORDER BY source_cycle_ts ASC
+        """,
+        tuple(params),
+    )
+    return [row["source_cycle_ts"] for row in rows]
+
+
+def load_window_updates_by_cycle(
+    cycle_timestamps: list[datetime],
+    window_source: str = "hot",
+    tracked_pairs: list[tuple[str, str]] | None = None,
+) -> dict[datetime, list[dict]]:
+    if not cycle_timestamps:
+        return {}
+    table_name = _window_source_table(window_source)
+    symbol_filter_sql, symbol_filter_params = _symbol_filter_sql(tracked_pairs)
+    rows = fetch(
+        f"""
+        SELECT
+            metric,
+            window_code,
+            ts_open,
+            ts_close,
+            exchange,
+            symbol,
+            open_value,
+            high_value,
+            low_value,
+            close_value,
+            sum_value,
+            avg_value,
+            delta_pct,
+            unique_candles,
+            source_cycle_ts,
+            built_at
+        FROM {table_name}
+        WHERE metric IN ('OI', 'PRICE', 'VOLUME')
+          AND window_code = ANY(%s)
+          AND source_cycle_ts IS NOT NULL
+          {symbol_filter_sql}
+          AND source_cycle_ts >= %s
+          AND source_cycle_ts <= %s
+        ORDER BY source_cycle_ts ASC, metric, window_code, exchange, symbol
+        """,
+        (WINDOWS, *symbol_filter_params, cycle_timestamps[0], cycle_timestamps[-1]),
+    )
+    by_cycle_ts: dict[datetime, list[dict]] = defaultdict(list)
+    for row in rows:
+        by_cycle_ts[row["source_cycle_ts"]].append(row)
+    return by_cycle_ts
+
+
+def load_autonomous_oi_progress() -> datetime | None:
+    if not AUTONOMOUS_OI_PROGRESS_PATH.exists():
+        return None
+    try:
+        payload = json.loads(AUTONOMOUS_OI_PROGRESS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    value = payload.get("last_source_cycle_ts")
+    return _parse_state_ts(value)
+
+
+def save_autonomous_oi_progress(last_source_cycle_ts: datetime | None) -> None:
+    if last_source_cycle_ts is None:
+        return
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"last_source_cycle_ts": last_source_cycle_ts.isoformat()}
+    AUTONOMOUS_OI_PROGRESS_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def load_previous_core_state_map() -> dict[tuple[str, str], dict]:
@@ -252,6 +382,8 @@ def apply_stage_guardrails(
     oi_summary: dict,
     price_summary: tuple[str, str, bool, int],
     volume_summary: tuple[str, str],
+    previous_stage_age_minutes: float,
+    trigger_age_minutes: float = 0.0,
 ) -> tuple[int, str]:
     return _apply_stage_guardrails_impl(
         previous_state,
@@ -259,6 +391,8 @@ def apply_stage_guardrails(
         oi_summary,
         price_summary,
         volume_summary,
+        previous_stage_age_minutes,
+        trigger_age_minutes,
     )
 
 
@@ -266,8 +400,75 @@ def compute_stage_age(previous_state: dict | None, target_stage: int, cycle_ts: 
     return _compute_stage_age_impl(previous_state, target_stage, cycle_ts)
 
 
-def compute_transition_permission(previous_state: dict | None, target_stage: int, stage_age_minutes: float, blocked_by_price: bool) -> str:
-    return _compute_transition_permission_impl(previous_state, target_stage, stage_age_minutes, blocked_by_price)
+def compute_transition_permission(
+    previous_state: dict | None,
+    target_stage: int,
+    stage_age_minutes: float,
+    oi_summary: dict,
+    price_summary: tuple[str, str, bool, int],
+    trigger_age_minutes: float = 0.0,
+) -> str:
+    return _compute_transition_permission_impl(
+        previous_state,
+        target_stage,
+        stage_age_minutes,
+        oi_summary,
+        price_summary,
+        trigger_age_minutes,
+    )
+
+
+def _parse_state_ts(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_growth_class(slope_class: str) -> bool:
+    return slope_class in {"weak_up", "good_up", "strong_up"}
+
+
+def _is_trigger_start_class(slope_class: str, slope_class_30m: str = "flat") -> bool:
+    del slope_class_30m
+    return slope_class in {"good_up", "strong_up"}
+
+
+def _resolve_growth_trigger_ts(
+    previous_state: dict | None,
+    oi_summary: dict,
+    price_summary: tuple[str, str, bool, int],
+    cycle_ts: datetime,
+) -> datetime | None:
+    previous_stage = int(previous_state.get("current_stage") or 0) if previous_state else 0
+    current_15m = str(oi_summary.get("oi_slope_class_15m") or "flat")
+    current_30m = str(oi_summary.get("oi_slope_class_30m") or "flat")
+    current_4h = str(oi_summary.get("oi_slope_class_4h") or "flat")
+    blocked_by_price = bool(price_summary[2])
+    previous_15m = str(previous_state.get("oi_slope_class_15m") or "flat") if previous_state else "flat"
+    trigger_ts = _parse_state_ts(previous_state.get("growth_trigger_ts")) if previous_state else None
+
+    if blocked_by_price or current_4h == "strong_down":
+        return None
+
+    if trigger_ts is not None:
+        if not _is_growth_class(current_15m) and not _is_growth_class(current_30m):
+            trigger_ts = None
+        else:
+            return trigger_ts
+
+    if previous_stage < 2 and _is_trigger_start_class(current_15m, current_30m) and not _is_growth_class(previous_15m):
+        return cycle_ts
+
+    if previous_stage <= 1 and trigger_ts is None and _is_trigger_start_class(current_15m, current_30m):
+        return cycle_ts
+
+    return trigger_ts
 
 
 def build_window_record(
@@ -316,6 +517,7 @@ def build_core_record(
     stage_age_minutes: float,
     cycle_ts: datetime,
     decision_reason: str,
+    trigger_ts: datetime | None,
 ) -> tuple:
     price_state, price_block, blocked_by_price, blocked_stage_max = price_summary
     volume_state, volume_confidence = volume_summary
@@ -350,11 +552,16 @@ def build_core_record(
         decision_reason,
         block_reason,
         breakdown_reason,
+        trigger_ts,
+        oi_summary["oi_slope_class_15m"],
+        oi_summary["oi_slope_class_30m"],
+        oi_summary["oi_slope_class_1h"],
+        oi_summary["oi_slope_class_4h"],
         cycle_ts,
     )
 
 
-def build_stage_history_record(previous_state: dict | None, exchange: str, symbol: str, target_stage: int, transition_permission: str, stage_age_minutes: float, cycle_ts: datetime, reason: str) -> tuple | None:
+def build_stage_history_record(previous_state: dict | None, exchange: str, symbol: str, target_stage: int, transition_permission: str, previous_stage_age_minutes: float, cycle_ts: datetime, reason: str) -> tuple | None:
     previous_stage = int(previous_state.get("current_stage") or 0) if previous_state else 0
     if previous_stage == target_stage:
         return None
@@ -365,7 +572,7 @@ def build_stage_history_record(previous_state: dict | None, exchange: str, symbo
         target_stage,
         reason,
         transition_permission != "нельзя",
-        round(stage_age_minutes, 2),
+        round(previous_stage_age_minutes, 2),
         cycle_ts,
     )
 
@@ -487,7 +694,7 @@ def build_transition_history_record_v2(
     symbol: str,
     target_stage: int,
     transition_permission: str,
-    stage_age_minutes: float,
+    previous_stage_age_minutes: float,
     cycle_ts: datetime,
     reason: str,
 ) -> tuple | None:
@@ -501,7 +708,7 @@ def build_transition_history_record_v2(
         target_stage,
         cycle_ts,
         transition_permission != "нельзя",
-        round(stage_age_minutes, 2),
+        round(previous_stage_age_minutes, 2),
         reason,
     )
 
@@ -540,15 +747,30 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
         raw_target_stage, decision_reason = determine_target_stage(oi_summary, price_summary, volume_summary)
 
         previous_state = previous_state_map.get((exchange, symbol))
+        previous_stage = int(previous_state.get("current_stage") or 0) if previous_state else 0
+        previous_stage_age_minutes = compute_stage_age(previous_state, previous_stage, cycle_ts) if previous_state else 0.0
+        trigger_ts = _resolve_growth_trigger_ts(previous_state, oi_summary, price_summary, cycle_ts)
+        trigger_age_minutes = 0.0
+        if trigger_ts is not None:
+            trigger_age_minutes = max(0.0, (cycle_ts - trigger_ts).total_seconds() / 60.0)
         target_stage, guard_reason = apply_stage_guardrails(
             previous_state,
             raw_target_stage,
             oi_summary,
             price_summary,
             volume_summary,
+            previous_stage_age_minutes,
+            trigger_age_minutes,
         )
         stage_age_minutes = compute_stage_age(previous_state, target_stage, cycle_ts)
-        transition_permission = compute_transition_permission(previous_state, target_stage, stage_age_minutes, price_summary[2])
+        transition_permission = compute_transition_permission(
+            previous_state,
+            target_stage,
+            stage_age_minutes,
+            oi_summary,
+            price_summary,
+            trigger_age_minutes,
+        )
         decision_reason = f"{decision_reason}; guard={guard_reason}"
 
         for index, window_code in enumerate(WINDOWS):
@@ -585,6 +807,7 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
                 stage_age_minutes,
                 cycle_ts,
                 decision_reason,
+                trigger_ts,
             )
         )
         core_rows_v2.append(
@@ -608,7 +831,7 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
             symbol,
             target_stage,
             transition_permission,
-            stage_age_minutes,
+            previous_stage_age_minutes,
             cycle_ts,
             decision_reason,
         )
@@ -620,7 +843,7 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
             symbol,
             target_stage,
             transition_permission,
-            stage_age_minutes,
+            previous_stage_age_minutes,
             cycle_ts,
             decision_reason,
         )
@@ -640,6 +863,11 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
             "blocked_by_price": price_summary[2],
             "blocked_stage_max": price_summary[3],
             "decision_reason": decision_reason,
+            "growth_trigger_ts": trigger_ts.isoformat() if trigger_ts else None,
+            "oi_slope_class_15m": oi_summary["oi_slope_class_15m"],
+            "oi_slope_class_30m": oi_summary["oi_slope_class_30m"],
+            "oi_slope_class_1h": oi_summary["oi_slope_class_1h"],
+            "oi_slope_class_4h": oi_summary["oi_slope_class_4h"],
         }
 
     next_state_map["__v2_rows__"] = {
@@ -881,18 +1109,104 @@ def compute_autonomous_oi_snapshot(
     )
 
 
+def compute_autonomous_oi_snapshot_incremental_to_cycle(
+    cycle_ts: datetime | None = None,
+    previous_state_map: dict[tuple[str, str], dict] | None = None,
+    last_source_cycle_ts: datetime | None = None,
+    tracked_pairs: list[tuple[str, str]] | None = None,
+    window_source: str = "hot",
+) -> tuple[list[tuple], list[tuple], list[tuple], dict[tuple[str, str], dict], datetime | None]:
+    cycle_ts = cycle_ts or datetime.now(timezone.utc)
+    if previous_state_map is None:
+        previous_state_map = load_previous_core_state_map()
+
+    source_cycles = load_source_cycle_timestamps(
+        cycle_ts,
+        start_exclusive=last_source_cycle_ts,
+        window_source=window_source,
+        tracked_pairs=tracked_pairs,
+    )
+    if not source_cycles:
+        return [], [], [], previous_state_map, last_source_cycle_ts
+    if last_source_cycle_ts is None:
+        source_cycles = [source_cycles[-1]]
+
+    latest_window_map = load_latest_window_map(
+        source_cycles[0],
+        window_source=window_source,
+        tracked_pairs=tracked_pairs,
+    )
+    updates_by_cycle = load_window_updates_by_cycle(
+        source_cycles,
+        window_source=window_source,
+        tracked_pairs=tracked_pairs,
+    )
+
+    final_core_rows: list[tuple] = []
+    final_window_rows: list[tuple] = []
+    all_history_rows: list[tuple] = []
+    final_core_rows_v2: list[tuple] = []
+    final_window_rows_v2: list[tuple] = []
+    all_history_rows_v2: list[tuple] = []
+    state_map = previous_state_map
+
+    for source_cycle in source_cycles:
+        for row in updates_by_cycle.get(source_cycle, []):
+            key = (row["exchange"], row["symbol"])
+            latest_window_map.setdefault(key, {})
+            latest_window_map[key].setdefault(row["window_code"], {})
+            latest_window_map[key][row["window_code"]][row["metric"]] = row
+
+        final_core_rows, final_window_rows, history_rows, state_map = compute_autonomous_oi_snapshot_from_latest_window_map(
+            latest_window_map,
+            cycle_ts=source_cycle,
+            previous_state_map=state_map,
+        )
+        all_history_rows.extend(history_rows)
+        v2_rows = state_map.get("__v2_rows__", {}) if isinstance(state_map, dict) else {}
+        final_core_rows_v2 = list(v2_rows.get("core_rows_v2", []))
+        final_window_rows_v2 = list(v2_rows.get("window_rows_v2", []))
+        all_history_rows_v2.extend(v2_rows.get("history_rows_v2", []))
+
+    if isinstance(state_map, dict):
+        state_map["__v2_rows__"] = {
+            "core_rows_v2": final_core_rows_v2,
+            "window_rows_v2": final_window_rows_v2,
+            "history_rows_v2": all_history_rows_v2,
+        }
+
+    return final_core_rows, final_window_rows, all_history_rows, state_map, source_cycles[-1]
+
+
 def run_autonomous_oi_service(cycle_ts: datetime | None = None) -> int:
     cycle_ts = cycle_ts or datetime.now(timezone.utc)
-    core_rows, window_rows, history_rows, next_state_map = compute_autonomous_oi_snapshot(cycle_ts=cycle_ts)
+    last_source_cycle_ts = load_autonomous_oi_progress()
+    core_rows, window_rows, history_rows, next_state_map, last_source_cycle_ts = compute_autonomous_oi_snapshot_incremental_to_cycle(
+        cycle_ts=cycle_ts,
+        last_source_cycle_ts=last_source_cycle_ts,
+    )
+    if not core_rows:
+        log("autonomous_oi_service ok: no_new_source_cycles")
+        return 0
     v2_rows = next_state_map.pop("__v2_rows__", {}) if isinstance(next_state_map, dict) else {}
 
+    prune_counts = prune_inactive_state_rows()
     replace_oi_core_state(core_rows)
     replace_oi_window_state(window_rows)
     insert_oi_stage_history(history_rows)
     replace_core_state_v2(v2_rows.get("core_rows_v2", []))
     replace_window_state_v2(v2_rows.get("window_rows_v2", []))
     insert_transition_history_v2(v2_rows.get("history_rows_v2", []))
-    update_post_stage_analytics(history_rows, cycle_ts)
+    if prune_counts:
+        log(
+            "prune_inactive_state_rows ok: "
+            + " ".join(f"{k}={v}" for k, v in prune_counts.items())
+        )
+    save_autonomous_oi_progress(last_source_cycle_ts)
+    post_stage_started = time.perf_counter()
+    update_post_stage_analytics(history_rows, last_source_cycle_ts or cycle_ts)
+    post_stage_seconds = time.perf_counter() - post_stage_started
+    log(f"post_stage_analytics_seconds={post_stage_seconds:.2f}")
     log(
         f"autonomous_oi_service ok: symbols={len(core_rows)} "
         f"windows={len(window_rows)} history={len(history_rows)}"

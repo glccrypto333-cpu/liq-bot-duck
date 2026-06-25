@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 import requests
-from config import BYBIT_BASE, BINANCE_BASE, BINANCE_UNIVERSE_SKIP_TOP, BYBIT_UNIVERSE_SKIP_TOP
+from config import BYBIT_BASE, BINANCE_BASE
 
 UA = {"User-Agent": "Mozilla/5.0 MightyDuck/1.0"}
 
@@ -90,21 +90,49 @@ def _norm_5m_close(ts_open: datetime) -> datetime:
 def _closed(ts_close: datetime) -> bool:
     return ts_close <= datetime.now(timezone.utc) - timedelta(seconds=30)
 
+def _is_usdc_pair(symbol: str | None) -> bool:
+    return "USDC" in str(symbol or "").upper()
+
 def fetch_bybit_symbols() -> list[str]:
+    """
+    Active universe rule:
+    - Bybit USDT linear contracts only
+    - exclude USDC-related pairs
+    - runtime limit is applied in main.py
+    """
     data = _get(f"{BYBIT_BASE}/v5/market/instruments-info", {"category": "linear", "limit": 1000})
-    symbols = [
+    allowed = {
         x["symbol"]
         for x in data.get("result", {}).get("list", [])
-        if x.get("status") == "Trading" and x.get("quoteCoin") == "USDT"
-    ]
-    return sorted(symbols)[BYBIT_UNIVERSE_SKIP_TOP:]
+        if x.get("status") == "Trading"
+        and x.get("quoteCoin") == "USDT"
+        and x.get("contractType") == "LinearPerpetual"
+        and not _is_usdc_pair(x.get("symbol"))
+    }
+
+    tickers = _get(f"{BYBIT_BASE}/v5/market/tickers", {"category": "linear"})
+    rows = []
+    for item in tickers.get("result", {}).get("list", []):
+        symbol = item.get("symbol")
+        if symbol not in allowed:
+            continue
+        try:
+            turnover_24h = float(item.get("turnover24h", 0) or 0)
+        except (TypeError, ValueError):
+            turnover_24h = 0.0
+        rows.append((turnover_24h, symbol))
+
+    if not rows:
+        return sorted(allowed)
+
+    rows.sort(reverse=True)
+    return [symbol for _, symbol in rows]
 
 def fetch_binance_symbols() -> list[str]:
     """
     Active universe rule:
     - Binance USDT perpetuals only
-    - sort by 24h quoteVolume
-    - skip TOP-50
+    - exclude USDC-related pairs
     - runtime limit is applied in main.py
     """
     exchange_info = _get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo")
@@ -114,6 +142,7 @@ def fetch_binance_symbols() -> list[str]:
         if x.get("status") == "TRADING"
         and x.get("quoteAsset") == "USDT"
         and x.get("contractType") == "PERPETUAL"
+        and not _is_usdc_pair(x.get("symbol"))
     }
 
     tickers = _get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr")
@@ -129,7 +158,7 @@ def fetch_binance_symbols() -> list[str]:
         rows.append((quote_volume, symbol))
 
     rows.sort(reverse=True)
-    return [symbol for _, symbol in rows[BINANCE_UNIVERSE_SKIP_TOP:]]
+    return [symbol for _, symbol in rows]
 
 def fetch_bybit_oi_5m(symbol: str, limit: int = 200) -> list[tuple]:
     data = _get(

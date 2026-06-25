@@ -34,3 +34,7 @@ runtime_reports/
 __pycache__/
 *.pyc
 scripts/
+*.db
+reports/
+archive/db_backups/
+archive/file_backups/

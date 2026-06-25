@@ -2,7 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/load_verification_db_env.sh"
+# Always pin the default verification contour explicitly so suite flags
+# are not misread by the sourced env-loader as a DB target name.
+source "${SCRIPT_DIR}/load_verification_db_env.sh" hot
 
 cd "${SCRIPT_DIR}"
 mkdir -p reports

@@ -121,6 +121,7 @@ ORDER BY
 
 print("\n=== RUNTIME REPORTS ===")
 reports = Path("runtime_reports")
+runtime_dir = Path("runtime")
 
 
 def read_json(name):
@@ -139,6 +140,19 @@ def read_json(name):
 
 runtime = read_json("runtime_health.json")
 cycle = read_json("cycle_status.json")
+
+print("\n=== LIVE PROCESS MARKERS ===")
+main_pid_path = runtime_dir / "main.pid"
+current_log_path = runtime_dir / "current_main_log.path"
+if main_pid_path.exists():
+    print(f"main_pid: {main_pid_path.read_text().strip()}")
+else:
+    print("main_pid: missing")
+
+if current_log_path.exists():
+    print(f"current_main_log: {current_log_path.read_text().strip()}")
+else:
+    print("current_main_log: missing")
 
 if runtime:
     for key in [

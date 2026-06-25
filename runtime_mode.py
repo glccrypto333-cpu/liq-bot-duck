@@ -10,3 +10,12 @@ def runtime_mode_flags() -> dict:
 def runtime_mode_text() -> str:
     flags = runtime_mode_flags()
     return " ".join(f"{k}={v}" for k, v in flags.items())
+
+
+
+def main() -> None:
+    print(runtime_mode_text())
+
+
+if __name__ == "__main__":
+    main()

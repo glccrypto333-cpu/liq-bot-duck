@@ -28,6 +28,7 @@ from config import (
     MAX_COLLECT_SECONDS_FOR_AGGREGATES,
 )
 from logger import log
+from time_utils import iso_мск, текст_мск
 from db import init_db, upsert_oi, upsert_price, upsert_volume, cleanup_old, migrate_canonical_ts_close, replace_active_universe, replace_request_failures, load_quarantine_symbols, fetch
 from exchange_clients import (
     fetch_bybit_symbols,
@@ -39,10 +40,11 @@ from exchange_clients import (
     get_request_stats,
     reset_request_stats,
 )
-from aggregation_engine import rebuild_aggregate_windows
+from aggregation_engine import rebuild_aggregate_windows, rebuild_latest_aggregate_windows
 from autonomous_oi_service import run_autonomous_oi_service
+from cycle_cadence import should_run_this_cycle, should_run_maintenance_this_cycle
 from export_engine import rebuild_exports
-from telegram_bot import start_polling, send_panel_message
+from telegram_bot import start_polling, send_panel_message, check_stage3_alerts
 from runtime_mode import runtime_mode_text
 from raw_validate import validate_collected_raw
 
@@ -52,6 +54,18 @@ class CycleStop(RuntimeError):
         super().__init__(message)
         self.stop_reason = stop_reason
         self.severity = severity
+
+
+def _aligned_cycle_sleep_seconds(elapsed: float) -> float:
+    cadence_seconds = max(60, ИНТЕРВАЛ_ЦИКЛА_СЕК)
+    offset_seconds = max(0.0, float(os.getenv("CYCLE_ALIGN_OFFSET_SECONDS", "5")))
+    now_epoch = time.time()
+    next_boundary_epoch = ((int(now_epoch) // cadence_seconds) + 1) * cadence_seconds + offset_seconds
+    sleep_seconds = max(0.0, next_boundary_epoch - now_epoch)
+    # Не даем планировщику перескочить через целую свечу из-за offset.
+    if sleep_seconds > cadence_seconds + offset_seconds:
+        sleep_seconds = max(0.0, cadence_seconds - elapsed)
+    return sleep_seconds
 
 
 def _validate_runtime_contract() -> None:
@@ -76,7 +90,7 @@ def _write_runtime_timing_report(timings: list[tuple[str, float]]) -> None:
 
     total = sum(seconds for _, seconds in timings)
     lines = [
-        f"generated_at={datetime.now(timezone.utc).isoformat()}",
+        f"generated_at={iso_мск()}",
         f"total_seconds={round(total, 2)}",
         "",
         "step,seconds",
@@ -106,15 +120,15 @@ def _write_runtime_health_snapshot(
         "\n".join([
             f"watchdog_health={watchdog_health}",
             f"watchdog_streaks={watchdog_streaks}",
-            f"updated_at_utc={datetime.now(timezone.utc).isoformat()}",
+            f"updated_at_utc={iso_мск()}",
         ]) + "\n"
     )
 
     rss_mb = _runtime_memory_mb()
     rss_health = "ok"
-    if rss_mb >= float(os.getenv("RSS_CRITICAL_MB", "512")):
+    if rss_mb >= float(os.getenv("RSS_CRITICAL_MB", "1024")):
         rss_health = "critical"
-    elif rss_mb >= float(os.getenv("RSS_WARNING_MB", "256")):
+    elif rss_mb >= float(os.getenv("RSS_WARNING_MB", "768")):
         rss_health = "warning"
 
     collect_seconds = next((seconds for name, seconds in timings if name == "collect"), 0.0)
@@ -137,7 +151,7 @@ def _write_runtime_health_snapshot(
 
     timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
     runtime_health = {
-        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "updated_at_utc": iso_мск(),
         "app_version": APP_VERSION,
         "pid": os.getpid(),
         "rss_mb": round(rss_mb, 2),
@@ -684,6 +698,9 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
                 details = stderr or stdout or f"returncode={completed.returncode}"
                 raise RuntimeError(f"{name} subprocess failed: {details}")
             result_text = (completed.stdout or "").strip().splitlines()
+            for stdout_line in result_text[:-1]:
+                if "post_stage_analytics_seconds=" in stdout_line:
+                    log(stdout_line)
             result = int(result_text[-1]) if result_text else 0
             elapsed = time.time() - started
             timings.append((name, elapsed))
@@ -695,12 +712,24 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
                 f"memory_rss_mb={_runtime_memory_mb():.2f} memory_peak_rss_mb={_runtime_memory_peak_mb():.2f}"
             )
             return result
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             _timed_watchdog_step._inflight.discard(name)
             elapsed = time.time() - started
             timings.append((name, elapsed))
             streak = _timed_watchdog_step._timeout_streaks.get(name, 0) + 1
             _timed_watchdog_step._timeout_streaks[name] = streak
+            stdout_tail = (exc.stdout or "").strip().splitlines()[-20:]
+            stderr_tail = (exc.stderr or "").strip().splitlines()[-20:]
+            if stdout_tail:
+                log(
+                    f"WATCHDOG_TIMEOUT_STDOUT step={name} "
+                    f"lines={len(stdout_tail)} tail={' || '.join(stdout_tail)}"
+                )
+            if stderr_tail:
+                log(
+                    f"WATCHDOG_TIMEOUT_STDERR step={name} "
+                    f"lines={len(stderr_tail)} tail={' || '.join(stderr_tail)}"
+                )
             log(
                 f"WATCHDOG_TIMEOUT "
                 f"step={name} elapsed={elapsed:.2f}s "
@@ -779,9 +808,22 @@ def _require_watchdog_success(step_name: str, result: int) -> int:
     return result
 
 
+def _cycle_period_from_env(env_name: str, default_value: int) -> int:
+    raw_value = os.getenv(env_name, str(default_value)).strip()
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default_value
+    return max(1, parsed)
+
+
 def background(bybit_symbols, binance_symbols):
     last_export = 0.0
     cycle_no = 0
+    aggregate_full_rebuild_every_cycles = _cycle_period_from_env("AGGREGATES_FULL_REBUILD_EVERY_CYCLES", 6)
+    aggregate_validate_every_cycles = _cycle_period_from_env("AGGREGATES_VALIDATE_EVERY_CYCLES", 6)
+    db_universe_check_every_cycles = _cycle_period_from_env("DB_UNIVERSE_CHECK_EVERY_CYCLES", 12)
+    cleanup_old_every_cycles = _cycle_period_from_env("CLEANUP_OLD_EVERY_CYCLES", 6)
 
     while True:
         cycle_no += 1
@@ -789,38 +831,63 @@ def background(bybit_symbols, binance_symbols):
         stop_reason = "ok"
         stop_severity = "ok"
         stage3_alert_count = -1
+        agg_count = 0
         timings = []
         try:
             collect_batch = _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
             collect_batch = _timed_step(timings, "raw_validate", lambda: validate_collected_raw(collect_batch, bybit_symbols, binance_symbols))
             _timed_step(timings, "insert_raw", lambda: insert_collected_raw(collect_batch))
+            source_cycle_ts = collect_batch.get("cycle_ts")
+            if source_cycle_ts is None:
+                raise CycleStop("missing_collect_cycle_ts", "lower contour stopped: collect batch missing cycle_ts")
+            _timed_step(timings, "aggregates_hot", lambda: rebuild_latest_aggregate_windows(source_cycle_ts))
             collect_seconds = next((seconds for name, seconds in timings if name == "collect"), 0.0)
 
+            autonomous_oi_count = _timed_watchdog_step(
+                timings,
+                "autonomous_oi_service",
+                run_autonomous_oi_service,
+                "WATCHDOG_AUTONOMOUS_OI_SECONDS",
+                60,
+            )
+            _require_watchdog_success("autonomous_oi_service", autonomous_oi_count)
+            stage3_alert_count = _timed_step(timings, "stage3_alerts", check_stage3_alerts)
+
             if os.getenv("SKIP_HEAVY_AGGREGATES") == "1":
-                raise CycleStop("aggregates_skipped_by_env", "lower contour stopped: SKIP_HEAVY_AGGREGATES=1")
+                log("aggregates_full skipped: SKIP_HEAVY_AGGREGATES=1")
             elif collect_seconds > MAX_COLLECT_SECONDS_FOR_AGGREGATES:
-                raise CycleStop(
-                    "collect_too_slow_for_aggregates",
-                    f"lower contour stopped: collect too slow {collect_seconds:.2f}s > {MAX_COLLECT_SECONDS_FOR_AGGREGATES}s",
+                log(
+                    "aggregates_full skipped: "
+                    f"collect too slow {collect_seconds:.2f}s > {MAX_COLLECT_SECONDS_FOR_AGGREGATES}s"
                 )
+            elif cycle_no % aggregate_full_rebuild_every_cycles == 0:
+                expected_full_seconds = float(os.getenv("AGGREGATES_FULL_EXPECTED_SECONDS", "190"))
+                full_reserve_seconds = float(os.getenv("AGGREGATES_FULL_RESERVE_SECONDS", "20"))
+                elapsed_before_full = time.time() - cycle_started
+                if elapsed_before_full + expected_full_seconds + full_reserve_seconds > ИНТЕРВАЛ_ЦИКЛА_СЕК:
+                    log(
+                        "aggregates_full skipped: "
+                        f"cycle budget elapsed={elapsed_before_full:.2f}s "
+                        f"expected={expected_full_seconds:.2f}s "
+                        f"reserve={full_reserve_seconds:.2f}s "
+                        f"interval={ИНТЕРВАЛ_ЦИКЛА_СЕК}s"
+                    )
+                else:
+                    agg_count = _timed_watchdog_step(
+                        timings,
+                        "aggregates_full",
+                        rebuild_aggregate_windows,
+                        "WATCHDOG_AGGREGATES_SECONDS",
+                        150,
+                    )
+                    _require_watchdog_success("aggregates_full", agg_count)
             else:
-                agg_count = _timed_watchdog_step(
-                    timings,
-                    "aggregates",
-                    rebuild_aggregate_windows,
-                    "WATCHDOG_AGGREGATES_SECONDS",
-                    150,
-                )
-                _require_watchdog_success("aggregates", agg_count)
+                log(f"aggregates_full skipped: cycle={cycle_no} every={aggregate_full_rebuild_every_cycles}")
+
+            if cycle_no % aggregate_validate_every_cycles == 0:
                 _timed_step(timings, "aggregates_validate", validate_aggregate_windows)
-                autonomous_oi_count = _timed_watchdog_step(
-                    timings,
-                    "autonomous_oi_service",
-                    run_autonomous_oi_service,
-                    "WATCHDOG_AUTONOMOUS_OI_SECONDS",
-                    60,
-                )
-                _require_watchdog_success("autonomous_oi_service", autonomous_oi_count)
+            else:
+                log(f"aggregates_validate skipped: cycle={cycle_no} every={aggregate_validate_every_cycles}")
             audit_count = -1
             if os.getenv("ENABLE_RUNTIME_VALIDATION_AUDIT") == "1":
                 log("validation_audit skipped: legacy audit_engine archived")
@@ -845,9 +912,9 @@ def background(bybit_symbols, binance_symbols):
             log(f"cycle timing: {timing_text}")
             rss_mb = _runtime_memory_mb()
             rss_health = "ok"
-            if rss_mb >= float(os.getenv("RSS_CRITICAL_MB", "512")):
+            if rss_mb >= float(os.getenv("RSS_CRITICAL_MB", "1024")):
                 rss_health = "critical"
-            elif rss_mb >= float(os.getenv("RSS_WARNING_MB", "256")):
+            elif rss_mb >= float(os.getenv("RSS_WARNING_MB", "768")):
                 rss_health = "warning"
 
             if rss_health != "ok":
@@ -874,7 +941,7 @@ def background(bybit_symbols, binance_symbols):
                 "\n".join([
                     f"watchdog_health={watchdog_health}",
                     f"watchdog_streaks={watchdog_streaks}",
-                    f"updated_at_utc={datetime.now(timezone.utc).isoformat()}",
+                    f"updated_at_utc={iso_мск()}",
                 ]) + "\n"
             )
 
@@ -897,7 +964,7 @@ def background(bybit_symbols, binance_symbols):
                 runtime_alerts.append(f"collect_reserve_{collect_reserve_health}")
 
             runtime_health = {
-                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "updated_at_utc": iso_мск(),
                 "app_version": APP_VERSION,
                 "pid": os.getpid(),
                 "rss_mb": round(rss_mb, 2),
@@ -967,6 +1034,7 @@ def background(bybit_symbols, binance_symbols):
             log(
                 f"oi runtime cycle ok: aggregates={agg_count} "
                 f"autonomous_oi={autonomous_oi_count} "
+                f"stage3_alerts={stage3_alert_count} "
                 f"audit={audit_count} "
                 f"legacy_research={research_count} "
                 f"legacy_silence={silence_count} "
@@ -976,7 +1044,13 @@ def background(bybit_symbols, binance_symbols):
                 f"legacy_phase_source={phase_source_count} "
                 f"legacy_phase={phase_count}"
             )
-            _log_db_universe_check()
+            if should_run_maintenance_this_cycle(cycle_no, db_universe_check_every_cycles):
+                _timed_step(timings, "db_universe_check", _log_db_universe_check)
+            else:
+                log(
+                    "db universe check skipped: "
+                    f"cycle={cycle_no} every={db_universe_check_every_cycles}"
+                )
 
         except CycleStop as exc:
             stop_reason = exc.stop_reason
@@ -989,7 +1063,13 @@ def background(bybit_symbols, binance_symbols):
             log(traceback.format_exc())
 
         try:
-            _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
+            if should_run_maintenance_this_cycle(cycle_no, cleanup_old_every_cycles):
+                _timed_step(timings, "cleanup_old", lambda: cleanup_old(ДНЕЙ_ХРАНЕНИЯ))
+            else:
+                log(
+                    "cleanup_old skipped: "
+                    f"cycle={cycle_no} every={cleanup_old_every_cycles}"
+                )
         except Exception as exc:
             if stop_reason == "ok":
                 stop_reason = "cleanup_old_failed"
@@ -1017,7 +1097,7 @@ def background(bybit_symbols, binance_symbols):
         else:
             background._overrun_streak = 0
 
-        sleep_seconds = max(0, ИНТЕРВАЛ_ЦИКЛА_СЕК - elapsed)
+        sleep_seconds = _aligned_cycle_sleep_seconds(elapsed)
 
         cycle_health = "ok"
         if stop_reason != "ok":
@@ -1049,7 +1129,7 @@ def background(bybit_symbols, binance_symbols):
 
         Path("runtime_reports").mkdir(exist_ok=True)
         cycle_status = {
-            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "updated_at_utc": iso_мск(),
             "cycle_target_seconds": ИНТЕРВАЛ_ЦИКЛА_СЕК,
             "cycle_elapsed_seconds": round(elapsed, 2),
             "cycle_sleep_seconds": round(sleep_seconds, 2),
@@ -1077,6 +1157,7 @@ def main():
     log(
         "runtime env: "
         f"cycle_interval={ИНТЕРВАЛ_ЦИКЛА_СЕК}s "
+        f"cycle_align_offset={os.getenv('CYCLE_ALIGN_OFFSET_SECONDS', '5')}s "
         f"skip_heavy={os.getenv('SKIP_HEAVY_AGGREGATES')} "
         f"skip_stage2={os.getenv('SKIP_STAGE2_REBUILDS')} "
         f"force_stage2={os.getenv('FORCE_STAGE2_WITH_STALE_AGGREGATES')} "
@@ -1099,7 +1180,7 @@ def main():
         СТАРТОВОЕ_СООБЩЕНИЕ.format(
             version=APP_VERSION,
             retention=ДНЕЙ_ХРАНЕНИЯ,
-            started_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            started_at=текст_мск(),
         )
     )
     log("Telegram OK")
@@ -1109,27 +1190,20 @@ def main():
 
     bad_symbols = load_quarantine_symbols(95.0)
 
-    bybit_symbols = [
-        s for s in bybit_symbols_all
-        if ("BYBIT", s) not in bad_symbols
-    ]
+    # Universe must stay visible: bad coverage is diagnostics, not a hidden symbol filter.
+    bybit_symbols = list(bybit_symbols_all)
     if ЛИМИТ_СИМВОЛОВ_BYBIT > 0:
         bybit_symbols = bybit_symbols[:ЛИМИТ_СИМВОЛОВ_BYBIT]
 
-    binance_symbols_filtered = [
-        s for s in binance_symbols_all
-        if ("BINANCE", s) not in bad_symbols
-    ]
-
     binance_symbols = (
-        binance_symbols_filtered
+        binance_symbols_all
         if ЛИМИТ_СИМВОЛОВ_BINANCE <= 0
-        else binance_symbols_filtered[:ЛИМИТ_СИМВОЛОВ_BINANCE]
+        else binance_symbols_all[:ЛИМИТ_СИМВОЛОВ_BINANCE]
     )
 
     active_universe = (
-        [("BYBIT", s, "runtime_limit_quarantine_filtered") for s in bybit_symbols] +
-        [("BINANCE", s, "runtime_limit_quarantine_filtered") for s in binance_symbols]
+        [("BYBIT", s, "runtime_limit_usdc_filtered") for s in bybit_symbols] +
+        [("BINANCE", s, "runtime_limit_usdc_filtered") for s in binance_symbols]
     )
     replace_active_universe(active_universe)
 
@@ -1137,7 +1211,7 @@ def main():
     log(f"Binance symbols: {len(binance_symbols_all)}")
     log(f"Limits: bybit={ЛИМИТ_СИМВОЛОВ_BYBIT}, binance={ЛИМИТ_СИМВОЛОВ_BINANCE}")
     log(f"Active universe: bybit={len(bybit_symbols)} binance={len(binance_symbols)} total={len(active_universe)}")
-    log(f"Quarantine symbols excluded: {len(bad_symbols)}")
+    log(f"Quarantine symbols observed, not excluded: {len(bad_symbols)}")
 
     threading.Thread(target=background, args=(bybit_symbols, binance_symbols), daemon=True).start()
 

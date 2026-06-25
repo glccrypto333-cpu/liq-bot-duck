@@ -30,6 +30,28 @@ def _validate_raw_rows(name: str, rows: list[tuple], expected_len: int) -> None:
                 raise RuntimeError(f"raw_validate failed: {name} null value index={i} symbol={symbol}")
 
 
+def _format_missing_details(missing_keys: set[tuple[str, str]]) -> str:
+    if not missing_keys:
+        return "missing_exchange_counts=none missing_sample=none"
+
+    exchange_counts: dict[str, int] = {}
+    for exchange, _symbol in missing_keys:
+        exchange_counts[exchange] = exchange_counts.get(exchange, 0) + 1
+
+    exchange_summary = ",".join(
+        f"{exchange}:{exchange_counts[exchange]}"
+        for exchange in sorted(exchange_counts)
+    )
+    sample = ",".join(
+        f"{exchange}:{symbol}"
+        for exchange, symbol in sorted(missing_keys)[:8]
+    )
+    return (
+        f"missing_exchange_counts={exchange_summary} "
+        f"missing_sample={sample}"
+    )
+
+
 def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binance: list[str]) -> dict:
     if not batch:
         raise RuntimeError("raw_validate failed: empty collect batch")
@@ -76,6 +98,7 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
                 "raw_validate tolerated partial collect: "
                 f"missing_price={len(missing_price)} "
                 f"missing_volume={len(missing_volume)} "
+                f"{_format_missing_details(missing_price)} "
                 f"tolerance_abs={tolerated_price_volume_missing} "
                 f"tolerance_pct={tolerated_price_volume_missing_pct:.4f} "
                 f"tolerance_limit={tolerated_price_volume_missing_limit}"
@@ -86,6 +109,7 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
                 f"missing_oi={len(missing_oi)} "
                 f"missing_price={len(missing_price)} "
                 f"missing_volume={len(missing_volume)} "
+                f"{_format_missing_details(missing_price if missing_price == missing_volume else missing_price | missing_volume)} "
                 f"tolerance_limit={tolerated_price_volume_missing_limit}"
             )
 

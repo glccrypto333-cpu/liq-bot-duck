@@ -3,38 +3,97 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
-OI_POSITIVE_START = {"weak_up", "good_up", "strong_up"}
-OI_WORKING_SET = {"good_up", "strong_up"}
-OI_SUPPORTING_4H = {"weak_up", "good_up", "strong_up"}
-OI_STRONG_SET = {"strong_up"}
-OI_NON_DEGRADING_1H = {"flat", "weak_up", "good_up", "strong_up"}
-PRICE_HARD_BAN = "ломает_сценарий"
-PHASE1_MIN_AGE_MINUTES = 60.0
+OI_GROWTH_SET = {"weak_up", "good_up", "strong_up"}
+OI_MATURE_SET = {"good_up", "strong_up"}
+OI_DECLINE_SET = {"weak_down", "strong_down"}
+PRICE_HARD_BAN = "цена_4ч_сильно_вниз"
+PRICE_STAGE3_BAN = "цена_4ч_слабо_вниз"
+PHASE1_MIN_AGE_MINUTES = 30.0
 PHASE2_MIN_AGE_MINUTES = 30.0
+TRIGGER_TO_STAGE2_MINUTES = 30.0
+TRIGGER_TO_STAGE3_MINUTES = 60.0
 
 
-def _oi_classes(oi_summary: dict) -> tuple[str, str]:
+def _oi_classes(oi_summary: dict) -> tuple[str, str, str, str]:
     return (
+        str(oi_summary.get("oi_slope_class_15m") or "flat"),
+        str(oi_summary.get("oi_slope_class_30m") or "flat"),
         str(oi_summary.get("oi_slope_class_1h") or "flat"),
         str(oi_summary.get("oi_slope_class_4h") or "flat"),
     )
 
 
-def determine_target_stage(oi_summary: dict, price_summary: tuple[str, str, bool, int], volume_summary: tuple[str, str]) -> tuple[int, str]:
+def _is_growth(slope_class: str) -> bool:
+    return slope_class in OI_GROWTH_SET
+
+
+def _is_mature_growth(slope_class: str) -> bool:
+    return slope_class in OI_MATURE_SET
+
+
+def _is_decline(slope_class: str) -> bool:
+    return slope_class in OI_DECLINE_SET
+
+
+def _is_4h_hard_decline(slope_class: str) -> bool:
+    return slope_class == "strong_down"
+
+
+def _is_15m_hard_negative_for_fresh_stage3(slope_class: str) -> bool:
+    return slope_class == "strong_down"
+
+
+def _has_live_build(oi_summary: dict) -> bool:
+    _oi_15m, oi_30m, oi_1h, oi_4h = _oi_classes(oi_summary)
+    return (
+        _is_growth(oi_30m)
+        and not _is_decline(oi_1h)
+        and not _is_4h_hard_decline(oi_4h)
+    )
+
+
+def _has_mature_build(oi_summary: dict) -> bool:
+    oi_15m, oi_30m, oi_1h, oi_4h = _oi_classes(oi_summary)
+    return (
+        _is_mature_growth(oi_30m)
+        and _is_growth(oi_1h)
+        and not _is_15m_hard_negative_for_fresh_stage3(oi_15m)
+        and not _is_4h_hard_decline(oi_4h)
+    )
+
+
+def _price_block(price_summary: tuple[str, str, bool, int]) -> tuple[str, bool]:
+    price_state, _price_block, blocked_by_price, _blocked_stage_max = price_summary
+    return price_state, bool(blocked_by_price)
+
+
+def _price_stage3_block(price_state: str) -> bool:
+    return price_state == PRICE_STAGE3_BAN
+
+
+def determine_target_stage(
+    oi_summary: dict,
+    price_summary: tuple[str, str, bool, int],
+    volume_summary: tuple[str, str],
+) -> tuple[int, str]:
     del volume_summary
-    price_state, _, blocked_by_price, _blocked_stage_max = price_summary
-    oi_1h, oi_4h = _oi_classes(oi_summary)
+
+    oi_15m, oi_30m, oi_1h, oi_4h = _oi_classes(oi_summary)
+    price_state, blocked_by_price = _price_block(price_summary)
 
     if blocked_by_price:
-        return 0, f"price={price_state}; hard_ban"
-
-    if oi_1h in OI_STRONG_SET and oi_4h in OI_WORKING_SET:
-        return 3, f"oi_1h={oi_1h}; oi_4h={oi_4h}; aggressive"
-    if oi_1h in OI_WORKING_SET and oi_4h not in {"weak_down", "strong_down"}:
-        return 2, f"oi_1h={oi_1h}; oi_4h={oi_4h}; working"
-    if oi_1h in OI_POSITIVE_START:
-        return 1, f"oi_1h={oi_1h}; early_positive"
-    return 0, f"oi_1h={oi_1h}; outside"
+        return 0, f"{PRICE_HARD_BAN}:{price_state}"
+    if _is_4h_hard_decline(oi_4h):
+        return 0, f"oi_4ч={oi_4h}; жесткий_старший_блок"
+    if _price_stage3_block(price_state):
+        if _has_live_build(oi_summary):
+            return 2, "цена_4ч_слабо_вниз:выше_2_не_пускаем"
+        return 1, "цена_4ч_слабо_вниз:ждем_живой_набор"
+    if _has_mature_build(oi_summary):
+        return 3, "30м_зрелое_1ч_подтверждает_силу"
+    if _has_live_build(oi_summary):
+        return 2, "30м_подтвердило_живой_набор"
+    return 1, "жесткий_запрет_снят"
 
 
 def apply_stage_guardrails(
@@ -43,55 +102,80 @@ def apply_stage_guardrails(
     oi_summary: dict,
     price_summary: tuple[str, str, bool, int],
     volume_summary: tuple[str, str],
+    previous_stage_age_minutes: float,
+    trigger_age_minutes: float = 0.0,
 ) -> tuple[int, str]:
     del volume_summary
-    previous_stage = int(previous_state.get("current_stage") or 0) if previous_state else 0
-    previous_age = float(previous_state.get("oi_stage_age_minutes") or 0.0) if previous_state else 0.0
-    price_state, _, blocked_by_price, _blocked_stage_max = price_summary
-    oi_1h, oi_4h = _oi_classes(oi_summary)
 
-    # Stage 3 is operator-owned: no automatic downgrade by any service.
+    previous_stage = int(previous_state.get("current_stage") or 0) if previous_state else 0
+    effective_previous_age = float(previous_stage_age_minutes or 0.0)
+    effective_trigger_age = float(trigger_age_minutes or 0.0)
+    oi_15m, oi_30m, oi_1h, oi_4h = _oi_classes(oi_summary)
+    price_state, blocked_by_price = _price_block(price_summary)
+
     if previous_stage == 3:
-        return 3, "manual_hold_stage_3"
+        if _is_decline(oi_4h):
+            return 0, f"сброс_3_0:oi_4ч={oi_4h}"
+        if blocked_by_price:
+            return 1, f"снижение_3_1:цена_4ч={price_state}"
+        if _price_stage3_block(price_state):
+            return 2, f"снижение_3_2:цена_4ч={price_state}"
+        return 3, "удержание_3:только_ручной_или_по_oi_4ч"
 
     if blocked_by_price:
         if previous_stage >= 2:
-            return 1, f"price_hard_ban:{price_state}; degrade_2_to_1"
-        return 0, f"price_hard_ban:{price_state}; degrade_to_0"
+            return 1, f"снижение_2_1:цена_4ч={price_state}"
+        return 0, f"снижение_1_0:цена_4ч={price_state}"
 
-    if target_stage <= 0:
-        if previous_stage >= 2 and oi_4h in OI_SUPPORTING_4H and oi_1h in OI_NON_DEGRADING_1H:
-            return 1, "degrade_2_to_1_soft"
-        if previous_stage == 1 and oi_4h in OI_SUPPORTING_4H and oi_1h in OI_NON_DEGRADING_1H:
-            return 1, "hold_phase_1_hysteresis"
-        return 0, "outside_phase_model"
-
-    if target_stage == 1:
-        if oi_1h in OI_POSITIVE_START:
-            return 1, "phase_1_early_positive"
-        return 0, "phase_1_not_confirmed"
-
-    if target_stage == 2:
+    if _is_4h_hard_decline(oi_4h):
         if previous_stage >= 2:
-            return 2, "hold_phase_2"
-        if previous_stage >= 1 and previous_age >= PHASE1_MIN_AGE_MINUTES and oi_1h in OI_WORKING_SET and oi_4h not in {"weak_down", "strong_down"}:
-            return 2, "promote_1_to_2"
-        if oi_1h in OI_POSITIVE_START:
-            return 1, "seed_phase_1_before_phase_2"
-        return 0, "no_base_for_phase_2"
+            return 1, f"снижение_2_1:oi_4ч={oi_4h}"
+        return 0, f"снижение_1_0:oi_4ч={oi_4h}"
 
-    if target_stage >= 3:
-        if previous_stage >= 2 and previous_age >= PHASE2_MIN_AGE_MINUTES and oi_1h in OI_STRONG_SET and oi_4h in OI_WORKING_SET:
-            return 3, "promote_2_to_3"
+    if _is_decline(oi_30m):
         if previous_stage >= 2:
-            return 2, "hold_phase_2_before_phase_3"
-        if previous_stage == 1 and previous_age >= PHASE1_MIN_AGE_MINUTES and oi_4h in OI_WORKING_SET:
-            return 2, "promote_1_to_2_before_phase_3"
-        if oi_1h in OI_POSITIVE_START:
-            return 1, "seed_phase_1_before_phase_3"
-        return 0, "no_base_for_phase_3"
+            return 1, f"снижение_2_1:oi_30м={oi_30m}"
+        return 1 if previous_stage == 1 else 1, "удержание_1:нет_живого_набора"
 
-    return 0, "fallback_to_0"
+    if _is_decline(oi_1h):
+        if previous_stage >= 2:
+            return 1, f"снижение_2_1:oi_1ч={oi_1h}"
+        return 1 if previous_stage == 1 else 1, "удержание_1:нет_живого_набора"
+
+    if previous_stage <= 0:
+        return 1, "вход_в_1:жесткий_запрет_снят"
+
+    if previous_stage == 1:
+        if target_stage < 2:
+            return 1, "удержание_1:нет_живого_набора"
+        if not _is_growth(oi_15m):
+            return 1, "удержание_1:15м_не_подтвердило_старт"
+        if not _is_mature_growth(oi_30m):
+            return 1, "удержание_1:30м_еще_не_зрелое"
+        if oi_15m == "weak_up" and oi_1h != "strong_up":
+            return 1, "удержание_1:1ч_еще_не_сильный"
+        if effective_trigger_age < TRIGGER_TO_STAGE2_MINUTES:
+            return 1, "удержание_1:ждем_30_минут_от_триггера"
+        if effective_previous_age < PHASE1_MIN_AGE_MINUTES:
+            return 1, "удержание_1:ждем_30_минут"
+        return 2, "переход_1_2:30м_подтвердило_живой_набор"
+
+    if previous_stage == 2:
+        if _price_stage3_block(price_state):
+            return 2, f"удержание_2:цена_4ч={price_state}"
+        if target_stage <= 1:
+            return 1, "снижение_2_1:живой_набор_умер"
+        if target_stage == 2:
+            if _is_15m_hard_negative_for_fresh_stage3(oi_15m):
+                return 2, "удержание_2:15м_локально_слабое"
+            return 2, "удержание_2:30м_или_1ч_еще_не_созрели"
+        if effective_previous_age < PHASE2_MIN_AGE_MINUTES:
+            return 2, "удержание_2:ждем_30_минут"
+        if effective_trigger_age < TRIGGER_TO_STAGE3_MINUTES:
+            return 2, "удержание_2:ждем_1ч_от_триггера"
+        return 3, "переход_2_3:30м_зрелое_1ч_подтверждает_силу"
+
+    return 1, "fallback_в_1"
 
 
 def compute_stage_age(previous_state: dict | None, target_stage: int, cycle_ts: datetime) -> float:
@@ -110,28 +194,63 @@ def compute_stage_age(previous_state: dict | None, target_stage: int, cycle_ts: 
     return previous_age + delta_minutes
 
 
-def compute_transition_permission(previous_state: dict | None, target_stage: int, stage_age_minutes: float, blocked_by_price: bool) -> str:
+def compute_transition_permission(
+    previous_state: dict | None,
+    target_stage: int,
+    stage_age_minutes: float,
+    oi_summary: dict,
+    price_summary: tuple[str, str, bool, int],
+    trigger_age_minutes: float = 0.0,
+) -> str:
     previous_stage = int(previous_state.get("current_stage") or 0) if previous_state else 0
-    previous_age = float(previous_state.get("oi_stage_age_minutes") or 0.0) if previous_state else 0.0
+    effective_age = float(stage_age_minutes or 0.0)
+    effective_trigger_age = float(trigger_age_minutes or 0.0)
+    oi_15m, oi_30m, oi_1h, oi_4h = _oi_classes(oi_summary)
+    _price_state, blocked_by_price = _price_block(price_summary)
 
     if previous_stage == 3:
-        return "manual_only_stage_3"
+        if target_stage == 0 and _is_decline(oi_4h):
+            return "сброс_3_0_по_oi_4ч"
+        if target_stage == 1 and blocked_by_price:
+            return "снижение_3_1_по_цене_4ч"
+        if target_stage == 2 and _price_stage3_block(_price_state):
+            return "снижение_3_2_по_цене_4ч"
+        return "удержание_3"
+
     if blocked_by_price:
-        return "price_hard_ban"
-    if target_stage <= 0:
-        return "phase_0"
+        return "блок_цены_4ч"
+    if previous_stage >= 2 and _price_stage3_block(_price_state):
+        return "блок_3_по_цене_4ч"
+    if _is_4h_hard_decline(oi_4h):
+        return "блок_oi_4ч"
+    if previous_stage >= 2 and _is_decline(oi_30m):
+        return "снижение_2_1_по_30м"
+    if previous_stage >= 2 and _is_decline(oi_1h):
+        return "снижение_2_1_по_1ч"
+    if previous_stage == 1 and target_stage < 2:
+        return "удержание_1"
+    if previous_stage == 1 and not _is_growth(oi_15m):
+        return "удержание_1_по_15м"
+    if previous_stage == 1 and not _is_mature_growth(oi_30m):
+        return "удержание_1_по_30м"
+    if previous_stage == 1 and oi_15m == "weak_up" and oi_1h != "strong_up":
+        return "удержание_1_по_1ч"
+    if previous_stage == 1 and effective_trigger_age < TRIGGER_TO_STAGE2_MINUTES:
+        return "ждем_30_минут_от_триггера"
+    if previous_stage == 1 and effective_age < PHASE1_MIN_AGE_MINUTES:
+        return "ждем_30_минут_в_1"
+    if previous_stage == 2 and target_stage <= 2:
+        if _is_15m_hard_negative_for_fresh_stage3(oi_15m):
+            return "удержание_2_по_15м"
+        return "удержание_2"
+    if previous_stage == 2 and effective_trigger_age < TRIGGER_TO_STAGE3_MINUTES:
+        return "ждем_1ч_от_триггера"
+    if previous_stage == 2 and effective_age < PHASE2_MIN_AGE_MINUTES:
+        return "ждем_30_минут_в_2"
     if target_stage == 1:
-        return "phase_1_allowed"
+        return "разрешен_вход_в_1"
     if target_stage == 2:
-        if previous_stage < 1:
-            return "need_phase_1_seed"
-        if previous_stage == 1 and previous_age < PHASE1_MIN_AGE_MINUTES:
-            return "need_1h_in_phase_1"
-        return "phase_2_allowed"
-    if target_stage >= 3:
-        if previous_stage < 2:
-            return "need_phase_2_base"
-        if previous_stage == 2 and previous_age < PHASE2_MIN_AGE_MINUTES:
-            return "need_15m_in_phase_2"
-        return "phase_3_allowed"
-    return "unknown"
+        return "разрешен_вход_в_2"
+    if target_stage == 3:
+        return "разрешен_вход_в_3"
+    return "неизвестно"

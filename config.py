@@ -3,13 +3,37 @@ from pathlib import Path
 
 APP_VERSION = "v3.5.4"
 
-ИНТЕРВАЛ_ЦИКЛА_СЕК = int(os.getenv("COLLECT_INTERVAL_SECONDS", "180"))
+
+def _load_fallback_env_file() -> None:
+    if os.getenv("DATABASE_URL"):
+        return
+    for candidate in (Path(".env.vps_postgres"), Path(".env")):
+        if not candidate.exists():
+            continue
+        try:
+            for raw_line in candidate.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("'").strip('"')
+                os.environ.setdefault(key, value)
+        except OSError:
+            continue
+        if os.getenv("DATABASE_URL"):
+            return
+
+
+_load_fallback_env_file()
+
+ИНТЕРВАЛ_ЦИКЛА_СЕК = int(os.getenv("COLLECT_INTERVAL_SECONDS", "300"))
 ДНЕЙ_ХРАНЕНИЯ = int(os.getenv("RETENTION_DAYS", "30"))
 
 ЛИМИТ_СИМВОЛОВ_BYBIT = int(os.getenv("LIMIT_SYMBOLS_BYBIT", "0"))
 ЛИМИТ_СИМВОЛОВ_BINANCE = int(os.getenv("LIMIT_SYMBOLS_BINANCE", "0"))
-BINANCE_UNIVERSE_SKIP_TOP = int(os.getenv("BINANCE_UNIVERSE_SKIP_TOP", "50"))
-BYBIT_UNIVERSE_SKIP_TOP = int(os.getenv("BYBIT_UNIVERSE_SKIP_TOP", "50"))
+BINANCE_UNIVERSE_SKIP_TOP = int(os.getenv("BINANCE_UNIVERSE_SKIP_TOP", "0"))
+BYBIT_UNIVERSE_SKIP_TOP = int(os.getenv("BYBIT_UNIVERSE_SKIP_TOP", "0"))
 BINANCE_COLLECT_WORKERS = int(os.getenv("BINANCE_COLLECT_WORKERS", "6"))
 BYBIT_COLLECT_WORKERS = int(os.getenv("BYBIT_COLLECT_WORKERS", "8"))
 
