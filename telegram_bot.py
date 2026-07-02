@@ -193,18 +193,18 @@ def _visual_strength_token(value: str | None) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return "⬜️⬜️⬜️⬜️⬜️"
-    if text in {"сильное", "сильный", "очень_гладко", "очень гладко", "подтвержденное", "подтвержденный"}:
+    if text in {"сильное", "сильный", "очень_гладко", "очень гладко", "подтвержденное", "подтвержденный", "сильная", "хорошая"}:
         return "1️⃣2️⃣3️⃣4️⃣5️⃣"
-    if text in {"хорошая", "хороший", "почти_нет", "почти нет"}:
+    if text in {"хороший", "почти_нет", "почти нет", "гладко", "легкий", "легкая"}:
         return "1️⃣2️⃣3️⃣4️⃣⬜️"
     if text in {"замедляется, но держится", "ровно / без явного ускорения"}:
         return "1️⃣2️⃣3️⃣4️⃣⬜️"
-    if text in {"средняя", "рабочая", "рабочий"}:
+    if text in {"средняя", "рабочая", "рабочий", "средне", "заметный"}:
         return "1️⃣2️⃣3️⃣⬜️⬜️"
-    if text in {"нет", "срыв", "рвано", "ускоряется вниз", "плоско"}:
+    if text in {"нет", "срыв", "рвано", "ускоряется вниз", "плоско", "слабая", "слабый", "сильный", "доминирующий"}:
         return "1️⃣2️⃣⬜️⬜️⬜️"
-    if text in {"слабая", "слабый"}:
-        return "1️⃣2️⃣⬜️⬜️⬜️"
+    if text in {"плохая", "плохой", "пила", "мертвый", "всплеск_с_боковиком", "всплеск с боковиком"}:
+        return "1️⃣⬜️⬜️⬜️⬜️"
     return "1️⃣2️⃣3️⃣⬜️⬜️"
 
 
@@ -1079,8 +1079,8 @@ def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: l
     latest_ts = transition_ts or core_row.get("latest_cycle_ts")
     row_1h = window_map.get("1ч") or {}
 
-    lines = [title, ""]
-    lines.extend(_build_symbol_header(symbol, exchange, latest_ts))
+    header_symbol, header_ts = _build_symbol_header(symbol, exchange, latest_ts)
+    lines = [f"<b>{title}</b>", "", f"<b>{header_symbol}</b>", f"<b>{header_ts}</b>"]
     current_stage = int(core_row.get("current_stage") or 0)
     lines.extend([""])
     lines.extend(
@@ -1092,23 +1092,31 @@ def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: l
         )
     )
 
-    lines.extend(["", "📊 Открытый интерес", "", "Наклонка OI", "по полному окну, не по одной свече"])
+    lines.extend(["", "<b>📊 Открытый интерес</b>", "", "<b>Наклонка OI</b>"])
     for tf in ("15м", "30м", "1ч", "4ч"):
         row = window_map.get(tf) or {}
         lines.append(
             f"{_visual_oi_slope(row.get('oi_slope_class'))} - {tf} - "
-            f"{_human_oi_slope(row.get('oi_slope_class'))}{_oi_ratio_note(row)} | "
-            f"{_oi_window_explanation(row)}"
+            f"{_human_oi_slope(row.get('oi_slope_class'))}"
         )
 
-    lines.extend(["", "Интерпретаторы OI"])
-    hold_text = row_1h.get("oi_hold_class") or oi.get("oi_retention_summary") or "n/a"
-    pullback_text = row_1h.get("oi_pullback_class") or "n/a"
-    smooth_text = row_1h.get("oi_smoothness_class") or oi.get("oi_stability_summary") or "n/a"
+    lines.extend(["", "<b>Интерпретаторы OI</b>"])
+    form_text = oi.get("oi_form_class_1h") or "n/a"
+    hold_text = row_1h.get("oi_hold_class") or oi.get("oi_hold_class_1h") or oi.get("oi_retention_summary") or "n/a"
+    pullback_text = row_1h.get("oi_pullback_class") or oi.get("oi_pullback_class_1h") or "n/a"
+    smooth_text = row_1h.get("oi_smoothness_class") or oi.get("oi_smoothness_class_1h") or oi.get("oi_stability_summary") or "n/a"
+    concentration_text = oi.get("oi_concentration_class_1h") or "n/a"
+    tail_text = oi.get("oi_tail_share_class_1h") or "n/a"
+    flat_tail_text = oi.get("oi_flat_tail_class_1h") or "n/a"
+    form_score = oi.get("oi_form_score_1h")
+    form_score_text = f" ({form_score}/5)" if form_score is not None else ""
+    lines.append(f"{_visual_strength_token(form_text)} - Форма набора - {_human_text_token(form_text)}{form_score_text}")
     lines.append(f"{_visual_strength_token(hold_text)} - Удержание - {_human_text_token(hold_text)}")
     lines.append(f"{_visual_strength_token(pullback_text)} - Откат - {_human_text_token(pullback_text)}")
     lines.append(f"{_visual_strength_token(smooth_text)} - Гладкость - {_human_text_token(smooth_text)}")
-    lines.append(f"Итого по OI - {_human_text_token(oi.get('oi_pattern_label') or oi.get('oi_pattern_code') or 'n/a')}")
+    lines.append(f"{_visual_strength_token(concentration_text)} - Концентрация роста - {_human_text_token(concentration_text)}")
+    lines.append(f"{_visual_strength_token(tail_text)} - Доля хвоста - {_human_text_token(tail_text)}")
+    lines.append(f"{_visual_strength_token(flat_tail_text)} - Плоский хвост после хая - {_human_text_token(flat_tail_text)}")
     lines.extend(["", _symbol_links(symbol, exchange)])
     return "\n".join(lines)
 
@@ -1441,6 +1449,40 @@ def _fmt_file(path: Path) -> str:
 def _runtime_snapshot() -> tuple[dict, dict]:
     runtime = _read_json_file(RUNTIME_REPORTS_DIR / "runtime_health.json")
     cycle = _read_json_file(RUNTIME_REPORTS_DIR / "cycle_status.json")
+    canonical = _read_json_file(Path(__file__).resolve().parent / "runtime" / "health.json")
+    if canonical:
+        universe = canonical.get("universe") or {}
+        metrics = canonical.get("metrics") or {}
+        runtime.update(
+            {
+                "status": canonical.get("status"),
+                "global_block_reason": canonical.get("global_block_reason"),
+                "runtime_alerts": canonical.get("alerts") or runtime.get("runtime_alerts") or [],
+                "symbols_total": universe.get("total_symbols"),
+                "symbols_by_exchange": {
+                    "BINANCE": (universe.get("sources", {}).get("binance") or {}).get("monitored"),
+                    "BYBIT": (universe.get("sources", {}).get("bybit") or {}).get("monitored"),
+                },
+                "duck_universe_health": universe.get("universe_health"),
+                "duck_listing_health": universe.get("listing_health"),
+                "data_quality_state": universe.get("data_quality"),
+                "symbols_incomplete_windows": universe.get("incomplete_windows"),
+                "symbols_stale_windows": universe.get("stale_windows"),
+                "symbols_absent_in_duck": universe.get("absent_in_duck"),
+                "data_quality_quarantine_total": universe.get("data_quality_quarantine_total"),
+                "data_quality_quarantine": universe.get("data_quality_quarantine") or universe.get("quarantine") or [],
+            }
+        )
+        cycle.update(
+            {
+                "cycle_health": metrics.get("cycle_health"),
+                "cycle_latency_class": metrics.get("cycle_latency_class"),
+                "cycle_elapsed_seconds": metrics.get("cycle_elapsed_seconds"),
+                "cycle_reserve_seconds": metrics.get("cycle_reserve_seconds"),
+                "cycle_reserve_pct": metrics.get("cycle_reserve_pct"),
+                "overrun_streak": metrics.get("overrun_streak"),
+            }
+        )
     return runtime, cycle
 
 
@@ -2807,7 +2849,7 @@ def _build_stage3_alert_text(r: dict) -> str:
         transition_ts=transition_ts,
         transition_reason=transition_reason,
     )
-def check_stage3_alerts() -> int:
+def check_stage3_alerts() -> dict:
     alerted = _read_stage3_alerted_keys()
 
     rows = _safe_rows("""
@@ -2832,6 +2874,10 @@ def check_stage3_alerts() -> int:
     """)
 
     sent = 0
+    already_active = 0
+    observations_total = 0
+    delivery_failed = 0
+    new_signals: list[dict] = []
 
     for r in rows:
         try:
@@ -2846,6 +2892,7 @@ def check_stage3_alerts() -> int:
                 f"{r.get('exchange')} {r.get('symbol')}"
             )
             continue
+        observations_total += 1
         key = "|".join([
             str(r.get("exchange")),
             str(r.get("symbol")),
@@ -2853,20 +2900,49 @@ def check_stage3_alerts() -> int:
         ])
 
         if key in alerted:
+            already_active += 1
             continue
 
         delivered = send_message(
             _build_stage3_alert_text(r),
             _main_keyboard(),
+            parse_mode="HTML",
         )
         if not delivered:
             log(f"stage3 alert delivery failed: {key}")
+            delivery_failed += 1
             continue
 
         _append_stage3_alert_history(r, key)
         sent += 1
+        new_signals.append(
+            {
+                "exchange": str(r.get("exchange") or ""),
+                "symbol": str(r.get("symbol") or ""),
+                "transition_ts": str(transition_ts),
+                "alert_key": key,
+            }
+        )
 
-    return sent
+    waiting_rows = _safe_rows(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM core_state_v2
+        WHERE current_stage IN (1, 2)
+          AND strpos(COALESCE(transition_permission, ''), 'ждем_') = 1
+        """
+    )
+    waiting_confirmation = int((waiting_rows[0] or {}).get("cnt", 0) or 0) if waiting_rows else 0
+
+    return {
+        "sent_count": sent,
+        "signal_observations_total": observations_total,
+        "signals_already_active": already_active,
+        "signals_waiting_confirmation": waiting_confirmation,
+        "signals_repeat_on_cooldown": 0,
+        "delivery_failed": delivery_failed,
+        "new_signals": new_signals,
+    }
 def _archive_index_path() -> Path:
     return Path("archive") / "manifests" / "archive_index.json"
 

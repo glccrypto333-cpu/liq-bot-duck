@@ -34,7 +34,7 @@ OI_SLOPE_THRESHOLDS = {
         "strong_down": 0.96,
         "weak_down": 0.99,
         "flat_high": 1.0044,
-        "weak_up": 1.016,
+        "weak_up": 1.012,
         "good_up": 1.05,
     },
     "1ч": {
@@ -46,7 +46,7 @@ OI_SLOPE_THRESHOLDS = {
     },
     "4ч": {
         "strong_down": 0.94,
-        "weak_down": 0.99,
+        "weak_down": 0.996,
         "flat_high": 1.01,
         "weak_up": 1.035,
         "good_up": 1.095,
@@ -211,7 +211,8 @@ def retention_ratio_from_points(points: list[float]) -> float:
     high = max(points)
     if high <= start:
         return 0.0 if end >= start else -1.0
-    return (end - start) / (high - start)
+    raw_ratio = (end - start) / (high - start)
+    return max(0.0, min(1.0, raw_ratio))
 
 
 def pullback_ratio_from_points(points: list[float]) -> float:
@@ -224,17 +225,95 @@ def pullback_ratio_from_points(points: list[float]) -> float:
         return 1.0 if points[-1] < start else 0.0
     tail = points[high_idx:]
     low_after_high = min(tail) if tail else points[-1]
-    return max(0.0, (high - low_after_high) / (high - start))
+    raw_ratio = (high - low_after_high) / (high - start)
+    return max(0.0, min(1.0, raw_ratio))
 
 
 def smoothness_ratio_from_points(points: list[float]) -> float:
     if len(points) < 2:
         return 0.0
-    net = abs(points[-1] - points[0])
-    path = sum(abs(curr - prev) for prev, curr in zip(points, points[1:]))
-    if path <= 0:
+    net = points[-1] - points[0]
+    if net == 0:
+        return 0.0
+
+    trend_sign = 1.0 if net > 0 else -1.0
+    forward_path = 0.0
+    reverse_path = 0.0
+
+    for prev, curr in zip(points, points[1:]):
+        step = (curr - prev) * trend_sign
+        if step > 0:
+            forward_path += step
+        elif step < 0:
+            reverse_path += abs(step)
+
+    if forward_path <= 0:
+        return 0.0
+    if reverse_path <= 0:
         return 1.0
-    return max(0.0, min(1.0, net / path))
+
+    raw_ratio = 1.0 - (reverse_path / forward_path)
+    return max(0.0, min(1.0, raw_ratio))
+
+
+def concentration_ratio_from_points(points: list[float]) -> float:
+    if len(points) < 2:
+        return 1.0
+
+    positive_steps = [max(0.0, curr - prev) for prev, curr in zip(points, points[1:])]
+    positive_path = sum(positive_steps)
+    if positive_path <= 0:
+        return 1.0
+    peak_step = max(positive_steps) if positive_steps else 0.0
+    if peak_step <= 0:
+        return 1.0
+    return max(0.0, min(1.0, peak_step / positive_path))
+
+
+def tail_share_from_points(points: list[float]) -> float:
+    if len(points) < 2:
+        return 0.0
+    positive_steps = [max(0.0, curr - prev) for prev, curr in zip(points, points[1:])]
+    positive_path = sum(positive_steps)
+    if positive_path <= 0:
+        return 0.0
+    tail_positive_path = sum(positive_steps[-2:])
+    return max(0.0, min(1.0, tail_positive_path / positive_path))
+
+
+def _first_local_high_index(points: list[float]) -> int:
+    if not points:
+        return 0
+    if len(points) < 3:
+        return points.index(max(points))
+    start = points[0]
+    for idx in range(1, len(points) - 1):
+        if points[idx] > start and points[idx] >= points[idx - 1] and points[idx] >= points[idx + 1]:
+            return idx
+    return points.index(max(points))
+
+
+def flat_tail_ratio_from_points(points: list[float]) -> float:
+    if len(points) < 3:
+        return 0.0
+    positive_steps = [max(0.0, curr - prev) for prev, curr in zip(points, points[1:])]
+    positive_path = sum(positive_steps)
+    if positive_path <= 0:
+        return 0.0
+
+    high_idx = _first_local_high_index(points)
+    tail_steps = [abs(curr - prev) for prev, curr in zip(points[high_idx:], points[high_idx + 1:])]
+    if not tail_steps:
+        return 0.0
+
+    flat_threshold = max(positive_path * 0.03, max(points) * 0.0005)
+    flat_steps = 0
+    for step in tail_steps:
+        if step <= flat_threshold:
+            flat_steps += 1
+            continue
+        break
+    return max(0.0, min(1.0, flat_steps / len(tail_steps)))
 
 
 def silent_build_ratio_from_points(points: list[float]) -> float:

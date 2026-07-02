@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
+import gc
 import os
 
 from db import (
@@ -49,6 +51,36 @@ def _is_contiguous_5m(chunk) -> bool:
     return True
 
 
+def _select_window_chunk(items, anchor_ts: datetime, timeframe: str, need: int):
+    """Return a strict 5m chunk, or tolerate one missing 5m candle on senior windows."""
+    strict_chunk = [item for item in items if item["ts_close"] <= anchor_ts][-need:]
+    if len(strict_chunk) == need and _is_contiguous_5m(strict_chunk):
+        return strict_chunk
+
+    if need < 12:
+        return None
+
+    window_start = anchor_ts - timedelta(minutes=WINDOW_MINUTES[timeframe])
+    window_items = [
+        item
+        for item in items
+        if item["ts_close"] > window_start and item["ts_close"] <= anchor_ts
+    ]
+    if len(window_items) < need - 1:
+        return None
+
+    missing_slots = 0
+    for prev, current in zip(window_items, window_items[1:]):
+        delta_slots = int((current["ts_open"] - prev["ts_open"]) / FIVE_MINUTES)
+        if delta_slots < 1:
+            return None
+        missing_slots += max(0, delta_slots - 1)
+        if missing_slots > 1:
+            return None
+
+    return window_items
+
+
 def _window_items(selected_windows: tuple[str, ...] | None):
     window_names = selected_windows or tuple(WINDOWS.keys())
     return [(timeframe, WINDOWS[timeframe]) for timeframe in window_names]
@@ -57,7 +89,22 @@ def _window_items(selected_windows: tuple[str, ...] | None):
 def _active_clause(alias: str, active_only: bool) -> str:
     if not active_only:
         return ""
-    return f"\n          AND {active_universe_sql(alias)}"
+    return f"\n          AND {active_universe_sql(alias, include_data_quality_quarantine=False)}"
+
+
+def _tracked_pairs_clause(
+    alias: str,
+    tracked_pairs: Iterable[tuple[str, str]] | None,
+) -> tuple[str, tuple]:
+    tracked = list(tracked_pairs or [])
+    if not tracked:
+        return "", ()
+    placeholders = ",".join(["(%s,%s)"] * len(tracked))
+    sql = f"\n          AND ({alias}.exchange, {alias}.symbol) IN ({placeholders})"
+    params: list[str] = []
+    for exchange, symbol in tracked:
+        params.extend([exchange, symbol])
+    return sql, tuple(params)
 
 
 def _fetch_metric_rows(
@@ -68,16 +115,18 @@ def _fetch_metric_rows(
     window_hours: int | None = None,
     start_ts=None,
     end_ts=None,
+    tracked_pairs: Iterable[tuple[str, str]] | None = None,
 ):
     active_clause = _active_clause(alias, active_only)
+    tracked_clause, tracked_params = _tracked_pairs_clause(alias, tracked_pairs)
     if window_hours is not None:
         return fetch(f"""
             SELECT {select_sql}
             FROM {table} {alias}
             WHERE ts_close <= NOW() - interval '30 seconds'
-              AND ts_close >= NOW() - (%s || ' hours')::interval{active_clause}
+              AND ts_close >= NOW() - (%s || ' hours')::interval{active_clause}{tracked_clause}
             ORDER BY exchange, symbol, ts_open
-        """, (window_hours,))
+        """, (window_hours, *tracked_params))
 
     if start_ts is None or end_ts is None:
         raise RuntimeError("_fetch_metric_rows requires window_hours or start_ts/end_ts")
@@ -86,9 +135,9 @@ def _fetch_metric_rows(
         SELECT {select_sql}
         FROM {table} {alias}
         WHERE ts_close >= %s
-          AND ts_close < %s{active_clause}
+          AND ts_close < %s{active_clause}{tracked_clause}
         ORDER BY exchange, symbol, ts_open
-    """, (start_ts, end_ts))
+    """, (start_ts, end_ts, *tracked_params))
 
 
 def _fetch_recent_metric_rows(
@@ -110,17 +159,77 @@ def _fetch_recent_metric_rows(
     """, (lookback, source_cycle_ts))
 
 
-def resolve_latest_common_ts_close() -> datetime | None:
-    rows = fetch("""
-        SELECT LEAST(
-            (SELECT MAX(ts_close) FROM oi_raw),
-            (SELECT MAX(ts_close) FROM price_raw),
-            (SELECT MAX(ts_close) FROM volume_raw)
-        ) AS anchor_ts
-    """)
-    if not rows:
-        return None
-    return rows[0]["anchor_ts"]
+def _fetch_latest_ts_map(
+    table: str,
+    alias: str,
+    active_only: bool,
+    source_cycle_ts: datetime,
+) -> dict[tuple[str, str], datetime]:
+    active_clause = _active_clause(alias, active_only)
+    rows = fetch(f"""
+        SELECT exchange, symbol, max(ts_close) AS latest_ts
+        FROM {table} {alias}
+        WHERE ts_close <= %s{active_clause}
+        GROUP BY exchange, symbol
+    """, (source_cycle_ts,))
+    return {
+        (row["exchange"], row["symbol"]): row["latest_ts"]
+        for row in rows
+        if row.get("latest_ts") is not None
+    }
+
+
+def _resolve_symbol_anchor_map_from_db(
+    metric_set: set[str],
+    active_only: bool,
+    source_cycle_ts: datetime,
+) -> dict[tuple[str, str], datetime]:
+    metric_tables = {
+        "OI": ("oi_raw", "oi"),
+        "PRICE": ("price_raw", "price"),
+        "VOLUME": ("volume_raw", "volume"),
+    }
+    latest_by_metric = {
+        metric: _fetch_latest_ts_map(table, alias, active_only, source_cycle_ts)
+        for metric, (table, alias) in metric_tables.items()
+        if metric in metric_set
+    }
+    if not latest_by_metric:
+        return {}
+
+    common_keys: set[tuple[str, str]] | None = None
+    for latest_map in latest_by_metric.values():
+        keys = set(latest_map.keys())
+        common_keys = keys if common_keys is None else common_keys & keys
+    if not common_keys:
+        return {}
+
+    return {
+        key: min(latest_by_metric[metric][key] for metric in latest_by_metric)
+        for key in common_keys
+    }
+
+
+def _resolve_symbol_anchor_map(
+    grouped_by_metric: dict[str, dict[tuple[str, str], list[dict]]],
+    metric_set: set[str],
+) -> dict[tuple[str, str], datetime]:
+    anchors: dict[tuple[str, str], datetime] = {}
+    symbol_keys: set[tuple[str, str]] = set()
+    for grouped in grouped_by_metric.values():
+        symbol_keys.update(grouped.keys())
+
+    for key in symbol_keys:
+        latest_closes: list[datetime] = []
+        for metric_name in metric_set:
+            metric_rows = grouped_by_metric.get(metric_name, {}).get(key, [])
+            if not metric_rows:
+                latest_closes = []
+                break
+            latest_closes.append(metric_rows[-1]["ts_close"])
+        if latest_closes:
+            anchors[key] = min(latest_closes)
+    return anchors
 
 
 def build_aggregate_rows(
@@ -130,6 +239,7 @@ def build_aggregate_rows(
     active_only: bool = True,
     start_ts=None,
     end_ts=None,
+    tracked_pairs: Iterable[tuple[str, str]] | None = None,
 ) -> tuple[list[tuple], dict]:
     rows_out: list[tuple] = []
     skipped_non_contiguous = 0
@@ -146,6 +256,7 @@ def build_aggregate_rows(
             window_hours=window_hours,
             start_ts=start_ts,
             end_ts=end_ts,
+            tracked_pairs=tracked_pairs,
         )
 
         for (exchange, symbol), items in _groups(oi_rows).items():
@@ -168,6 +279,7 @@ def build_aggregate_rows(
                         None, None,
                         изменение_в_процентах(chunk[0]["oi_open"], chunk[-1]["oi_close"]),
                         len(chunk),
+                        [x["oi_close"] for x in chunk],
                     ))
 
     price_rows = []
@@ -180,6 +292,7 @@ def build_aggregate_rows(
             window_hours=window_hours,
             start_ts=start_ts,
             end_ts=end_ts,
+            tracked_pairs=tracked_pairs,
         )
 
         for (exchange, symbol), items in _groups(price_rows).items():
@@ -202,6 +315,7 @@ def build_aggregate_rows(
                         None, None,
                         изменение_в_процентах(chunk[0]["price_open"], chunk[-1]["price_close"]),
                         len(chunk),
+                        None,
                     ))
 
     volume_rows = []
@@ -214,6 +328,7 @@ def build_aggregate_rows(
             window_hours=window_hours,
             start_ts=start_ts,
             end_ts=end_ts,
+            tracked_pairs=tracked_pairs,
         )
 
         for (exchange, symbol), items in _groups(volume_rows).items():
@@ -238,6 +353,7 @@ def build_aggregate_rows(
                         sum(values) / len(values),
                         изменение_в_процентах(chunk[0]["volume"], chunk[-1]["volume"]),
                         len(chunk),
+                        None,
                     ))
 
     stats = {
@@ -266,6 +382,10 @@ def build_latest_aggregate_rows(
     skipped_non_contiguous = 0
     window_items = _window_items(selected_windows)
     metric_set = set(selected_metrics or ("OI", "PRICE", "VOLUME"))
+    symbol_anchor_map = _resolve_symbol_anchor_map_from_db(metric_set, active_only, source_cycle_ts)
+    raw_oi_count = 0
+    raw_price_count = 0
+    raw_volume_count = 0
 
     oi_rows = []
     if "OI" in metric_set:
@@ -276,19 +396,24 @@ def build_latest_aggregate_rows(
             active_only,
             source_cycle_ts,
         )
+        raw_oi_count = len(oi_rows)
         for (exchange, symbol), items in _groups(oi_rows).items():
-            if not items or items[-1]["ts_close"] != source_cycle_ts:
+            anchor_ts = symbol_anchor_map.get((exchange, symbol))
+            if anchor_ts is None:
+                continue
+            anchored_items = [item for item in items if item["ts_close"] <= anchor_ts]
+            if not anchored_items or anchored_items[-1]["ts_close"] != anchor_ts:
                 continue
             for timeframe, need in window_items:
-                if len(items) < need:
+                if len(anchored_items) < need - 1:
                     continue
-                chunk = items[-need:]
-                if not _is_contiguous_5m(chunk):
+                chunk = _select_window_chunk(anchored_items, anchor_ts, timeframe, need)
+                if chunk is None:
                     skipped_non_contiguous += 1
                     continue
                 rows_out.append((
                     "OI", timeframe,
-                    chunk[0]["ts_open"], _window_close(chunk[0]["ts_open"], timeframe),
+                    chunk[0]["ts_open"], chunk[-1]["ts_close"],
                     exchange, symbol,
                     chunk[0]["oi_open"],
                     max(x["oi_high"] for x in chunk),
@@ -297,7 +422,10 @@ def build_latest_aggregate_rows(
                     None, None,
                     изменение_в_процентах(chunk[0]["oi_open"], chunk[-1]["oi_close"]),
                     len(chunk),
+                    [x["oi_close"] for x in chunk],
                 ))
+        del oi_rows
+        gc.collect()
 
     price_rows = []
     if "PRICE" in metric_set:
@@ -308,19 +436,24 @@ def build_latest_aggregate_rows(
             active_only,
             source_cycle_ts,
         )
+        raw_price_count = len(price_rows)
         for (exchange, symbol), items in _groups(price_rows).items():
-            if not items or items[-1]["ts_close"] != source_cycle_ts:
+            anchor_ts = symbol_anchor_map.get((exchange, symbol))
+            if anchor_ts is None:
+                continue
+            anchored_items = [item for item in items if item["ts_close"] <= anchor_ts]
+            if not anchored_items or anchored_items[-1]["ts_close"] != anchor_ts:
                 continue
             for timeframe, need in window_items:
-                if len(items) < need:
+                if len(anchored_items) < need - 1:
                     continue
-                chunk = items[-need:]
-                if not _is_contiguous_5m(chunk):
+                chunk = _select_window_chunk(anchored_items, anchor_ts, timeframe, need)
+                if chunk is None:
                     skipped_non_contiguous += 1
                     continue
                 rows_out.append((
                     "PRICE", timeframe,
-                    chunk[0]["ts_open"], _window_close(chunk[0]["ts_open"], timeframe),
+                    chunk[0]["ts_open"], chunk[-1]["ts_close"],
                     exchange, symbol,
                     chunk[0]["price_open"],
                     max(x["price_high"] for x in chunk),
@@ -329,7 +462,10 @@ def build_latest_aggregate_rows(
                     None, None,
                     изменение_в_процентах(chunk[0]["price_open"], chunk[-1]["price_close"]),
                     len(chunk),
+                    None,
                 ))
+        del price_rows
+        gc.collect()
 
     volume_rows = []
     if "VOLUME" in metric_set:
@@ -340,20 +476,25 @@ def build_latest_aggregate_rows(
             active_only,
             source_cycle_ts,
         )
+        raw_volume_count = len(volume_rows)
         for (exchange, symbol), items in _groups(volume_rows).items():
-            if not items or items[-1]["ts_close"] != source_cycle_ts:
+            anchor_ts = symbol_anchor_map.get((exchange, symbol))
+            if anchor_ts is None:
+                continue
+            anchored_items = [item for item in items if item["ts_close"] <= anchor_ts]
+            if not anchored_items or anchored_items[-1]["ts_close"] != anchor_ts:
                 continue
             for timeframe, need in window_items:
-                if len(items) < need:
+                if len(anchored_items) < need - 1:
                     continue
-                chunk = items[-need:]
-                if not _is_contiguous_5m(chunk):
+                chunk = _select_window_chunk(anchored_items, anchor_ts, timeframe, need)
+                if chunk is None:
                     skipped_non_contiguous += 1
                     continue
                 values = [x["volume"] for x in chunk]
                 rows_out.append((
                     "VOLUME", timeframe,
-                    chunk[0]["ts_open"], _window_close(chunk[0]["ts_open"], timeframe),
+                    chunk[0]["ts_open"], chunk[-1]["ts_close"],
                     exchange, symbol,
                     None,
                     max(values),
@@ -363,15 +504,19 @@ def build_latest_aggregate_rows(
                     sum(values) / len(values),
                     изменение_в_процентах(chunk[0]["volume"], chunk[-1]["volume"]),
                     len(chunk),
+                    None,
                 ))
+        del volume_rows
+        gc.collect()
 
     stats = {
-        "raw_oi": len(oi_rows),
-        "raw_price": len(price_rows),
-        "raw_volume": len(volume_rows),
+        "raw_oi": raw_oi_count,
+        "raw_price": raw_price_count,
+        "raw_volume": raw_volume_count,
         "aggregates": len(rows_out),
         "skipped_non_contiguous": skipped_non_contiguous,
         "source_cycle_ts": source_cycle_ts,
+        "symbol_anchors": len(symbol_anchor_map),
         "selected_metrics": ",".join(sorted(metric_set)),
         "selected_windows": ",".join(selected_windows or tuple(WINDOWS.keys())),
         "active_only": active_only,
@@ -415,16 +560,11 @@ def rebuild_aggregate_windows() -> int:
 
 
 def rebuild_latest_aggregate_windows(source_cycle_ts: datetime) -> int:
-    anchor_ts = resolve_latest_common_ts_close()
-    if anchor_ts is None:
-        raise RuntimeError("aggregates latest rebuild failed: empty common anchor_ts")
-
-    rows_out, stats = build_latest_aggregate_rows(anchor_ts, active_only=True)
+    rows_out, stats = build_latest_aggregate_rows(source_cycle_ts, active_only=True)
     if not rows_out:
         raise RuntimeError(
             "aggregates latest rebuild failed: empty rows_out "
-            f"source_cycle_ts={source_cycle_ts.isoformat()} "
-            f"anchor_ts={anchor_ts.isoformat()}"
+            f"source_cycle_ts={source_cycle_ts.isoformat()}"
         )
 
     upsert_aggregate_hot_rows(rows_out)
@@ -432,9 +572,9 @@ def rebuild_latest_aggregate_windows(source_cycle_ts: datetime) -> int:
 
     log(
         f"aggregates latest rebuilt: source_cycle_ts={source_cycle_ts.isoformat()} "
-        f"anchor_ts={anchor_ts.isoformat()} "
         f"raw_oi={stats['raw_oi']} raw_price={stats['raw_price']} raw_volume={stats['raw_volume']} "
         f"aggregates={stats['aggregates']} "
+        f"symbol_anchors={stats['symbol_anchors']} "
         f"skipped_non_contiguous={stats['skipped_non_contiguous']} "
         f"history_synced={history_synced} history_pruned={history_pruned}"
     )

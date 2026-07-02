@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -69,6 +70,7 @@ PATTERN_LABELS = {
 
 RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
 AUTONOMOUS_OI_PROGRESS_PATH = RUNTIME_DIR / "autonomous_oi_progress.json"
+SYMBOL_WINDOWS_STALE_MINUTES = int(os.getenv("SYMBOL_WINDOWS_STALE_MINUTES", "30"))
 
 
 def attach_oi_trajectory_points(window_map_by_symbol: dict[tuple[str, str], dict[str, dict[str, dict]]]) -> None:
@@ -214,6 +216,42 @@ def load_latest_window_map(
         window_map[key][row["window_code"]][row["metric"]] = row
     attach_oi_trajectory_points(window_map)
     return window_map
+
+
+def _latest_symbol_window_ts(payload: dict[str, dict[str, dict] | None]) -> datetime | None:
+    latest_ts: datetime | None = None
+    for window_code in WINDOWS:
+        for metric_name in ("OI", "PRICE", "VOLUME"):
+            row = payload[window_code].get(metric_name)
+            if not row:
+                continue
+            ts_close = row.get("ts_close")
+            if ts_close is None:
+                continue
+            if latest_ts is None or ts_close > latest_ts:
+                latest_ts = ts_close
+    return latest_ts
+
+
+def _stale_windows_reason(
+    payload: dict[str, dict[str, dict] | None],
+    cycle_ts: datetime,
+) -> tuple[bool, float, datetime | None]:
+    latest_ts = _latest_symbol_window_ts(payload)
+    if latest_ts is None:
+        return True, float("inf"), None
+    lag_minutes = max(0.0, (cycle_ts - latest_ts).total_seconds() / 60.0)
+    return lag_minutes > SYMBOL_WINDOWS_STALE_MINUTES, lag_minutes, latest_ts
+
+
+def _missing_senior_background_reason(
+    payload: dict[str, dict[str, dict] | None],
+) -> str | None:
+    oi_4h = payload.get("4ч", {}).get("OI")
+    price_4h = payload.get("4ч", {}).get("PRICE")
+    if not oi_4h or not price_4h:
+        return "новый_листинг_без_старшего_фона"
+    return None
 
 
 def load_source_cycle_timestamps(
@@ -372,7 +410,7 @@ def summarize_volume(window_states: list[dict], target_stage: int) -> tuple[str,
     return _summarize_volume_impl(window_states, target_stage)
 
 
-def determine_target_stage(oi_summary: dict, price_summary: tuple[str, str, bool, int], volume_summary: tuple[str, str]) -> tuple[int, str]:
+def determine_target_stage(oi_summary: dict, price_summary: tuple[str, ...], volume_summary: tuple[str, str]) -> tuple[int, str]:
     return _determine_target_stage_impl(oi_summary, price_summary, volume_summary)
 
 
@@ -380,7 +418,7 @@ def apply_stage_guardrails(
     previous_state: dict | None,
     target_stage: int,
     oi_summary: dict,
-    price_summary: tuple[str, str, bool, int],
+    price_summary: tuple[str, ...],
     volume_summary: tuple[str, str],
     previous_stage_age_minutes: float,
     trigger_age_minutes: float = 0.0,
@@ -405,7 +443,7 @@ def compute_transition_permission(
     target_stage: int,
     stage_age_minutes: float,
     oi_summary: dict,
-    price_summary: tuple[str, str, bool, int],
+    price_summary: tuple[str, ...],
     trigger_age_minutes: float = 0.0,
 ) -> str:
     return _compute_transition_permission_impl(
@@ -442,7 +480,7 @@ def _is_trigger_start_class(slope_class: str, slope_class_30m: str = "flat") -> 
 def _resolve_growth_trigger_ts(
     previous_state: dict | None,
     oi_summary: dict,
-    price_summary: tuple[str, str, bool, int],
+    price_summary: tuple[str, ...],
     cycle_ts: datetime,
 ) -> datetime | None:
     previous_stage = int(previous_state.get("current_stage") or 0) if previous_state else 0
@@ -462,11 +500,13 @@ def _resolve_growth_trigger_ts(
         else:
             return trigger_ts
 
+    trigger_seed_ts = cycle_ts - timedelta(minutes=5)
+
     if previous_stage < 2 and _is_trigger_start_class(current_15m, current_30m) and not _is_growth_class(previous_15m):
-        return cycle_ts
+        return trigger_seed_ts
 
     if previous_stage <= 1 and trigger_ts is None and _is_trigger_start_class(current_15m, current_30m):
-        return cycle_ts
+        return trigger_seed_ts
 
     return trigger_ts
 
@@ -510,7 +550,7 @@ def build_core_record(
     exchange: str,
     symbol: str,
     oi_summary: dict,
-    price_summary: tuple[str, str, bool, int],
+    price_summary: tuple[str, ...],
     volume_summary: tuple[str, str],
     target_stage: int,
     transition_permission: str,
@@ -519,7 +559,7 @@ def build_core_record(
     decision_reason: str,
     trigger_ts: datetime | None,
 ) -> tuple:
-    price_state, price_block, blocked_by_price, blocked_stage_max = price_summary
+    price_state, price_block, blocked_by_price, blocked_stage_max = price_summary[:4]
     volume_state, volume_confidence = volume_summary
     block_reason = price_state if blocked_by_price else ""
     breakdown_reason = oi_summary["oi_breakdown_summary"] if oi_summary["oi_breakdown_summary"] != "нет" else ""
@@ -605,13 +645,13 @@ def _oi_pullback_class(oi_state: dict) -> str:
 
 def _oi_smoothness_class(oi_state: dict) -> str:
     smoothness = float(oi_state.get("oi_smoothness_proxy") or 0.0)
-    if smoothness >= 0.85:
+    if smoothness >= 0.90:
         return "очень_гладко"
-    if smoothness >= 0.70:
+    if smoothness >= 0.65:
         return "гладко"
     if smoothness >= 0.50:
         return "средне"
-    if smoothness >= 0.30:
+    if smoothness >= 0.35:
         return "рвано"
     return "пила"
 
@@ -648,7 +688,7 @@ def build_core_record_v2(
     exchange: str,
     symbol: str,
     oi_summary: dict,
-    price_summary: tuple[str, str, bool, int],
+    price_summary: tuple[str, ...],
     volume_summary: tuple[str, str],
     target_stage: int,
     transition_permission: str,
@@ -656,7 +696,7 @@ def build_core_record_v2(
     cycle_ts: datetime,
     decision_reason: str,
 ) -> tuple:
-    price_state, price_block, blocked_by_price, blocked_stage_max = price_summary
+    price_state, price_block, blocked_by_price, blocked_stage_max = price_summary[:4]
     volume_state, volume_confidence = volume_summary
     return (
         exchange,
@@ -734,6 +774,7 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
         payload = build_symbol_window_payload(window_map)
         if not any(payload[window]["OI"] for window in WINDOWS):
             continue
+        stale_windows, stale_lag_minutes, latest_symbol_ts = _stale_windows_reason(payload, cycle_ts)
 
         oi_window_states = [compute_oi_window_state(payload, window) for window in WINDOWS]
         price_window_states = [compute_price_window_state(payload, oi_window_states[idx], window) for idx, window in enumerate(WINDOWS)]
@@ -762,6 +803,16 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
             previous_stage_age_minutes,
             trigger_age_minutes,
         )
+        missing_senior_background_reason = _missing_senior_background_reason(payload)
+        if missing_senior_background_reason and target_stage > 1:
+            target_stage = 1
+            guard_reason = missing_senior_background_reason
+        if stale_windows:
+            target_stage = 0
+            guard_reason = (
+                f"stale_windows lag={round(stale_lag_minutes, 1)}m "
+                f"latest_window_ts={latest_symbol_ts.isoformat() if latest_symbol_ts else 'none'}"
+            )
         stage_age_minutes = compute_stage_age(previous_state, target_stage, cycle_ts)
         transition_permission = compute_transition_permission(
             previous_state,
@@ -771,6 +822,10 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
             price_summary,
             trigger_age_minutes,
         )
+        if stale_windows:
+            transition_permission = "skip:stale_windows"
+        elif missing_senior_background_reason and target_stage <= 1:
+            transition_permission = "нет_старшего_фона_4ч"
         decision_reason = f"{decision_reason}; guard={guard_reason}"
 
         for index, window_code in enumerate(WINDOWS):
@@ -868,6 +923,22 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
             "oi_slope_class_30m": oi_summary["oi_slope_class_30m"],
             "oi_slope_class_1h": oi_summary["oi_slope_class_1h"],
             "oi_slope_class_4h": oi_summary["oi_slope_class_4h"],
+            "oi_growth_pct_1h": oi_summary.get("oi_growth_pct_1h"),
+            "oi_retention_ratio_1h": oi_summary.get("oi_retention_ratio_1h"),
+            "oi_pullback_ratio_1h": oi_summary.get("oi_pullback_ratio_1h"),
+            "oi_smoothness_proxy_1h": oi_summary.get("oi_smoothness_proxy_1h"),
+            "oi_concentration_ratio_1h": oi_summary.get("oi_concentration_ratio_1h"),
+            "oi_tail_share_1h": oi_summary.get("oi_tail_share_1h"),
+            "oi_tail_share_ratio_1h": oi_summary.get("oi_tail_share_ratio_1h"),
+            "oi_flat_tail_ratio_1h": oi_summary.get("oi_flat_tail_ratio_1h"),
+            "oi_hold_class_1h": oi_summary.get("oi_hold_class_1h"),
+            "oi_pullback_class_1h": oi_summary.get("oi_pullback_class_1h"),
+            "oi_smoothness_class_1h": oi_summary.get("oi_smoothness_class_1h"),
+            "oi_concentration_class_1h": oi_summary.get("oi_concentration_class_1h"),
+            "oi_tail_share_class_1h": oi_summary.get("oi_tail_share_class_1h"),
+            "oi_flat_tail_class_1h": oi_summary.get("oi_flat_tail_class_1h"),
+            "oi_form_class_1h": oi_summary.get("oi_form_class_1h"),
+            "oi_form_score_1h": oi_summary.get("oi_form_score_1h"),
         }
 
     next_state_map["__v2_rows__"] = {

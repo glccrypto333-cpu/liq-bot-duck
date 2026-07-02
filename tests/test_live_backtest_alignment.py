@@ -4,6 +4,8 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -45,6 +47,8 @@ def test_incremental_live_processing_stays_aligned_with_ctr_replay() -> None:
     start = parse_user_ts("2026-06-24 01:00:00")
     end = start + timedelta(hours=4)
     all_cycles = _load_history_cycles(start, end)
+    if not all_cycles:
+        pytest.skip("Нет исторических cycle_ts в aggregate_windows_history для окна CTRUSDT")
     wall_cycles = _select_sparse_wall_cycles(all_cycles, step_minutes=7)
 
     state_map = {}

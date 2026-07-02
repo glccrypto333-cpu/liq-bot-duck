@@ -124,28 +124,64 @@ reports = Path("runtime_reports")
 runtime_dir = Path("runtime")
 
 
-def read_json(name):
-    path = reports / name
+def read_json_path(path: Path, label: str) -> dict:
     if not path.exists():
-        print(f"{name}: missing")
+        print(f"{label}: missing")
         return {}
     try:
         data = json.loads(path.read_text())
-        print(f"{name}: ok")
+        print(f"{label}: ok")
         return data
     except Exception as exc:
-        print(f"{name}: bad_json {type(exc).__name__}: {exc}")
+        print(f"{label}: bad_json {type(exc).__name__}: {exc}")
         return {}
 
 
+def read_json(name):
+    return read_json_path(reports / name, name)
+
+
+canonical = read_json_path(runtime_dir / "health.json", "runtime/health.json")
 runtime = read_json("runtime_health.json")
 cycle = read_json("cycle_status.json")
+
+if canonical:
+    universe = canonical.get("universe") or {}
+    metrics = canonical.get("metrics") or {}
+    print("\n=== CANONICAL HEALTH ===")
+    for key in ["status", "pid", "started_at", "updated_at", "global_block_reason", "alerts"]:
+        print(f"{key}: {canonical.get(key)}")
+    for key in [
+        "total_symbols",
+        "monitored_symbols",
+        "listing_health",
+        "universe_health",
+        "data_quality",
+        "stale_windows",
+        "incomplete_windows",
+        "absent_in_duck",
+        "data_quality_quarantine_total",
+    ]:
+        print(f"universe.{key}: {universe.get(key)}")
+    for key in [
+        "cycle_health",
+        "cycle_latency_class",
+        "cycle_elapsed_seconds",
+        "cycle_reserve_seconds",
+        "cycle_reserve_pct",
+        "overrun_streak",
+        "signals_observations",
+        "signals_waiting_confirmation",
+    ]:
+        print(f"metrics.{key}: {metrics.get(key)}")
 
 print("\n=== LIVE PROCESS MARKERS ===")
 main_pid_path = runtime_dir / "main.pid"
 current_log_path = runtime_dir / "current_main_log.path"
+main_pid_value = None
 if main_pid_path.exists():
-    print(f"main_pid: {main_pid_path.read_text().strip()}")
+    main_pid_value = main_pid_path.read_text().strip()
+    print(f"main_pid: {main_pid_value}")
 else:
     print("main_pid: missing")
 
@@ -161,6 +197,31 @@ if runtime:
         "collect_seconds",
         "collect_reserve_seconds",
         "collect_reserve_health",
+        "universe_health",
+        "universe_alerts",
+        "universe_summary",
+        "universe_problem_pairs",
+        "listing_health",
+        "listing_alerts",
+        "listing_summary",
+        "listing_problem_pairs",
+        "symbols_total",
+        "symbols_by_exchange",
+        "duck_universe_health",
+        "duck_listing_health",
+        "duck_universe_summary",
+        "symbols_incomplete_windows",
+        "symbols_stale_windows",
+        "symbols_absent_in_duck",
+        "data_quality_state",
+        "data_quality_alerts",
+        "signal_observations_total",
+        "signals_already_active",
+        "signals_waiting_confirmation",
+        "signals_repeat_on_cooldown",
+        "new_signals",
+        "auto_heal_oi_gaps",
+        "auto_heal_listing",
         "runtime_alert_count",
         "runtime_alerts",
         "snapshot_health",
@@ -183,12 +244,74 @@ health_flags = [
     runtime.get("rss_health"),
     runtime.get("watchdog_health"),
     runtime.get("collect_reserve_health"),
+    runtime.get("universe_health"),
+    runtime.get("listing_health"),
     runtime.get("snapshot_health"),
     cycle.get("cycle_health"),
 ]
 
 bad = [x for x in health_flags if x and x not in {"ok", "healthy"}]
+if canonical:
+    universe = canonical.get("universe") or {}
+    metrics = canonical.get("metrics") or {}
+    if canonical.get("status") != "running":
+        bad.append(f"canonical_status={canonical.get('status')}")
+    if canonical.get("global_block_reason"):
+        bad.append(f"global_block_reason={canonical.get('global_block_reason')}")
+    if canonical.get("alerts"):
+        bad.append(f"canonical_alerts={canonical.get('alerts')}")
+    for label, value in [
+        ("canonical_listing_health", universe.get("listing_health")),
+        ("canonical_universe_health", universe.get("universe_health")),
+        ("canonical_data_quality", universe.get("data_quality")),
+        ("canonical_cycle_health", metrics.get("cycle_health")),
+    ]:
+        if value and value not in {"ok", "healthy"}:
+            bad.append(f"{label}={value}")
+runtime_pid = runtime.get("pid") if runtime else None
+if main_pid_value and runtime_pid and str(runtime_pid) != str(main_pid_value):
+    bad.append(f"runtime_snapshot_pid_mismatch={runtime_pid}!={main_pid_value}")
+universe_alerts = runtime.get("universe_alerts", []) if runtime else []
+if universe_alerts:
+    bad.append(f"universe_alerts={universe_alerts}")
+problem_pairs = runtime.get("universe_problem_pairs", []) if runtime else []
+if problem_pairs:
+    print("universe_problem_pairs:")
+    for row in problem_pairs[:10]:
+        reason = row.get("reason_code")
+        level = row.get("reason_level")
+        hint = row.get("reason_hint")
+        if reason or level or hint:
+            print(
+                {
+                    "exchange": row.get("exchange"),
+                    "symbol": row.get("symbol"),
+                    "present_cnt": row.get("present_cnt"),
+                    "missing_cnt": row.get("missing_cnt"),
+                    "max_lag_min": row.get("max_lag_min"),
+                    "missing_list": row.get("missing_list"),
+                    "stale_list": row.get("stale_list"),
+                    "reason_code": reason,
+                    "reason_level": level,
+                    "reason_hint": hint,
+                    "blocking": row.get("blocking"),
+                }
+            )
+        else:
+            print(row)
+listing_alerts = runtime.get("listing_alerts", []) if runtime else []
+if listing_alerts:
+    bad.append(f"listing_alerts={listing_alerts}")
+listing_problem_pairs = runtime.get("listing_summary", {}).get("listing_problem_pairs", []) if runtime else []
+if listing_problem_pairs:
+    print("listing_problem_pairs:")
+    for row in listing_problem_pairs[:10]:
+        print(row)
+    if any(row.get("blocking") for row in listing_problem_pairs):
+        bad.append("listing_problem_pairs_blocking")
+
 if bad:
     print(f"RUNTIME_VERDICT: DEGRADED flags={bad}")
-else:
-    print("RUNTIME_VERDICT: OK")
+    raise SystemExit(1)
+
+print("RUNTIME_VERDICT: OK")

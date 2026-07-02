@@ -36,7 +36,7 @@ def test_weak_down_on_price_4h_caps_stage3_to_stage2() -> None:
     assert "цена_4ч_слабо_вниз" in reason
 
 
-def test_stage3_degrades_to_stage2_on_price_4h_weak_down() -> None:
+def test_stage3_holds_on_price_4h_weak_down() -> None:
     previous_state = {"current_stage": 3}
     oi_summary = _oi_summary()
     price_summary = ("цена_4ч_слабо_вниз", "блок_стадии_3_по_цене_4ч", False, 2)
@@ -59,12 +59,12 @@ def test_stage3_degrades_to_stage2_on_price_4h_weak_down() -> None:
         90.0,
     )
 
-    assert guarded_stage == 2
-    assert guard_reason == "снижение_3_2:цена_4ч=цена_4ч_слабо_вниз"
-    assert permission == "снижение_3_2_по_цене_4ч"
+    assert guarded_stage == 3
+    assert guard_reason == "удержание_3:только_ручной_или_по_oi_4ч"
+    assert permission == "удержание_3"
 
 
-def test_stage3_degrades_to_stage1_on_price_4h_strong_down() -> None:
+def test_stage3_holds_on_price_4h_strong_down() -> None:
     previous_state = {"current_stage": 3}
     oi_summary = _oi_summary()
     price_summary = ("цена_4ч_сильно_вниз", "жесткий_блок_роста_по_цене_4ч", True, 1)
@@ -87,6 +87,6 @@ def test_stage3_degrades_to_stage1_on_price_4h_strong_down() -> None:
         90.0,
     )
 
-    assert guarded_stage == 1
-    assert guard_reason == "снижение_3_1:цена_4ч=цена_4ч_сильно_вниз"
-    assert permission == "снижение_3_1_по_цене_4ч"
+    assert guarded_stage == 3
+    assert guard_reason == "удержание_3:только_ручной_или_по_oi_4ч"
+    assert permission == "удержание_3"

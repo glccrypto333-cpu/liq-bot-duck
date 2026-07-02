@@ -313,6 +313,40 @@ def _storage_health_text(files: list[Path]) -> str:
 def _runtime_health_text(table_health: list[dict], core_rows: list[dict], stage_history_rows: list[dict]) -> str:
     runtime = _read_json(RUNTIME_REPORTS_DIR / "runtime_health.json")
     cycle = _read_json(RUNTIME_REPORTS_DIR / "cycle_status.json")
+    canonical = _read_json(Path(__file__).resolve().parent / "runtime" / "health.json")
+    if canonical:
+        universe = canonical.get("universe") or {}
+        metrics = canonical.get("metrics") or {}
+        runtime.update(
+            {
+                "status": canonical.get("status"),
+                "global_block_reason": canonical.get("global_block_reason"),
+                "runtime_alerts": canonical.get("alerts") or runtime.get("runtime_alerts") or [],
+                "symbols_total": universe.get("total_symbols"),
+                "symbols_by_exchange": {
+                    "BINANCE": (universe.get("sources", {}).get("binance") or {}).get("monitored"),
+                    "BYBIT": (universe.get("sources", {}).get("bybit") or {}).get("monitored"),
+                },
+                "duck_universe_health": universe.get("universe_health"),
+                "duck_listing_health": universe.get("listing_health"),
+                "data_quality_state": universe.get("data_quality"),
+                "symbols_incomplete_windows": universe.get("incomplete_windows"),
+                "symbols_stale_windows": universe.get("stale_windows"),
+                "symbols_absent_in_duck": universe.get("absent_in_duck"),
+                "data_quality_quarantine_total": universe.get("data_quality_quarantine_total"),
+                "data_quality_quarantine": universe.get("data_quality_quarantine") or universe.get("quarantine") or [],
+            }
+        )
+        cycle.update(
+            {
+                "cycle_health": metrics.get("cycle_health"),
+                "cycle_latency_class": metrics.get("cycle_latency_class"),
+                "cycle_elapsed_seconds": metrics.get("cycle_elapsed_seconds"),
+                "cycle_reserve_seconds": metrics.get("cycle_reserve_seconds"),
+                "cycle_reserve_pct": metrics.get("cycle_reserve_pct"),
+                "overrun_streak": metrics.get("overrun_streak"),
+            }
+        )
     watchdog = _read_text(RUNTIME_REPORTS_DIR / "watchdog_status.txt").strip()
     snapshot = _read_text(RUNTIME_REPORTS_DIR / "snapshot_status.txt").strip()
 
@@ -335,9 +369,20 @@ def _runtime_health_text(table_health: list[dict], core_rows: list[dict], stage_
         f"collect_reserve_health={runtime.get('collect_reserve_health', 'unknown')}",
         f"snapshot_health={runtime.get('snapshot_health', 'unknown')}",
         f"cycle_health={cycle.get('cycle_health', 'unknown')}",
+        f"cycle_latency_class={cycle.get('cycle_latency_class', 'unknown')}",
         f"cycle_elapsed_seconds={cycle.get('cycle_elapsed_seconds', 'n/a')}",
+        f"cycle_reserve_seconds={cycle.get('cycle_reserve_seconds', 'n/a')}",
         f"cycle_sleep_seconds={cycle.get('cycle_sleep_seconds', 'n/a')}",
         f"cycle_reserve_pct={cycle.get('cycle_reserve_pct', 'n/a')}",
+        f"global_block_reason={runtime.get('global_block_reason')}",
+        f"symbols_total={runtime.get('symbols_total', 'n/a')}",
+        f"duck_universe_health={runtime.get('duck_universe_health', 'unknown')}",
+        f"duck_listing_health={runtime.get('duck_listing_health', 'unknown')}",
+        f"data_quality_state={runtime.get('data_quality_state', 'unknown')}",
+        f"symbols_incomplete_windows={runtime.get('symbols_incomplete_windows', 'n/a')}",
+        f"symbols_stale_windows={runtime.get('symbols_stale_windows', 'n/a')}",
+        f"symbols_absent_in_duck={runtime.get('symbols_absent_in_duck', 'n/a')}",
+        f"data_quality_quarantine_total={runtime.get('data_quality_quarantine_total', 'n/a')}",
         f"latest_core_cycle_ts={max([str(row.get('latest_cycle_ts') or '') for row in core_rows] or [''])}",
         "",
         "watchdog_status:",

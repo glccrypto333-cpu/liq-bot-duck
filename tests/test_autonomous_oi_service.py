@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from autonomous_oi_service import _resolve_growth_trigger_ts, build_core_record
+from autonomous_oi_service import _oi_smoothness_class, _resolve_growth_trigger_ts, build_core_record
 
 
 PRICE_OK = ("цена_не_блокирует", "нет", False, 3)
@@ -80,3 +80,11 @@ def test_build_core_record_persists_trigger_and_latest_oi_slopes_for_next_cycle(
     )
     assert row[-6] == trigger_ts
     assert row[-5:] == ("weak_up", "good_up", "strong_up", "good_up", cycle_ts)
+
+
+def test_smoothness_class_uses_new_scale() -> None:
+    assert _oi_smoothness_class({"oi_smoothness_proxy": 0.93}) == "очень_гладко"
+    assert _oi_smoothness_class({"oi_smoothness_proxy": 0.67}) == "гладко"
+    assert _oi_smoothness_class({"oi_smoothness_proxy": 0.52}) == "средне"
+    assert _oi_smoothness_class({"oi_smoothness_proxy": 0.39}) == "рвано"
+    assert _oi_smoothness_class({"oi_smoothness_proxy": 0.27}) == "пила"

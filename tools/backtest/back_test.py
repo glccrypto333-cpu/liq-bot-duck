@@ -18,8 +18,13 @@ from autonomous_oi_replay import (
     load_batch_window_updates,
     load_latest_window_map_for_replay,
 )
-from autonomous_oi_service import compute_autonomous_oi_snapshot_from_latest_window_map, load_previous_core_state_map
-from db import fetch
+from aggregation_engine import build_aggregate_rows, HISTORY_WINDOWS
+from autonomous_oi_service import (
+    attach_oi_trajectory_points,
+    compute_autonomous_oi_snapshot_from_latest_window_map,
+    load_previous_core_state_map,
+)
+from db import fetch, upsert_aggregate_history_rows
 
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -39,6 +44,20 @@ class ReplayPoint:
     price_state: str | None
     blocked_by_price: bool
     blocked_stage_max: int | None
+    oi_form_1h: str | None
+    oi_form_score_1h: int | None
+    oi_hold_1h: str | None
+    oi_pullback_1h: str | None
+    oi_smoothness_1h: str | None
+    oi_concentration_1h: str | None
+    oi_tail_share_1h: str | None
+    oi_flat_tail_1h: str | None
+    oi_retention_ratio_1h: float | None
+    oi_pullback_ratio_1h: float | None
+    oi_smoothness_proxy_1h: float | None
+    oi_concentration_ratio_1h: float | None
+    oi_tail_share_ratio_1h: float | None
+    oi_flat_tail_ratio_1h: float | None
 
 
 def parse_user_ts(value: str) -> datetime:
@@ -86,6 +105,41 @@ def load_cycle_timestamps_between(
     return query("aggregate_windows_history"), "history"
 
 
+def restore_history_from_raw(
+    exchange: str,
+    symbol: str,
+    start_ts: datetime,
+    end_ts: datetime,
+) -> dict:
+    tracked_pairs = [(exchange, symbol)]
+    context_start = start_ts - timedelta(hours=4)
+    fetch_end = end_ts + timedelta(minutes=5)
+    rows_out, stats = build_aggregate_rows(
+        selected_windows=HISTORY_WINDOWS,
+        selected_metrics=("OI", "PRICE", "VOLUME"),
+        active_only=False,
+        start_ts=context_start,
+        end_ts=fetch_end,
+        tracked_pairs=tracked_pairs,
+    )
+    filtered_rows = [
+        row
+        for row in rows_out
+        if row[4] == exchange
+        and row[5] == symbol
+        and start_ts <= row[3] <= end_ts
+    ]
+    synced = upsert_aggregate_history_rows(filtered_rows)
+    return {
+        "exchange": exchange,
+        "symbol": symbol,
+        "raw_rows": len(rows_out),
+        "restored_rows": len(filtered_rows),
+        "history_synced": synced,
+        "stats": stats,
+    }
+
+
 def build_initial_state(state_mode: str) -> dict[tuple[str, str], dict]:
     if state_mode == "fresh":
         return {}
@@ -104,17 +158,22 @@ def replay_single_case(
     control_points: list[datetime],
 ) -> dict:
     cycles, resolved_window_source = load_cycle_timestamps_between(start_ts, end_ts, window_source)
+    restored_from_raw = None
     if not cycles:
-        return {
-            "exchange": exchange,
-            "symbol": symbol,
-            "state_mode": state_mode,
-            "window_source": resolved_window_source,
-            "start_ts": start_ts.isoformat(),
-            "end_ts": end_ts.isoformat(),
-            "cycles": 0,
-            "error": "нет_циклов_в_интервале",
-        }
+        restored_from_raw = restore_history_from_raw(exchange, symbol, start_ts, end_ts)
+        cycles, resolved_window_source = load_cycle_timestamps_between(start_ts, end_ts, "history")
+        if not cycles:
+            return {
+                "exchange": exchange,
+                "symbol": symbol,
+                "state_mode": state_mode,
+                "window_source": resolved_window_source,
+                "start_ts": start_ts.isoformat(),
+                "end_ts": end_ts.isoformat(),
+                "cycles": 0,
+                "restored_from_raw": restored_from_raw,
+                "error": "нет_циклов_в_интервале",
+            }
 
     tracked_key = (exchange, symbol)
     tracked_pairs = [tracked_key]
@@ -139,11 +198,15 @@ def replay_single_case(
     previous_stage: int | None = None
 
     for cycle_ts in cycles:
+        has_window_updates = False
         for row in updates_by_cycle.get(cycle_ts, []):
             key = (row["exchange"], row["symbol"])
             latest_window_map.setdefault(key, {})
             latest_window_map[key].setdefault(row["window_code"], {})
             latest_window_map[key][row["window_code"]][row["metric"]] = row
+            has_window_updates = True
+        if has_window_updates:
+            attach_oi_trajectory_points(latest_window_map)
 
         _core_rows, _window_rows, _history_rows, state_map = compute_autonomous_oi_snapshot_from_latest_window_map(
             latest_window_map,
@@ -171,6 +234,20 @@ def replay_single_case(
             price_state=state.get("price_state_summary"),
             blocked_by_price=bool(state.get("blocked_by_price")),
             blocked_stage_max=state.get("blocked_stage_max"),
+            oi_form_1h=state.get("oi_form_class_1h"),
+            oi_form_score_1h=state.get("oi_form_score_1h"),
+            oi_hold_1h=state.get("oi_hold_class_1h"),
+            oi_pullback_1h=state.get("oi_pullback_class_1h"),
+            oi_smoothness_1h=state.get("oi_smoothness_class_1h"),
+            oi_concentration_1h=state.get("oi_concentration_class_1h"),
+            oi_tail_share_1h=state.get("oi_tail_share_class_1h"),
+            oi_flat_tail_1h=state.get("oi_flat_tail_class_1h"),
+            oi_retention_ratio_1h=state.get("oi_retention_ratio_1h"),
+            oi_pullback_ratio_1h=state.get("oi_pullback_ratio_1h"),
+            oi_smoothness_proxy_1h=state.get("oi_smoothness_proxy_1h"),
+            oi_concentration_ratio_1h=state.get("oi_concentration_ratio_1h"),
+            oi_tail_share_ratio_1h=state.get("oi_tail_share_ratio_1h"),
+            oi_flat_tail_ratio_1h=state.get("oi_flat_tail_ratio_1h"),
         )
         while control_index < len(control_targets) and cycle_ts >= control_targets[control_index]:
             control_ts = control_targets[control_index]
@@ -192,6 +269,20 @@ def replay_single_case(
                         "price_state": point.price_state,
                         "blocked_by_price": point.blocked_by_price,
                         "blocked_stage_max": point.blocked_stage_max,
+                        "oi_form_1h": point.oi_form_1h,
+                        "oi_form_score_1h": point.oi_form_score_1h,
+                        "oi_hold_1h": point.oi_hold_1h,
+                        "oi_pullback_1h": point.oi_pullback_1h,
+                        "oi_smoothness_1h": point.oi_smoothness_1h,
+                        "oi_concentration_1h": point.oi_concentration_1h,
+                        "oi_tail_share_1h": point.oi_tail_share_1h,
+                        "oi_flat_tail_1h": point.oi_flat_tail_1h,
+                        "oi_retention_ratio_1h": point.oi_retention_ratio_1h,
+                        "oi_pullback_ratio_1h": point.oi_pullback_ratio_1h,
+                        "oi_smoothness_proxy_1h": point.oi_smoothness_proxy_1h,
+                        "oi_concentration_ratio_1h": point.oi_concentration_ratio_1h,
+                        "oi_tail_share_ratio_1h": point.oi_tail_share_ratio_1h,
+                        "oi_flat_tail_ratio_1h": point.oi_flat_tail_ratio_1h,
                     },
                 }
             )
@@ -219,6 +310,20 @@ def replay_single_case(
                     "price_state": point.price_state,
                     "blocked_by_price": point.blocked_by_price,
                     "blocked_stage_max": point.blocked_stage_max,
+                    "oi_form_1h": point.oi_form_1h,
+                    "oi_form_score_1h": point.oi_form_score_1h,
+                    "oi_hold_1h": point.oi_hold_1h,
+                    "oi_pullback_1h": point.oi_pullback_1h,
+                    "oi_smoothness_1h": point.oi_smoothness_1h,
+                    "oi_concentration_1h": point.oi_concentration_1h,
+                    "oi_tail_share_1h": point.oi_tail_share_1h,
+                    "oi_flat_tail_1h": point.oi_flat_tail_1h,
+                    "oi_retention_ratio_1h": point.oi_retention_ratio_1h,
+                    "oi_pullback_ratio_1h": point.oi_pullback_ratio_1h,
+                    "oi_smoothness_proxy_1h": point.oi_smoothness_proxy_1h,
+                    "oi_concentration_ratio_1h": point.oi_concentration_ratio_1h,
+                    "oi_tail_share_ratio_1h": point.oi_tail_share_ratio_1h,
+                    "oi_flat_tail_ratio_1h": point.oi_flat_tail_ratio_1h,
                 }
             )
             previous_stage = current_stage
@@ -245,6 +350,20 @@ def replay_single_case(
                     "price_state": last_point.price_state,
                     "blocked_by_price": last_point.blocked_by_price,
                     "blocked_stage_max": last_point.blocked_stage_max,
+                    "oi_form_1h": last_point.oi_form_1h,
+                    "oi_form_score_1h": last_point.oi_form_score_1h,
+                    "oi_hold_1h": last_point.oi_hold_1h,
+                    "oi_pullback_1h": last_point.oi_pullback_1h,
+                    "oi_smoothness_1h": last_point.oi_smoothness_1h,
+                    "oi_concentration_1h": last_point.oi_concentration_1h,
+                    "oi_tail_share_1h": last_point.oi_tail_share_1h,
+                    "oi_flat_tail_1h": last_point.oi_flat_tail_1h,
+                    "oi_retention_ratio_1h": last_point.oi_retention_ratio_1h,
+                    "oi_pullback_ratio_1h": last_point.oi_pullback_ratio_1h,
+                    "oi_smoothness_proxy_1h": last_point.oi_smoothness_proxy_1h,
+                    "oi_concentration_ratio_1h": last_point.oi_concentration_ratio_1h,
+                    "oi_tail_share_ratio_1h": last_point.oi_tail_share_ratio_1h,
+                    "oi_flat_tail_ratio_1h": last_point.oi_flat_tail_ratio_1h,
                 },
             }
         )
@@ -260,6 +379,7 @@ def replay_single_case(
         "end_ts": end_ts.isoformat(),
         "end_msk": fmt_msk(end_ts),
         "cycles": len(cycles),
+        "restored_from_raw": restored_from_raw,
         "first_stage_1_ts": first_stage_at[1].isoformat() if first_stage_at[1] else None,
         "first_stage_1_msk": fmt_msk(first_stage_at[1]),
         "first_stage_2_ts": first_stage_at[2].isoformat() if first_stage_at[2] else None,
@@ -285,6 +405,12 @@ def print_human_report(report: dict) -> None:
     print(f"Начало: {report.get('start_msk')}")
     print(f"Конец: {report.get('end_msk')}")
     print(f"Циклов: {report.get('cycles')}")
+    if report.get("restored_from_raw"):
+        restored = report["restored_from_raw"]
+        print(
+            "Восстановление истории из raw: "
+            f"rows={restored.get('restored_rows')} synced={restored.get('history_synced')}"
+        )
     if report.get("error"):
         print(f"Ошибка: {report['error']}")
         return
@@ -306,7 +432,10 @@ def print_human_report(report: dict) -> None:
             print(
                 f"- {item['cycle_msk']} | {item['from_stage']} -> {item['to_stage']} | "
                 f"15м={item['oi_15m']} 30м={item['oi_30m']} 1ч={item['oi_1h']} 4ч={item['oi_4h']} | "
-                f"цена={item['price_state']} | {item['reason']}"
+                f"цена={item['price_state']} | форма={item['oi_form_1h']} "
+                f"оценка={item.get('oi_form_score_1h')} "
+                f"удерж={item['oi_hold_1h']} откат={item['oi_pullback_1h']} "
+                f"гладк={item['oi_smoothness_1h']} | {item['reason']}"
             )
 
     if report["control_points"]:
@@ -320,7 +449,22 @@ def print_human_report(report: dict) -> None:
             print(
                 f"- {item['control_msk']} | стадия={snap['stage']} | "
                 f"15м={snap['oi_15m']} 30м={snap['oi_30m']} 1ч={snap['oi_1h']} 4ч={snap['oi_4h']} | "
-                f"цена={snap['price_state']} | {snap['reason']}"
+                f"цена={snap['price_state']} | форма={snap['oi_form_1h']} "
+                f"оценка={snap.get('oi_form_score_1h')} "
+                f"удерж={snap['oi_hold_1h']} откат={snap['oi_pullback_1h']} "
+                f"гладк={snap['oi_smoothness_1h']} | {snap['reason']}"
+            )
+            print(
+                "  "
+                f"концентрация={snap['oi_concentration_1h']} "
+                f"хвост={snap['oi_tail_share_1h']} "
+                f"плоский_хвост={snap['oi_flat_tail_1h']} | "
+                f"ret={snap['oi_retention_ratio_1h']} "
+                f"pull={snap['oi_pullback_ratio_1h']} "
+                f"smooth={snap['oi_smoothness_proxy_1h']} "
+                f"conc={snap['oi_concentration_ratio_1h']} "
+                f"tail={snap['oi_tail_share_ratio_1h']} "
+                f"flat_tail={snap['oi_flat_tail_ratio_1h']}"
             )
 
 

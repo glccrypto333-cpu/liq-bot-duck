@@ -59,7 +59,7 @@ def test_replace_aggregate_layers_atomically_uses_dedicated_connection(monkeypat
     monkeypatch.setattr(db, "_fresh_conn", lambda: fake_conn)
 
     rows = [
-        ("OI", "15m", "2026-06-23 20:00:00+00", "2026-06-23 20:15:00+00", "BYBIT", "TESTUSDT", 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 3),
+        ("OI", "15m", "2026-06-23 20:00:00+00", "2026-06-23 20:15:00+00", "BYBIT", "TESTUSDT", 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 3, None),
     ]
 
     db.replace_aggregate_layers_atomically(rows)

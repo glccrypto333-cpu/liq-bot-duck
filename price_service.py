@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from phase_common import classify_oi_slope, value_slope_ratio
 
+PRICE_30M_STAGE3_BLOCK_CLASSES = {"weak_down", "strong_down"}
+PRICE_1H_STAGE3_BLOCK_CLASSES = {"weak_down", "strong_down"}
 PRICE_4H_HARD_BLOCK_CLASS = "strong_down"
 PRICE_4H_STAGE3_BLOCK_CLASS = "weak_down"
 
@@ -18,6 +20,12 @@ def compute_price_window_state(window_payload: dict[str, dict[str, dict] | None]
         breakdown = "жесткий_блок"
     elif window_code == "4ч" and slope_class == PRICE_4H_STAGE3_BLOCK_CLASS:
         state = "цена_4ч_слабо_вниз"
+        breakdown = "блок_3"
+    elif window_code == "1ч" and slope_class in PRICE_1H_STAGE3_BLOCK_CLASSES:
+        state = "цена_1ч_вниз"
+        breakdown = "блок_3"
+    elif window_code == "30м" and slope_class in PRICE_30M_STAGE3_BLOCK_CLASSES:
+        state = "цена_30м_вниз"
         breakdown = "блок_3"
     else:
         state = "цена_не_блокирует"
@@ -37,7 +45,7 @@ def compute_price_window_state(window_payload: dict[str, dict[str, dict] | None]
             "жесткий"
             if state == "цена_4ч_сильно_вниз"
             else "стадия_3"
-            if state == "цена_4ч_слабо_вниз"
+            if state in {"цена_4ч_слабо_вниз", "цена_1ч_вниз", "цена_30м_вниз"}
             else "нет"
         ),
         "price_slope_ratio": round(slope_ratio, 6),
@@ -46,16 +54,26 @@ def compute_price_window_state(window_payload: dict[str, dict[str, dict] | None]
     }
 
 
-def summarize_price(window_states: list[dict], target_stage: int) -> tuple[str, str, bool, int]:
+def summarize_price(window_states: list[dict], target_stage: int) -> tuple[str, str, bool, int, str, str]:
     del target_stage
 
     states_by_window = {state["window_code"]: state for state in window_states}
     state_4h = states_by_window.get("4ч", {})
-    state_code = state_4h.get("price_state_code", "цена_не_блокирует")
+    state_1h = states_by_window.get("1ч", {})
+    state_30m = states_by_window.get("30м", {})
+    state_code_4h = state_4h.get("price_state_code", "цена_не_блокирует")
+    state_code_1h = state_1h.get("price_state_code", "цена_не_блокирует")
+    state_code_30m = state_30m.get("price_state_code", "цена_не_блокирует")
+    price_direction_1h = state_1h.get("price_direction", "flat")
+    price_direction_30m = state_30m.get("price_direction", "flat")
 
-    if state_code == "цена_4ч_сильно_вниз":
-        return "цена_4ч_сильно_вниз", "жесткий_блок_роста_по_цене_4ч", True, 1
-    if state_code == "цена_4ч_слабо_вниз":
-        return "цена_4ч_слабо_вниз", "блок_стадии_3_по_цене_4ч", False, 2
+    if state_code_4h == "цена_4ч_сильно_вниз":
+        return "цена_4ч_сильно_вниз", "жесткий_блок_роста_по_цене_4ч", True, 1, price_direction_30m, price_direction_1h
+    if state_code_4h == "цена_4ч_слабо_вниз":
+        return "цена_4ч_слабо_вниз", "блок_стадии_3_по_цене_4ч", False, 2, price_direction_30m, price_direction_1h
+    if state_code_1h == "цена_1ч_вниз":
+        return "цена_1ч_вниз", "блок_стадии_3_по_цене_1ч", False, 2, price_direction_30m, price_direction_1h
+    if state_code_30m == "цена_30м_вниз":
+        return "цена_30м_вниз", "блок_стадии_3_по_цене_30м", False, 2, price_direction_30m, price_direction_1h
 
-    return "цена_не_блокирует", "нет", False, 3
+    return "цена_не_блокирует", "нет", False, 3, price_direction_30m, price_direction_1h

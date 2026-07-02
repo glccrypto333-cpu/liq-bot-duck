@@ -95,6 +95,7 @@ def test_strong_15m_without_30m_confirmation_does_not_create_stage_2() -> None:
 def test_2_to_3_is_blocked_by_4h_oi_weak_down() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_15m="flat", oi_30m="good_up", oi_1h="weak_up", oi_4h="weak_down")
+    summary["oi_growth_pct_1h"] = 9.0
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
 
     stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 30.0, 60.0)
@@ -103,28 +104,20 @@ def test_2_to_3_is_blocked_by_4h_oi_weak_down() -> None:
     assert reason == "удержание_2:30м_или_1ч_еще_не_созрели"
 
 
-def test_2_to_3_requires_mature_30m_and_positive_1h() -> None:
+def test_2_to_3_requires_mature_30m_and_mature_1h() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_15m="flat", oi_30m="good_up", oi_1h="weak_up", oi_4h="flat")
-    target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+    summary["oi_growth_pct_1h"] = 9.0
+    target_stage, reason = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
 
-    stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 29.0, 59.0)
-    assert target_stage == 3
-    assert stage == 2
-    assert reason == "удержание_2:ждем_30_минут"
-
-    stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 30.0, 59.0)
-    assert stage == 2
-    assert reason == "удержание_2:ждем_1ч_от_триггера"
-
-    stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 30.0, 60.0)
-    assert stage == 3
-    assert reason == "переход_2_3:30м_зрелое_1ч_подтверждает_силу"
+    assert target_stage == 2
+    assert reason == "30м_подтвердило_живой_набор"
 
 
 def test_2_to_3_allows_15m_weak_down_as_local_pause() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_15m="weak_down", oi_30m="strong_up", oi_1h="good_up", oi_4h="good_up")
+    summary["oi_growth_pct_1h"] = 9.0
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
     stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 35.0, 60.0)
     assert target_stage == 3
@@ -135,6 +128,7 @@ def test_2_to_3_allows_15m_weak_down_as_local_pause() -> None:
 def test_15m_strong_down_does_not_drop_stage_2_but_blocks_fresh_stage_3() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_15m="strong_down", oi_30m="good_up", oi_1h="good_up", oi_4h="good_up")
+    summary["oi_growth_pct_1h"] = 9.0
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
     stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 35.0, 60.0)
     assert target_stage == 2
@@ -182,11 +176,11 @@ def test_4h_strong_down_resets_stage_1_to_0() -> None:
     assert reason == "снижение_1_0:oi_4ч=strong_down"
 
 
-def test_stage_3_degrades_on_strong_price_4h_block() -> None:
+def test_stage_3_holds_on_strong_price_4h_block() -> None:
     previous_state = {"current_stage": 3}
     stage, reason = apply_stage_guardrails(previous_state, 0, make_oi_summary(oi_4h="good_up"), PRICE_BLOCK, VOLUME_DUMMY, 12.0, 0.0)
-    assert stage == 1
-    assert reason == "снижение_3_1:цена_4ч=цена_4ч_сильно_вниз"
+    assert stage == 3
+    assert reason == "удержание_3:только_ручной_или_по_oi_4ч"
 
 
 def test_stage_3_resets_on_4h_oi_weak_down() -> None:
@@ -212,6 +206,7 @@ def test_transition_permission_uses_new_codes_for_stage_2_wait() -> None:
 def test_1_to_2_requires_strong_1h_when_15m_only_weak_up() -> None:
     previous_state = {"current_stage": 1}
     summary = make_oi_summary(oi_15m="weak_up", oi_30m="good_up", oi_1h="good_up", oi_4h="good_up")
+    summary["oi_growth_pct_1h"] = 9.0
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
     stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 45.0, 45.0)
     assert target_stage == 3
@@ -222,6 +217,7 @@ def test_1_to_2_requires_strong_1h_when_15m_only_weak_up() -> None:
 def test_1_to_2_allows_weak_15m_if_30m_is_mature_and_1h_is_strong() -> None:
     previous_state = {"current_stage": 1}
     summary = make_oi_summary(oi_15m="weak_up", oi_30m="good_up", oi_1h="strong_up", oi_4h="good_up")
+    summary["oi_growth_pct_1h"] = 9.0
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
     stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 45.0, 45.0)
     assert target_stage == 3
@@ -239,3 +235,61 @@ def test_transition_permission_marks_stage_3_reset_by_4h_oi() -> None:
     previous_state = {"current_stage": 3}
     permission = compute_transition_permission(previous_state, 0, 10.0, make_oi_summary(oi_4h="weak_down"), PRICE_OK, 0.0)
     assert permission == "сброс_3_0_по_oi_4ч"
+
+
+def test_stage_3_holds_on_price_30m_down_when_oi_is_still_mature() -> None:
+    previous_state = {"current_stage": 3}
+    price_30m_down = ("цена_30м_вниз", "блок_стадии_3_по_цене_30м", False, 2, "weak_down", "flat")
+    summary = make_oi_summary(oi_15m="flat", oi_30m="good_up", oi_1h="good_up", oi_4h="good_up")
+    summary["oi_growth_pct_1h"] = 9.0
+
+    stage, reason = apply_stage_guardrails(previous_state, 2, summary, price_30m_down, VOLUME_DUMMY, 60.0, 90.0)
+    permission = compute_transition_permission(previous_state, 2, 60.0, summary, price_30m_down, 90.0)
+
+    assert stage == 3
+    assert reason == "удержание_3:только_ручной_или_по_oi_4ч"
+    assert permission == "удержание_3"
+
+
+def test_stage_3_holds_on_price_1h_down_when_oi_is_still_mature() -> None:
+    previous_state = {"current_stage": 3}
+    price_1h_down = ("цена_1ч_вниз", "блок_стадии_3_по_цене_1ч", False, 2, "flat", "weak_down")
+    summary = make_oi_summary(oi_15m="weak_down", oi_30m="strong_up", oi_1h="good_up", oi_4h="good_up")
+    summary["oi_growth_pct_1h"] = 9.0
+
+    stage, reason = apply_stage_guardrails(previous_state, 2, summary, price_1h_down, VOLUME_DUMMY, 60.0, 90.0)
+    permission = compute_transition_permission(previous_state, 2, 60.0, summary, price_1h_down, 90.0)
+
+    assert stage == 3
+    assert reason == "удержание_3:только_ручной_или_по_oi_4ч"
+    assert permission == "удержание_3"
+
+
+def test_2_to_3_is_blocked_when_good_1h_growth_below_4_5pct() -> None:
+    summary = make_oi_summary(oi_15m="good_up", oi_30m="strong_up", oi_1h="good_up", oi_4h="good_up")
+    summary["oi_growth_pct_1h"] = 4.4
+
+    target_stage, reason = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+
+    assert target_stage == 2
+    assert reason == "рост_oi_1ч_недостаточен_для_умеренного_1ч:выше_2_не_пускаем"
+
+
+def test_2_to_3_is_allowed_when_good_1h_growth_reaches_4_5pct() -> None:
+    summary = make_oi_summary(oi_15m="good_up", oi_30m="strong_up", oi_1h="good_up", oi_4h="good_up")
+    summary["oi_growth_pct_1h"] = 4.5
+
+    target_stage, reason = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+
+    assert target_stage == 3
+    assert reason == "30м_зрелое_1ч_подтверждает_силу"
+
+
+def test_2_to_3_allows_strong_1h_even_when_growth_below_old_7pct() -> None:
+    summary = make_oi_summary(oi_15m="good_up", oi_30m="strong_up", oi_1h="strong_up", oi_4h="good_up")
+    summary["oi_growth_pct_1h"] = 6.0
+
+    target_stage, reason = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+
+    assert target_stage == 3
+    assert reason == "30м_зрелое_1ч_подтверждает_силу"

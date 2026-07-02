@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import psycopg
 from psycopg.rows import dict_row
 from config import DATABASE_URL, RAW_RETENTION_DAYS
@@ -165,6 +166,7 @@ def init_db() -> None:
             avg_value DOUBLE PRECISION,
             delta_pct DOUBLE PRECISION,
             unique_candles INTEGER NOT NULL,
+            trajectory_points JSONB,
             source_cycle_ts TIMESTAMPTZ,
             built_at TIMESTAMPTZ DEFAULT NOW()
         )
@@ -185,10 +187,13 @@ def init_db() -> None:
             avg_value DOUBLE PRECISION,
             delta_pct DOUBLE PRECISION,
             unique_candles INTEGER NOT NULL,
+            trajectory_points JSONB,
             source_cycle_ts TIMESTAMPTZ,
             built_at TIMESTAMPTZ DEFAULT NOW()
         )
         """)
+        safe_ddl(cur, "ALTER TABLE aggregate_windows ADD COLUMN IF NOT EXISTS trajectory_points JSONB")
+        safe_ddl(cur, "ALTER TABLE aggregate_windows_history ADD COLUMN IF NOT EXISTS trajectory_points JSONB")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS oi_core_state(
             exchange TEXT NOT NULL,
@@ -529,6 +534,22 @@ def init_db() -> None:
             symbol TEXT NOT NULL,
             activated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             source TEXT NOT NULL DEFAULT 'runtime_limit',
+            PRIMARY KEY(exchange, symbol)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS data_quality_quarantine(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            reason_hint TEXT,
+            missing_list TEXT,
+            stale_list TEXT,
+            first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            restored_at TIMESTAMPTZ,
+            status TEXT NOT NULL DEFAULT 'active',
             PRIMARY KEY(exchange, symbol)
         )
         """)
@@ -893,9 +914,9 @@ def upsert_aggregate_history_rows(rows: list[tuple]) -> int:
         INSERT INTO aggregate_windows_history(
             metric, window_code, ts_open, ts_close, exchange, symbol,
             open_value, high_value, low_value, close_value,
-            sum_value, avg_value, delta_pct, unique_candles,
+            sum_value, avg_value, delta_pct, unique_candles, trajectory_points,
             source_cycle_ts, built_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,NOW())
         ON CONFLICT (metric, window_code, exchange, symbol, ts_open)
         DO UPDATE SET
             ts_close=EXCLUDED.ts_close,
@@ -907,6 +928,7 @@ def upsert_aggregate_history_rows(rows: list[tuple]) -> int:
             avg_value=EXCLUDED.avg_value,
             delta_pct=EXCLUDED.delta_pct,
             unique_candles=EXCLUDED.unique_candles,
+            trajectory_points=EXCLUDED.trajectory_points,
             source_cycle_ts=EXCLUDED.source_cycle_ts,
             built_at=NOW()
         """
@@ -917,12 +939,13 @@ def upsert_aggregate_history_rows(rows: list[tuple]) -> int:
                     metric, timeframe, ts_open, ts_close, exchange, symbol,
                     open_value, high_value, low_value, close_value,
                     sum_value, avg_value, delta_pct, unique_candles,
+                    json.dumps(trajectory_points) if trajectory_points is not None else None,
                     ts_close,
                 )
                 for (
                     metric, timeframe, ts_open, ts_close, exchange, symbol,
                     open_value, high_value, low_value, close_value,
-                    sum_value, avg_value, delta_pct, unique_candles,
+                    sum_value, avg_value, delta_pct, unique_candles, trajectory_points,
                 ) in rows[i:i + batch_size]
             ]
             cur.executemany(insert_sql, batch)
@@ -942,9 +965,9 @@ def upsert_aggregate_hot_rows(rows: list[tuple]) -> int:
         INSERT INTO aggregate_windows(
             metric, window_code, ts_open, ts_close, exchange, symbol,
             open_value, high_value, low_value, close_value,
-            sum_value, avg_value, delta_pct, unique_candles,
+            sum_value, avg_value, delta_pct, unique_candles, trajectory_points,
             source_cycle_ts, built_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,NOW())
         ON CONFLICT (metric, window_code, exchange, symbol, ts_open)
         DO UPDATE SET
             ts_close=EXCLUDED.ts_close,
@@ -956,6 +979,7 @@ def upsert_aggregate_hot_rows(rows: list[tuple]) -> int:
             avg_value=EXCLUDED.avg_value,
             delta_pct=EXCLUDED.delta_pct,
             unique_candles=EXCLUDED.unique_candles,
+            trajectory_points=EXCLUDED.trajectory_points,
             source_cycle_ts=EXCLUDED.source_cycle_ts,
             built_at=NOW()
         """
@@ -966,12 +990,13 @@ def upsert_aggregate_hot_rows(rows: list[tuple]) -> int:
                     metric, timeframe, ts_open, ts_close, exchange, symbol,
                     open_value, high_value, low_value, close_value,
                     sum_value, avg_value, delta_pct, unique_candles,
+                    json.dumps(trajectory_points) if trajectory_points is not None else None,
                     ts_close,
                 )
                 for (
                     metric, timeframe, ts_open, ts_close, exchange, symbol,
                     open_value, high_value, low_value, close_value,
-                    sum_value, avg_value, delta_pct, unique_candles,
+                    sum_value, avg_value, delta_pct, unique_candles, trajectory_points,
                 ) in rows[i:i + batch_size]
             ]
             cur.executemany(insert_sql, batch)
@@ -1017,9 +1042,9 @@ def replace_aggregate_layers_atomically(rows: list[tuple]) -> None:
             INSERT INTO aggregate_windows(
                 metric, window_code, ts_open, ts_close, exchange, symbol,
                 open_value, high_value, low_value, close_value,
-                sum_value, avg_value, delta_pct, unique_candles,
+                sum_value, avg_value, delta_pct, unique_candles, trajectory_points,
                 source_cycle_ts, built_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,NOW())
             ON CONFLICT (metric, window_code, exchange, symbol, ts_open)
             DO UPDATE SET
                 ts_close=EXCLUDED.ts_close,
@@ -1031,6 +1056,7 @@ def replace_aggregate_layers_atomically(rows: list[tuple]) -> None:
                 avg_value=EXCLUDED.avg_value,
                 delta_pct=EXCLUDED.delta_pct,
                 unique_candles=EXCLUDED.unique_candles,
+                trajectory_points=EXCLUDED.trajectory_points,
                 source_cycle_ts=EXCLUDED.source_cycle_ts,
                 built_at=NOW()
             """
@@ -1041,12 +1067,13 @@ def replace_aggregate_layers_atomically(rows: list[tuple]) -> None:
                         metric, timeframe, ts_open, ts_close, exchange, symbol,
                         open_value, high_value, low_value, close_value,
                         sum_value, avg_value, delta_pct, unique_candles,
+                        json.dumps(trajectory_points) if trajectory_points is not None else None,
                         ts_close,
                     )
                     for (
                         metric, timeframe, ts_open, ts_close, exchange, symbol,
                         open_value, high_value, low_value, close_value,
-                        sum_value, avg_value, delta_pct, unique_candles,
+                        sum_value, avg_value, delta_pct, unique_candles, trajectory_points,
                     ) in rows[i:i + batch_size]
                 ]
                 cur.executemany(insert_sql, batch)
@@ -1385,25 +1412,75 @@ def insert_oi_stage_history(rows: list[tuple]) -> None:
 
 
 def replace_active_universe(rows: list[tuple]) -> None:
-    execute("DELETE FROM active_symbol_universe")
-    if not DATABASE_URL or not rows:
+    if not DATABASE_URL:
         return
+    existing_rows = fetch("SELECT exchange, symbol, source FROM active_symbol_universe")
+    existing_map = {
+        (str(row.get("exchange")), str(row.get("symbol"))): str(row.get("source") or "")
+        for row in existing_rows
+    }
+    next_map = {
+        (str(exchange), str(symbol)): str(source or "")
+        for exchange, symbol, source in rows
+    }
+
+    to_delete = [
+        (exchange, symbol)
+        for exchange, symbol in existing_map.keys()
+        if (exchange, symbol) not in next_map
+    ]
+    to_update = [
+        (source, exchange, symbol)
+        for (exchange, symbol), source in next_map.items()
+        if existing_map.get((exchange, symbol)) != source
+    ]
+    to_insert = [
+        (exchange, symbol, source)
+        for (exchange, symbol), source in next_map.items()
+        if (exchange, symbol) not in existing_map
+    ]
+
     with _conn() as conn, conn.cursor() as cur:
-        cur.executemany("""
-        INSERT INTO active_symbol_universe(exchange, symbol, source, activated_at)
-        VALUES (%s,%s,%s,NOW())
-        ON CONFLICT (exchange, symbol)
-        DO UPDATE SET source=EXCLUDED.source, activated_at=NOW()
-        """, rows)
+        if to_delete:
+            cur.executemany("""
+            DELETE FROM active_symbol_universe
+            WHERE exchange = %s AND symbol = %s
+            """, to_delete)
+
+        if to_update:
+            cur.executemany("""
+            UPDATE active_symbol_universe
+            SET source = %s
+            WHERE exchange = %s AND symbol = %s
+            """, to_update)
+
+        if to_insert:
+            cur.executemany("""
+            INSERT INTO active_symbol_universe(exchange, symbol, source, activated_at)
+            VALUES (%s,%s,%s,NOW())
+            ON CONFLICT (exchange, symbol)
+            DO UPDATE SET source = EXCLUDED.source
+            """, to_insert)
 
 
-def active_universe_sql(alias: str = "") -> str:
+def active_universe_sql(alias: str = "", include_data_quality_quarantine: bool = True) -> str:
     prefix = f"{alias}." if alias else ""
-    return (
+    base = (
         "EXISTS ("
         "SELECT 1 FROM active_symbol_universe au "
         f"WHERE au.exchange = {prefix}exchange "
         f"AND au.symbol = {prefix}symbol"
+        ")"
+    )
+    if not include_data_quality_quarantine:
+        return base
+    return (
+        f"{base} "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM data_quality_quarantine dq "
+        f"WHERE dq.exchange = {prefix}exchange "
+        f"AND dq.symbol = {prefix}symbol "
+        "AND dq.status = 'active'"
         ")"
     )
 
@@ -1768,6 +1845,74 @@ def load_quarantine_symbols(min_coverage_pct: float = 95.0) -> set[tuple[str, st
     """, (min_coverage_pct,))
 
     return {(r["exchange"], r["symbol"]) for r in rows}
+
+
+def load_data_quality_quarantine_symbols() -> set[tuple[str, str]]:
+    if not DATABASE_URL:
+        return set()
+
+    rows = fetch("""
+        SELECT exchange, symbol
+        FROM data_quality_quarantine
+        WHERE status = 'active'
+        GROUP BY exchange, symbol
+    """)
+
+    return {(r["exchange"], r["symbol"]) for r in rows}
+
+
+def sync_data_quality_quarantine(rows: list[tuple]) -> dict[str, int]:
+    if not DATABASE_URL:
+        return {"active": 0, "restored": 0}
+
+    active_keys = {(exchange, symbol) for exchange, symbol, *_ in rows}
+    active_existing = fetch("""
+        SELECT exchange, symbol
+        FROM data_quality_quarantine
+        WHERE status = 'active'
+    """)
+    restored_rows = [
+        (r["exchange"], r["symbol"])
+        for r in active_existing
+        if (r["exchange"], r["symbol"]) not in active_keys
+    ]
+
+    with _conn() as conn, conn.cursor() as cur:
+        if rows:
+            cur.executemany("""
+            INSERT INTO data_quality_quarantine(
+                exchange,
+                symbol,
+                reason_code,
+                reason_hint,
+                missing_list,
+                stale_list,
+                first_seen_at,
+                last_seen_at,
+                status,
+                restored_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,NOW(),NOW(),'active',NULL)
+            ON CONFLICT(exchange, symbol)
+            DO UPDATE SET
+                reason_code = EXCLUDED.reason_code,
+                reason_hint = EXCLUDED.reason_hint,
+                missing_list = EXCLUDED.missing_list,
+                stale_list = EXCLUDED.stale_list,
+                last_seen_at = NOW(),
+                status = 'active',
+                restored_at = NULL
+            """, rows)
+
+        if restored_rows:
+            cur.executemany("""
+            UPDATE data_quality_quarantine
+            SET status = 'restored',
+                restored_at = NOW(),
+                last_seen_at = NOW()
+            WHERE exchange = %s AND symbol = %s
+            """, restored_rows)
+
+    return {"active": len(active_keys), "restored": len(restored_rows)}
 
 def cleanup_old(days: int) -> None:
     raw_days = int(days or RAW_RETENTION_DAYS)
