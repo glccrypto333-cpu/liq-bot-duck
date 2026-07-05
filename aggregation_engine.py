@@ -81,6 +81,31 @@ def _select_window_chunk(items, anchor_ts: datetime, timeframe: str, need: int):
     return window_items
 
 
+def _previous_contiguous_item(items: list[dict], first_item: dict) -> dict | None:
+    expected_close = first_item["ts_open"]
+    for item in reversed(items):
+        if item["ts_close"] == expected_close:
+            return item
+        if item["ts_close"] < expected_close:
+            return None
+    return None
+
+
+def _oi_window_values(chunk: list[dict], previous_item: dict | None) -> tuple[float, float, float, float, float | None, list[float]]:
+    # OI raw is point-based, so the real window open is the previous closed point.
+    open_value = previous_item["oi_close"] if previous_item is not None else chunk[0]["oi_open"]
+    close_value = chunk[-1]["oi_close"]
+    trajectory = ([open_value] if previous_item is not None else []) + [x["oi_close"] for x in chunk]
+    return (
+        open_value,
+        max([open_value, *[x["oi_high"] for x in chunk]]),
+        min([open_value, *[x["oi_low"] for x in chunk]]),
+        close_value,
+        изменение_в_процентах(open_value, close_value),
+        trajectory,
+    )
+
+
 def _window_items(selected_windows: tuple[str, ...] | None):
     window_names = selected_windows or tuple(WINDOWS.keys())
     return [(timeframe, WINDOWS[timeframe]) for timeframe in window_names]
@@ -268,18 +293,22 @@ def build_aggregate_rows(
                     if not _is_contiguous_5m(chunk):
                         skipped_non_contiguous += 1
                         continue
+                    oi_open, oi_high, oi_low, oi_close, delta_pct, trajectory = _oi_window_values(
+                        chunk,
+                        items[i - need] if i - need >= 0 and items[i - need]["ts_close"] == chunk[0]["ts_open"] else None,
+                    )
                     rows_out.append((
                         "OI", timeframe,
                         chunk[0]["ts_open"], _window_close(chunk[0]["ts_open"], timeframe),
                         exchange, symbol,
-                        chunk[0]["oi_open"],
-                        max(x["oi_high"] for x in chunk),
-                        min(x["oi_low"] for x in chunk),
-                        chunk[-1]["oi_close"],
+                        oi_open,
+                        oi_high,
+                        oi_low,
+                        oi_close,
                         None, None,
-                        изменение_в_процентах(chunk[0]["oi_open"], chunk[-1]["oi_close"]),
+                        delta_pct,
                         len(chunk),
-                        [x["oi_close"] for x in chunk],
+                        trajectory,
                     ))
 
     price_rows = []
@@ -411,18 +440,22 @@ def build_latest_aggregate_rows(
                 if chunk is None:
                     skipped_non_contiguous += 1
                     continue
+                oi_open, oi_high, oi_low, oi_close, delta_pct, trajectory = _oi_window_values(
+                    chunk,
+                    _previous_contiguous_item(anchored_items, chunk[0]),
+                )
                 rows_out.append((
                     "OI", timeframe,
                     chunk[0]["ts_open"], chunk[-1]["ts_close"],
                     exchange, symbol,
-                    chunk[0]["oi_open"],
-                    max(x["oi_high"] for x in chunk),
-                    min(x["oi_low"] for x in chunk),
-                    chunk[-1]["oi_close"],
+                    oi_open,
+                    oi_high,
+                    oi_low,
+                    oi_close,
                     None, None,
-                    изменение_в_процентах(chunk[0]["oi_open"], chunk[-1]["oi_close"]),
+                    delta_pct,
                     len(chunk),
-                    [x["oi_close"] for x in chunk],
+                    trajectory,
                 ))
         del oi_rows
         gc.collect()

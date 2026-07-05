@@ -156,9 +156,13 @@ def replay_single_case(
     window_source: str,
     state_mode: str,
     control_points: list[datetime],
+    restore_from_raw: bool = False,
 ) -> dict:
-    cycles, resolved_window_source = load_cycle_timestamps_between(start_ts, end_ts, window_source)
     restored_from_raw = None
+    if restore_from_raw:
+        restored_from_raw = restore_history_from_raw(exchange, symbol, start_ts, end_ts)
+
+    cycles, resolved_window_source = load_cycle_timestamps_between(start_ts, end_ts, window_source)
     if not cycles:
         restored_from_raw = restore_history_from_raw(exchange, symbol, start_ts, end_ts)
         cycles, resolved_window_source = load_cycle_timestamps_between(start_ts, end_ts, "history")
@@ -434,8 +438,7 @@ def print_human_report(report: dict) -> None:
                 f"15м={item['oi_15m']} 30м={item['oi_30m']} 1ч={item['oi_1h']} 4ч={item['oi_4h']} | "
                 f"цена={item['price_state']} | форма={item['oi_form_1h']} "
                 f"оценка={item.get('oi_form_score_1h')} "
-                f"удерж={item['oi_hold_1h']} откат={item['oi_pullback_1h']} "
-                f"гладк={item['oi_smoothness_1h']} | {item['reason']}"
+                f"| {item['reason']}"
             )
 
     if report["control_points"]:
@@ -451,20 +454,7 @@ def print_human_report(report: dict) -> None:
                 f"15м={snap['oi_15m']} 30м={snap['oi_30m']} 1ч={snap['oi_1h']} 4ч={snap['oi_4h']} | "
                 f"цена={snap['price_state']} | форма={snap['oi_form_1h']} "
                 f"оценка={snap.get('oi_form_score_1h')} "
-                f"удерж={snap['oi_hold_1h']} откат={snap['oi_pullback_1h']} "
-                f"гладк={snap['oi_smoothness_1h']} | {snap['reason']}"
-            )
-            print(
-                "  "
-                f"концентрация={snap['oi_concentration_1h']} "
-                f"хвост={snap['oi_tail_share_1h']} "
-                f"плоский_хвост={snap['oi_flat_tail_1h']} | "
-                f"ret={snap['oi_retention_ratio_1h']} "
-                f"pull={snap['oi_pullback_ratio_1h']} "
-                f"smooth={snap['oi_smoothness_proxy_1h']} "
-                f"conc={snap['oi_concentration_ratio_1h']} "
-                f"tail={snap['oi_tail_share_ratio_1h']} "
-                f"flat_tail={snap['oi_flat_tail_ratio_1h']}"
+                f"| {snap['reason']}"
             )
 
 
@@ -478,6 +468,7 @@ def main() -> None:
     parser.add_argument("--window-source", choices=["auto", "hot", "history"], default="auto")
     parser.add_argument("--state-mode", choices=["fresh", "live"], default="fresh")
     parser.add_argument("--control-ts", action="append", default=[], help="Контрольная точка в МСК")
+    parser.add_argument("--restore-from-raw", action="store_true", help="Перед replay пересобрать историю окон выбранной пары из raw")
     parser.add_argument("--report-json", help="Куда сохранить json-отчет")
     args = parser.parse_args()
 
@@ -493,13 +484,14 @@ def main() -> None:
         window_source=args.window_source,
         state_mode=args.state_mode,
         control_points=control_points,
+        restore_from_raw=args.restore_from_raw,
     )
 
     print_human_report(report)
     if args.report_json:
         path = Path(args.report_json)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
         print("")
         print(f"JSON-отчет: {path}")
 

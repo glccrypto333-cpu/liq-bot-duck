@@ -1077,7 +1077,6 @@ def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: l
     oi = core_row.get("oi_summary") or {}
     window_map = {str(row.get("window_code")): row for row in window_rows}
     latest_ts = transition_ts or core_row.get("latest_cycle_ts")
-    row_1h = window_map.get("1ч") or {}
 
     header_symbol, header_ts = _build_symbol_header(symbol, exchange, latest_ts)
     lines = [f"<b>{title}</b>", "", f"<b>{header_symbol}</b>", f"<b>{header_ts}</b>"]
@@ -1100,23 +1099,11 @@ def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: l
             f"{_human_oi_slope(row.get('oi_slope_class'))}"
         )
 
-    lines.extend(["", "<b>Интерпретаторы OI</b>"])
+    lines.extend(["", "<b>Интерпретатор OI</b>"])
     form_text = oi.get("oi_form_class_1h") or "n/a"
-    hold_text = row_1h.get("oi_hold_class") or oi.get("oi_hold_class_1h") or oi.get("oi_retention_summary") or "n/a"
-    pullback_text = row_1h.get("oi_pullback_class") or oi.get("oi_pullback_class_1h") or "n/a"
-    smooth_text = row_1h.get("oi_smoothness_class") or oi.get("oi_smoothness_class_1h") or oi.get("oi_stability_summary") or "n/a"
-    concentration_text = oi.get("oi_concentration_class_1h") or "n/a"
-    tail_text = oi.get("oi_tail_share_class_1h") or "n/a"
-    flat_tail_text = oi.get("oi_flat_tail_class_1h") or "n/a"
     form_score = oi.get("oi_form_score_1h")
     form_score_text = f" ({form_score}/5)" if form_score is not None else ""
-    lines.append(f"{_visual_strength_token(form_text)} - Форма набора - {_human_text_token(form_text)}{form_score_text}")
-    lines.append(f"{_visual_strength_token(hold_text)} - Удержание - {_human_text_token(hold_text)}")
-    lines.append(f"{_visual_strength_token(pullback_text)} - Откат - {_human_text_token(pullback_text)}")
-    lines.append(f"{_visual_strength_token(smooth_text)} - Гладкость - {_human_text_token(smooth_text)}")
-    lines.append(f"{_visual_strength_token(concentration_text)} - Концентрация роста - {_human_text_token(concentration_text)}")
-    lines.append(f"{_visual_strength_token(tail_text)} - Доля хвоста - {_human_text_token(tail_text)}")
-    lines.append(f"{_visual_strength_token(flat_tail_text)} - Плоский хвост после хая - {_human_text_token(flat_tail_text)}")
+    lines.append(f"{_visual_strength_token(form_text)} - Форма набора OI - {_human_text_token(form_text)}{form_score_text}")
     lines.extend(["", _symbol_links(symbol, exchange)])
     return "\n".join(lines)
 

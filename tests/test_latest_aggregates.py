@@ -4,6 +4,8 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from aggregation_engine import build_latest_aggregate_rows, rebuild_latest_aggregate_windows
@@ -19,6 +21,21 @@ def _oi_row(ts_open: datetime, exchange: str, symbol: str, value: float) -> dict
         "oi_high": value + 1.0,
         "oi_low": value - 1.0,
         "oi_close": value + 0.5,
+    }
+
+
+def _price_row(ts_open: datetime, exchange: str, symbol: str, open_value: float, close_value: float) -> dict:
+    high_value = max(open_value, close_value) + 1.0
+    low_value = min(open_value, close_value) - 1.0
+    return {
+        "ts_open": ts_open,
+        "ts_close": ts_open + timedelta(minutes=5),
+        "exchange": exchange,
+        "symbol": symbol,
+        "price_open": open_value,
+        "price_high": high_value,
+        "price_low": low_value,
+        "price_close": close_value,
     }
 
 
@@ -59,6 +76,86 @@ def test_build_latest_aggregate_rows_keeps_only_latest_cycle(monkeypatch) -> Non
     assert ts_close == source_cycle_ts
     assert exchange == "BYBIT"
     assert symbol == "TESTUSDT"
+
+
+def test_build_latest_aggregate_rows_anchors_oi_open_to_previous_close(monkeypatch) -> None:
+    source_cycle_ts = datetime(2026, 6, 24, 16, 0)
+    starts = [
+        datetime(2026, 6, 24, 15, 40),
+        datetime(2026, 6, 24, 15, 45),
+        datetime(2026, 6, 24, 15, 50),
+        datetime(2026, 6, 24, 15, 55),
+    ]
+    oi_rows = [_oi_row(ts_open, "BYBIT", "TESTUSDT", 100.0 + index * 10.0) for index, ts_open in enumerate(starts)]
+
+    def fake_fetch(table, select_sql, alias, active_only, cycle_ts):
+        assert cycle_ts == source_cycle_ts
+        if table == "oi_raw":
+            return oi_rows
+        return []
+
+    monkeypatch.setattr(
+        "aggregation_engine._resolve_symbol_anchor_map_from_db",
+        lambda *args, **kwargs: {("BYBIT", "TESTUSDT"): source_cycle_ts},
+    )
+    monkeypatch.setattr("aggregation_engine._fetch_recent_metric_rows", fake_fetch)
+
+    rows, stats = build_latest_aggregate_rows(
+        source_cycle_ts,
+        selected_windows=("15м",),
+        selected_metrics=("OI",),
+        active_only=True,
+    )
+
+    assert stats["aggregates"] == 1
+    row = rows[0]
+    assert row[6] == oi_rows[0]["oi_close"]
+    assert row[9] == oi_rows[-1]["oi_close"]
+    assert row[12] == pytest.approx(29.850746268656717)
+    assert row[14] == [oi_rows[0]["oi_close"], oi_rows[1]["oi_close"], oi_rows[2]["oi_close"], oi_rows[3]["oi_close"]]
+
+
+def test_build_latest_aggregate_rows_uses_price_first_open_and_last_close(monkeypatch) -> None:
+    source_cycle_ts = datetime(2026, 7, 2, 6, 0)
+    starts = [
+        datetime(2026, 7, 2, 5, 45),
+        datetime(2026, 7, 2, 5, 50),
+        datetime(2026, 7, 2, 5, 55),
+    ]
+    price_rows = [
+        _price_row(starts[0], "BINANCE", "TESTUSDT", 10.0, 12.0),
+        _price_row(starts[1], "BINANCE", "TESTUSDT", 12.0, 11.0),
+        _price_row(starts[2], "BINANCE", "TESTUSDT", 11.0, 15.0),
+    ]
+
+    def fake_fetch(table, select_sql, alias, active_only, cycle_ts):
+        assert cycle_ts == source_cycle_ts
+        if table == "price_raw":
+            return price_rows
+        return []
+
+    monkeypatch.setattr(
+        "aggregation_engine._resolve_symbol_anchor_map_from_db",
+        lambda *args, **kwargs: {("BINANCE", "TESTUSDT"): source_cycle_ts},
+    )
+    monkeypatch.setattr("aggregation_engine._fetch_recent_metric_rows", fake_fetch)
+
+    rows, stats = build_latest_aggregate_rows(
+        source_cycle_ts,
+        selected_windows=("15м",),
+        selected_metrics=("PRICE",),
+        active_only=True,
+    )
+
+    assert stats["aggregates"] == 1
+    row = rows[0]
+    assert row[0] == "PRICE"
+    assert row[6] == 10.0
+    assert row[7] == 16.0
+    assert row[8] == 9.0
+    assert row[9] == 15.0
+    assert row[12] == pytest.approx(50.0)
+    assert row[14] is None
 
 
 def test_build_latest_aggregate_rows_uses_symbol_anchor_not_global_anchor(monkeypatch) -> None:
