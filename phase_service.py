@@ -13,7 +13,6 @@ PHASE2_MIN_AGE_MINUTES = 30.0
 TRIGGER_TO_STAGE2_MINUTES = 30.0
 TRIGGER_TO_STAGE3_MINUTES = 60.0
 MIN_STAGE3_OI_GROWTH_1H_FOR_GOOD_UP_PCT = 4.5
-EARLY_STAGE3_MIN_FORM_SCORE = 4
 
 
 def _oi_classes(oi_summary: dict) -> tuple[str, str, str, str]:
@@ -103,12 +102,8 @@ def _is_soft_stage3_extension_case(
     )
 
 
-def _has_early_stage3_form(oi_summary: dict) -> bool:
-    try:
-        form_score = int(oi_summary.get("oi_form_score_1h") or 0)
-    except (TypeError, ValueError):
-        form_score = 0
-    return form_score >= EARLY_STAGE3_MIN_FORM_SCORE
+def _has_early_stage3_15m_confirmation(oi_15m: str) -> bool:
+    return _is_mature_growth(oi_15m)
 
 
 def determine_target_stage(
@@ -215,11 +210,11 @@ def apply_stage_guardrails(
             target_stage >= 2
             and oi_1h == "strong_up"
             and _is_growth(oi_30m)
-            and _has_early_stage3_form(oi_summary)
+            and _has_early_stage3_15m_confirmation(oi_15m)
             and effective_previous_age >= 10.0
             and effective_trigger_age >= 40.0
         ):
-            return 3, "переход_2_3:ранний_выпуск_A_форма_4"
+            return 3, "переход_2_3:ранний_выпуск_A_15м_подтвердил_импульс"
         if target_stage == 2:
             if _is_15m_hard_negative_for_fresh_stage3(oi_15m):
                 return 2, "удержание_2:15м_локально_слабое"

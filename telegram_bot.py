@@ -9,6 +9,9 @@ import json
 import os
 import subprocess
 import re
+import asyncio
+import socket as _socket
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 import csv
@@ -29,6 +32,7 @@ _offset = 0
 _export_lock = threading.Lock()
 _csv_lock = threading.Lock()
 RUNTIME_REPORTS_DIR = Path(__file__).resolve().parent / "runtime_reports"
+RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
 POLLING_LOCK_PATH = ПАПКА_ДАННЫХ / "telegram_polling.lock"
 _polling_lock_file = None
 BYBIT_SYMBOL_ALIASES = {
@@ -41,6 +45,23 @@ COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 _api_cache_lock = threading.Lock()
 _api_cache: dict[str, dict] = {}
 _rank_cache: dict[str, object] = {"ts": 0.0, "data": {}}
+
+# Фикс IPv6-blackhole для Telegram, уже доказавший себя в Moose.
+# Сохраняем текущий transport Duck, но форсим IPv4 только для api.telegram.org,
+# чтобы multipart-отправка скриншотов не висла на IPv6 timeout.
+_orig_getaddrinfo = _socket.getaddrinfo
+
+
+def _getaddrinfo_ipv4_telegram(host, *args, **kwargs):
+    res = _orig_getaddrinfo(host, *args, **kwargs)
+    if isinstance(host, str) and host.endswith("api.telegram.org"):
+        v4 = [r for r in res if r[0] == _socket.AF_INET]
+        if v4:
+            return v4
+    return res
+
+
+_socket.getaddrinfo = _getaddrinfo_ipv4_telegram
 
 
 def _cache_get(key: str, ttl: int = 20):
@@ -1074,7 +1095,6 @@ def _build_exchange_semantic_block(symbol: str, current_exchange: str) -> list[s
 def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: list[dict], metric_windows: dict[tuple[str, str], dict], *, title: str, transition_ts=None, transition_reason: str | None = None) -> str:
     symbol = str(core_row.get("symbol") or "").upper()
     exchange = str(core_row.get("exchange") or "").upper()
-    oi = core_row.get("oi_summary") or {}
     window_map = {str(row.get("window_code")): row for row in window_rows}
     latest_ts = transition_ts or core_row.get("latest_cycle_ts")
 
@@ -1099,11 +1119,6 @@ def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: l
             f"{_human_oi_slope(row.get('oi_slope_class'))}"
         )
 
-    lines.extend(["", "<b>Интерпретатор OI</b>"])
-    form_text = oi.get("oi_form_class_1h") or "n/a"
-    form_score = oi.get("oi_form_score_1h")
-    form_score_text = f" ({form_score}/5)" if form_score is not None else ""
-    lines.append(f"{_visual_strength_token(form_text)} - Форма набора OI - {_human_text_token(form_text)}{form_score_text}")
     lines.extend(["", _symbol_links(symbol, exchange)])
     return "\n".join(lines)
 
@@ -1251,9 +1266,67 @@ def _safe_tg_text(text: str, limit: int = 3900) -> str:
     return text[:limit - 80] + "\n\n... truncated. Use download/report for full output."
 
 
-def send_message(text: str, reply_markup: dict | None = None, parse_mode: str | None = None) -> bool:
+TG_CAPTION_LIMIT = int(os.getenv("TG_CAPTION_LIMIT", "1024"))
+CHART_CAPTURE_WARN_SECONDS = float(os.getenv("CHART_CAPTURE_WARN_SECONDS", "20"))
+CHART_SEND_WARN_SECONDS = float(os.getenv("CHART_SEND_WARN_SECONDS", "10"))
+CHART_TOTAL_WARN_SECONDS = float(os.getenv("CHART_TOTAL_WARN_SECONDS", "50"))
+
+
+@dataclass(frozen=True)
+class TelegramDeliveryResult:
+    ok: bool
+    message_id: int | None = None
+    chat_id: str | None = None
+    delivered_at: datetime | None = None
+    attempts: int = 0
+    delivery_mode: str = "text"
+    chart_requested: bool = False
+    chart_captured: bool = False
+    chart_capture_failure_reason: str | None = None
+    chart_delivery_failure_reason: str | None = None
+    chart_requested_timeframes: tuple[str, ...] = ()
+    chart_captured_timeframes: tuple[str, ...] = ()
+    chart_timeframe_seconds: dict[str, float] | None = None
+    chart_timeframe_verification_failures: tuple[str, ...] = ()
+    chart_capture_seconds: float = 0.0
+    chart_send_seconds: float = 0.0
+    total_delivery_seconds: float = 0.0
+    media_alerts: tuple[str, ...] = ()
+
+
+def _telegram_result_from_response(response: requests.Response, *, attempts: int = 1) -> TelegramDeliveryResult:
+    if not response.ok:
+        raise RuntimeError(
+            "telegram api error: "
+            f"status={response.status_code} body={(response.text or '')[:500]}"
+        )
+    parsed = response.json()
+    if not parsed.get("ok"):
+        raise RuntimeError(f"telegram api error: {parsed}")
+    result = parsed.get("result") or {}
+    if isinstance(result, list):
+        first = result[0] if result else {}
+    else:
+        first = result
+    chat = first.get("chat") or {}
+    return TelegramDeliveryResult(
+        ok=True,
+        message_id=first.get("message_id"),
+        chat_id=str(chat.get("id")) if chat.get("id") is not None else str(TELEGRAM_CHAT_ID),
+        delivered_at=datetime.now(timezone.utc),
+        attempts=attempts,
+    )
+
+
+def send_message_result(
+    text: str,
+    reply_markup: dict | None = None,
+    parse_mode: str | None = None,
+    *,
+    timeout: int = 30,
+) -> TelegramDeliveryResult:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
+        return TelegramDeliveryResult(ok=False, attempts=0)
 
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": _safe_tg_text(text)}
     auto_parse_mode = parse_mode
@@ -1269,19 +1342,374 @@ def send_message(text: str, reply_markup: dict | None = None, parse_mode: str | 
         response = requests.post(
             f"{BASE}/sendMessage",
             json=payload,
-            timeout=30,
+            timeout=timeout,
         )
-        if not response.ok:
-            log(
-                "telegram send error: "
-                f"status={response.status_code} "
-                f"body={(response.text or '')[:500]}"
-            )
-            return False
-        return True
+        result = _telegram_result_from_response(response)
+        return TelegramDeliveryResult(
+            ok=result.ok,
+            message_id=result.message_id,
+            chat_id=result.chat_id,
+            delivered_at=result.delivered_at,
+            attempts=result.attempts,
+            delivery_mode="text",
+        )
     except Exception as exc:
         log(f"telegram send error: {exc}")
-        return False
+        return TelegramDeliveryResult(ok=False, attempts=1, delivery_mode="text")
+
+
+def send_message(text: str, reply_markup: dict | None = None, parse_mode: str | None = None) -> bool:
+    return send_message_result(text, reply_markup, parse_mode).ok
+
+
+def _send_photo_result(
+    photo_path: str,
+    *,
+    caption: str | None = None,
+    reply_markup: dict | None = None,
+    parse_mode: str | None = "HTML",
+) -> TelegramDeliveryResult:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return TelegramDeliveryResult(ok=False, attempts=0, delivery_mode="photo")
+    data = {"chat_id": TELEGRAM_CHAT_ID}
+    if caption:
+        data["caption"] = caption
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    with open(photo_path, "rb") as fh:
+        response = requests.post(
+            f"{BASE}/sendPhoto",
+            data=data,
+            files={"photo": (Path(photo_path).name or "chart.png", fh, "image/png")},
+            timeout=45,
+        )
+    result = _telegram_result_from_response(response)
+    return TelegramDeliveryResult(
+        ok=result.ok,
+        message_id=result.message_id,
+        chat_id=result.chat_id,
+        delivered_at=result.delivered_at,
+        attempts=result.attempts,
+        delivery_mode="photo",
+    )
+
+
+def _send_media_group_result(
+    photo_paths: list[str],
+    *,
+    caption: str | None = None,
+    parse_mode: str | None = "HTML",
+) -> TelegramDeliveryResult:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return TelegramDeliveryResult(ok=False, attempts=0, delivery_mode="album")
+    media = []
+    files = {}
+    handles = []
+    try:
+        for idx, photo_path in enumerate(photo_paths):
+            field_name = f"photo{idx}"
+            item = {"type": "photo", "media": f"attach://{field_name}"}
+            if idx == 0 and caption:
+                item["caption"] = caption
+                if parse_mode:
+                    item["parse_mode"] = parse_mode
+            media.append(item)
+            fh = open(photo_path, "rb")
+            handles.append(fh)
+            files[field_name] = (Path(photo_path).name or f"chart{idx}.png", fh, "image/png")
+        response = requests.post(
+            f"{BASE}/sendMediaGroup",
+            data={"chat_id": TELEGRAM_CHAT_ID, "media": json.dumps(media, ensure_ascii=False)},
+            files=files,
+            timeout=60,
+        )
+    finally:
+        for fh in handles:
+            try:
+                fh.close()
+            except Exception:
+                pass
+    result = _telegram_result_from_response(response)
+    return TelegramDeliveryResult(
+        ok=result.ok,
+        message_id=result.message_id,
+        chat_id=result.chat_id,
+        delivered_at=result.delivered_at,
+        attempts=result.attempts,
+        delivery_mode="album",
+    )
+
+
+def _empty_chart_result(*, requested: bool = False, failure_reason: str | None = None) -> dict:
+    return {
+        "requested": requested,
+        "paths": [],
+        "requested_timeframes": [],
+        "captured_timeframes": [],
+        "capture_seconds": 0.0,
+        "timeframe_seconds": {},
+        "timeframe_verification_failures": [],
+        "failure_reason": failure_reason,
+    }
+
+
+def _try_chart_screenshot(row: dict) -> dict:
+    """Снимает CoinGlass 5m/4H best-effort.
+
+    Любая ошибка Playwright/CoinGlass/config возвращает пустой результат.
+    Сигнал Stage 3 из-за графика теряться не должен.
+    """
+    try:
+        from chart_screenshot.config import ENABLE_CHART_SCREENSHOT, CHART_TIMEFRAMES
+
+        if not ENABLE_CHART_SCREENSHOT:
+            return _empty_chart_result()
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            return _empty_chart_result()
+        exchange = str(row.get("exchange") or "").strip() or None
+        from chart_screenshot.coinglass import capture_coinglass_screenshots
+
+        result = asyncio.run(
+            capture_coinglass_screenshots(symbol, exchange, timeframes=CHART_TIMEFRAMES)
+        )
+        return {
+            "requested": True,
+            "paths": list(result.photo_paths),
+            "requested_timeframes": list(result.requested_timeframes),
+            "captured_timeframes": list(result.captured_timeframes),
+            "capture_seconds": float(result.capture_seconds_total or 0.0),
+            "timeframe_seconds": dict(result.timeframe_seconds or {}),
+            "timeframe_verification_failures": list(result.timeframe_verification_failures or ()),
+            "failure_reason": result.failure_reason,
+        }
+    except Exception as exc:
+        log(f"stage3 chart screenshot skipped: {type(exc).__name__}: {exc}")
+        return _empty_chart_result(requested=True, failure_reason=type(exc).__name__)
+
+
+def _finalize_media_alerts(
+    alerts: list[str],
+    *,
+    chart_send_seconds: float,
+    total_delivery_seconds: float,
+) -> tuple[str, ...]:
+    result = list(alerts)
+    if chart_send_seconds >= CHART_SEND_WARN_SECONDS:
+        result.append(f"долгая_отправка:{chart_send_seconds:.1f}с")
+    if total_delivery_seconds >= CHART_TOTAL_WARN_SECONDS:
+        result.append(f"долгая_доставка:{total_delivery_seconds:.1f}с")
+    return tuple(result)
+
+
+def _with_media_metrics(
+    result: TelegramDeliveryResult,
+    *,
+    delivery_mode: str,
+    chart_requested: bool,
+    chart_captured: bool,
+    chart_capture_failure_reason: str | None,
+    chart_delivery_failure_reason: str | None,
+    chart_requested_timeframes: tuple[str, ...],
+    chart_captured_timeframes: tuple[str, ...],
+    chart_timeframe_seconds: dict[str, float],
+    chart_timeframe_verification_failures: tuple[str, ...],
+    chart_capture_seconds: float,
+    chart_send_seconds: float,
+    total_delivery_seconds: float,
+    media_alerts: tuple[str, ...],
+) -> TelegramDeliveryResult:
+    return TelegramDeliveryResult(
+        ok=result.ok,
+        message_id=result.message_id,
+        chat_id=result.chat_id,
+        delivered_at=result.delivered_at,
+        attempts=result.attempts,
+        delivery_mode=delivery_mode,
+        chart_requested=chart_requested,
+        chart_captured=chart_captured,
+        chart_capture_failure_reason=chart_capture_failure_reason,
+        chart_delivery_failure_reason=chart_delivery_failure_reason,
+        chart_requested_timeframes=chart_requested_timeframes,
+        chart_captured_timeframes=chart_captured_timeframes,
+        chart_timeframe_seconds=dict(chart_timeframe_seconds),
+        chart_timeframe_verification_failures=chart_timeframe_verification_failures,
+        chart_capture_seconds=round(chart_capture_seconds, 3),
+        chart_send_seconds=round(chart_send_seconds, 3),
+        total_delivery_seconds=round(total_delivery_seconds, 3),
+        media_alerts=media_alerts,
+    )
+
+
+def send_stage3_alert_result(
+    row: dict,
+    text: str,
+    reply_markup: dict | None = None,
+    parse_mode: str | None = "HTML",
+) -> TelegramDeliveryResult:
+    started_at = time.monotonic()
+    chart_result = _try_chart_screenshot(row)
+    chart_paths = list(chart_result.get("paths") or [])
+    chart_requested = bool(chart_result.get("requested"))
+    chart_captured = bool(chart_paths)
+    chart_capture_failure_reason = chart_result.get("failure_reason")
+    chart_delivery_failure_reason: str | None = None
+    chart_requested_timeframes = tuple(chart_result.get("requested_timeframes") or ())
+    chart_captured_timeframes = tuple(chart_result.get("captured_timeframes") or ())
+    chart_timeframe_seconds = dict(chart_result.get("timeframe_seconds") or {})
+    chart_timeframe_verification_failures = tuple(
+        chart_result.get("timeframe_verification_failures") or ()
+    )
+    chart_capture_seconds = float(chart_result.get("capture_seconds") or 0.0)
+    chart_send_seconds = 0.0
+    media_alerts: list[str] = []
+
+    if chart_capture_failure_reason:
+        media_alerts.append(f"график_не_снят:{chart_capture_failure_reason}")
+    if chart_timeframe_verification_failures:
+        media_alerts.append(
+            f"таймфрейм_не_подтвержден:{','.join(chart_timeframe_verification_failures)}"
+        )
+    if chart_capture_seconds >= CHART_CAPTURE_WARN_SECONDS:
+        media_alerts.append(f"долгая_съемка:{chart_capture_seconds:.1f}с")
+
+    try:
+        if chart_paths:
+            try:
+                send_started_at = time.monotonic()
+                if len(chart_paths) == 1:
+                    if len(text) <= TG_CAPTION_LIMIT:
+                        result = _send_photo_result(
+                            chart_paths[0],
+                            caption=text,
+                            reply_markup=reply_markup,
+                            parse_mode=parse_mode,
+                        )
+                        chart_send_seconds = time.monotonic() - send_started_at
+                        return _with_media_metrics(
+                            result,
+                            delivery_mode="photo",
+                            chart_requested=chart_requested,
+                            chart_captured=chart_captured,
+                            chart_capture_failure_reason=chart_capture_failure_reason,
+                            chart_delivery_failure_reason=chart_delivery_failure_reason,
+                            chart_requested_timeframes=chart_requested_timeframes,
+                            chart_captured_timeframes=chart_captured_timeframes,
+                            chart_timeframe_seconds=chart_timeframe_seconds,
+                            chart_timeframe_verification_failures=chart_timeframe_verification_failures,
+                            chart_capture_seconds=chart_capture_seconds,
+                            chart_send_seconds=chart_send_seconds,
+                            total_delivery_seconds=time.monotonic() - started_at,
+                            media_alerts=_finalize_media_alerts(
+                                media_alerts,
+                                chart_send_seconds=chart_send_seconds,
+                                total_delivery_seconds=time.monotonic() - started_at,
+                            ),
+                        )
+                    result = _send_photo_result(chart_paths[0], caption=None, parse_mode=parse_mode)
+                    chart_send_seconds = time.monotonic() - send_started_at
+                    send_message_result(text, reply_markup=reply_markup, parse_mode=parse_mode)
+                    return _with_media_metrics(
+                        result,
+                        delivery_mode="photo+text",
+                        chart_requested=chart_requested,
+                        chart_captured=chart_captured,
+                        chart_capture_failure_reason=chart_capture_failure_reason,
+                        chart_delivery_failure_reason=chart_delivery_failure_reason,
+                        chart_requested_timeframes=chart_requested_timeframes,
+                        chart_captured_timeframes=chart_captured_timeframes,
+                        chart_timeframe_seconds=chart_timeframe_seconds,
+                        chart_timeframe_verification_failures=chart_timeframe_verification_failures,
+                        chart_capture_seconds=chart_capture_seconds,
+                        chart_send_seconds=chart_send_seconds,
+                        total_delivery_seconds=time.monotonic() - started_at,
+                        media_alerts=_finalize_media_alerts(
+                            media_alerts,
+                            chart_send_seconds=chart_send_seconds,
+                            total_delivery_seconds=time.monotonic() - started_at,
+                        ),
+                    )
+
+                if len(text) <= TG_CAPTION_LIMIT:
+                    result = _send_media_group_result(chart_paths, caption=text, parse_mode=parse_mode)
+                    chart_send_seconds = time.monotonic() - send_started_at
+                    return _with_media_metrics(
+                        result,
+                        delivery_mode="album",
+                        chart_requested=chart_requested,
+                        chart_captured=chart_captured,
+                        chart_capture_failure_reason=chart_capture_failure_reason,
+                        chart_delivery_failure_reason=chart_delivery_failure_reason,
+                        chart_requested_timeframes=chart_requested_timeframes,
+                        chart_captured_timeframes=chart_captured_timeframes,
+                        chart_timeframe_seconds=chart_timeframe_seconds,
+                        chart_timeframe_verification_failures=chart_timeframe_verification_failures,
+                        chart_capture_seconds=chart_capture_seconds,
+                        chart_send_seconds=chart_send_seconds,
+                        total_delivery_seconds=time.monotonic() - started_at,
+                        media_alerts=_finalize_media_alerts(
+                            media_alerts,
+                            chart_send_seconds=chart_send_seconds,
+                            total_delivery_seconds=time.monotonic() - started_at,
+                        ),
+                    )
+                result = _send_media_group_result(chart_paths, caption=None, parse_mode=parse_mode)
+                chart_send_seconds = time.monotonic() - send_started_at
+                send_message_result(text, reply_markup=reply_markup, parse_mode=parse_mode)
+                return _with_media_metrics(
+                    result,
+                    delivery_mode="album+text",
+                    chart_requested=chart_requested,
+                    chart_captured=chart_captured,
+                    chart_capture_failure_reason=chart_capture_failure_reason,
+                    chart_delivery_failure_reason=chart_delivery_failure_reason,
+                    chart_requested_timeframes=chart_requested_timeframes,
+                    chart_captured_timeframes=chart_captured_timeframes,
+                    chart_timeframe_seconds=chart_timeframe_seconds,
+                    chart_timeframe_verification_failures=chart_timeframe_verification_failures,
+                    chart_capture_seconds=chart_capture_seconds,
+                    chart_send_seconds=chart_send_seconds,
+                    total_delivery_seconds=time.monotonic() - started_at,
+                    media_alerts=_finalize_media_alerts(
+                        media_alerts,
+                        chart_send_seconds=chart_send_seconds,
+                        total_delivery_seconds=time.monotonic() - started_at,
+                    ),
+                )
+            except Exception as exc:
+                chart_delivery_failure_reason = type(exc).__name__
+                media_alerts.append(f"график_не_доставлен:{chart_delivery_failure_reason}")
+                log(f"stage3 chart delivery failed, fallback to text: {exc}")
+
+        text_result = send_message_result(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return _with_media_metrics(
+            text_result,
+            delivery_mode="text",
+            chart_requested=chart_requested,
+            chart_captured=chart_captured,
+            chart_capture_failure_reason=chart_capture_failure_reason,
+            chart_delivery_failure_reason=chart_delivery_failure_reason,
+            chart_requested_timeframes=chart_requested_timeframes,
+            chart_captured_timeframes=chart_captured_timeframes,
+            chart_timeframe_seconds=chart_timeframe_seconds,
+            chart_timeframe_verification_failures=chart_timeframe_verification_failures,
+            chart_capture_seconds=chart_capture_seconds,
+            chart_send_seconds=chart_send_seconds,
+            total_delivery_seconds=time.monotonic() - started_at,
+            media_alerts=_finalize_media_alerts(
+                media_alerts,
+                chart_send_seconds=chart_send_seconds,
+                total_delivery_seconds=time.monotonic() - started_at,
+            ),
+        )
+    finally:
+        for chart_path in chart_paths:
+            try:
+                os.remove(chart_path)
+            except Exception:
+                pass
 
 
 def send_panel_message(text: str) -> None:
@@ -2815,6 +3243,86 @@ def _append_stage3_alert_history(row: dict, alert_key: str) -> None:
         logger.warning("Не удалось записать историю stage3 alerts в БД: %s", exc)
 
 
+def _append_stage3_delivery_history(
+    row: dict,
+    alert_key: str,
+    delivery: TelegramDeliveryResult,
+) -> None:
+    """JSONL-история расширенной доставки без миграции production DB."""
+    try:
+        RUNTIME_DIR.mkdir(exist_ok=True)
+        path = RUNTIME_DIR / "telegram_stage3_delivery_history.jsonl"
+        payload = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "alert_key": alert_key,
+            "exchange": row.get("exchange"),
+            "symbol": row.get("symbol"),
+            "message_id": delivery.message_id,
+            "chat_id": delivery.chat_id,
+            "delivered_at": delivery.delivered_at.isoformat() if delivery.delivered_at else None,
+            "attempts": delivery.attempts,
+            "delivery_mode": delivery.delivery_mode,
+            "chart_requested": delivery.chart_requested,
+            "chart_captured": delivery.chart_captured,
+            "chart_capture_failure_reason": delivery.chart_capture_failure_reason,
+            "chart_delivery_failure_reason": delivery.chart_delivery_failure_reason,
+            "chart_requested_timeframes": list(delivery.chart_requested_timeframes),
+            "chart_captured_timeframes": list(delivery.chart_captured_timeframes),
+            "chart_timeframe_seconds": delivery.chart_timeframe_seconds or {},
+            "chart_timeframe_verification_failures": list(
+                delivery.chart_timeframe_verification_failures
+            ),
+            "chart_capture_seconds": delivery.chart_capture_seconds,
+            "chart_send_seconds": delivery.chart_send_seconds,
+            "total_delivery_seconds": delivery.total_delivery_seconds,
+            "media_alerts": list(delivery.media_alerts),
+        }
+        with _csv_lock:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        log(f"stage3 delivery history write failed: {exc}")
+
+
+def _stage3_media_metric_template() -> dict:
+    return {
+        "media_albums_sent": 0,
+        "media_photos_sent": 0,
+        "media_text_fallbacks": 0,
+        "media_capture_errors": 0,
+        "media_delivery_errors": 0,
+        "media_charts_requested": 0,
+        "media_charts_captured": 0,
+        "media_chart_capture_seconds_total": 0.0,
+        "media_chart_send_seconds_total": 0.0,
+        "media_total_delivery_seconds_total": 0.0,
+        "media_alerts": [],
+    }
+
+
+def _accumulate_stage3_media_metrics(metrics: dict, delivery: TelegramDeliveryResult) -> None:
+    if delivery.delivery_mode.startswith("album"):
+        metrics["media_albums_sent"] += 1
+    elif delivery.delivery_mode.startswith("photo"):
+        metrics["media_photos_sent"] += 1
+    if delivery.delivery_mode == "text":
+        metrics["media_text_fallbacks"] += 1
+    if delivery.chart_capture_failure_reason:
+        metrics["media_capture_errors"] += 1
+    if delivery.chart_delivery_failure_reason:
+        metrics["media_delivery_errors"] += 1
+    if delivery.chart_requested:
+        metrics["media_charts_requested"] += len(delivery.chart_requested_timeframes)
+    if delivery.chart_captured:
+        metrics["media_charts_captured"] += len(delivery.chart_captured_timeframes)
+    metrics["media_chart_capture_seconds_total"] += float(delivery.chart_capture_seconds or 0.0)
+    metrics["media_chart_send_seconds_total"] += float(delivery.chart_send_seconds or 0.0)
+    metrics["media_total_delivery_seconds_total"] += float(delivery.total_delivery_seconds or 0.0)
+    for alert in delivery.media_alerts:
+        if alert not in metrics["media_alerts"]:
+            metrics["media_alerts"].append(alert)
+
+
 def _build_stage3_alert_text(r: dict) -> str:
     symbol = r.get("symbol")
     ex = r.get("exchange")
@@ -2865,6 +3373,7 @@ def check_stage3_alerts() -> dict:
     observations_total = 0
     delivery_failed = 0
     new_signals: list[dict] = []
+    media_metrics = _stage3_media_metric_template()
 
     for r in rows:
         try:
@@ -2890,17 +3399,20 @@ def check_stage3_alerts() -> dict:
             already_active += 1
             continue
 
-        delivered = send_message(
+        delivery = send_stage3_alert_result(
+            r,
             _build_stage3_alert_text(r),
             _main_keyboard(),
             parse_mode="HTML",
         )
-        if not delivered:
+        _accumulate_stage3_media_metrics(media_metrics, delivery)
+        if not delivery.ok:
             log(f"stage3 alert delivery failed: {key}")
             delivery_failed += 1
             continue
 
         _append_stage3_alert_history(r, key)
+        _append_stage3_delivery_history(r, key, delivery)
         sent += 1
         new_signals.append(
             {
@@ -2908,6 +3420,22 @@ def check_stage3_alerts() -> dict:
                 "symbol": str(r.get("symbol") or ""),
                 "transition_ts": str(transition_ts),
                 "alert_key": key,
+                "message_id": delivery.message_id,
+                "delivered_at": delivery.delivered_at.isoformat() if delivery.delivered_at else None,
+                "delivery_mode": delivery.delivery_mode,
+                "chart_requested": delivery.chart_requested,
+                "chart_captured": delivery.chart_captured,
+                "chart_capture_failure_reason": delivery.chart_capture_failure_reason,
+                "chart_delivery_failure_reason": delivery.chart_delivery_failure_reason,
+                "chart_requested_timeframes": list(delivery.chart_requested_timeframes),
+                "chart_captured_timeframes": list(delivery.chart_captured_timeframes),
+                "chart_timeframe_verification_failures": list(
+                    delivery.chart_timeframe_verification_failures
+                ),
+                "chart_capture_seconds": delivery.chart_capture_seconds,
+                "chart_send_seconds": delivery.chart_send_seconds,
+                "total_delivery_seconds": delivery.total_delivery_seconds,
+                "media_alerts": list(delivery.media_alerts),
             }
         )
 
@@ -2929,6 +3457,7 @@ def check_stage3_alerts() -> dict:
         "signals_repeat_on_cooldown": 0,
         "delivery_failed": delivery_failed,
         "new_signals": new_signals,
+        **media_metrics,
     }
 def _archive_index_path() -> Path:
     return Path("archive") / "manifests" / "archive_index.json"

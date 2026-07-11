@@ -73,74 +73,6 @@ AUTONOMOUS_OI_PROGRESS_PATH = RUNTIME_DIR / "autonomous_oi_progress.json"
 SYMBOL_WINDOWS_STALE_MINUTES = int(os.getenv("SYMBOL_WINDOWS_STALE_MINUTES", "30"))
 
 
-def attach_oi_trajectory_points(window_map_by_symbol: dict[tuple[str, str], dict[str, dict[str, dict]]]) -> None:
-    oi_rows = []
-    min_ts_open = None
-    max_ts_close = None
-    exchanges = set()
-    symbols = set()
-
-    for (exchange, symbol), window_map in window_map_by_symbol.items():
-        exchanges.add(exchange)
-        symbols.add(symbol)
-        for metric_rows in window_map.values():
-            oi_row = metric_rows.get("OI")
-            if not oi_row:
-                continue
-            oi_rows.append((exchange, symbol, oi_row))
-            row_open = oi_row.get("ts_open")
-            row_close = oi_row.get("ts_close")
-            if row_open is not None and (min_ts_open is None or row_open < min_ts_open):
-                min_ts_open = row_open
-            if row_close is not None and (max_ts_close is None or row_close > max_ts_close):
-                max_ts_close = row_close
-
-    if not oi_rows or min_ts_open is None or max_ts_close is None:
-        return
-
-    raw_rows = fetch(
-        """
-        SELECT
-            ts_open,
-            ts_close,
-            exchange,
-            symbol,
-            oi_open,
-            oi_high,
-            oi_low,
-            oi_close
-        FROM oi_raw
-        WHERE ts_open >= %s
-          AND ts_close <= %s
-          AND exchange = ANY(%s)
-          AND symbol = ANY(%s)
-        ORDER BY exchange, symbol, ts_open
-        """,
-        (min_ts_open, max_ts_close, list(exchanges), list(symbols)),
-    )
-
-    raw_by_symbol: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for row in raw_rows:
-        raw_by_symbol[(row["exchange"], row["symbol"])].append(row)
-
-    for exchange, symbol, oi_row in oi_rows:
-        start = oi_row.get("ts_open")
-        end = oi_row.get("ts_close")
-        if start is None or end is None:
-            continue
-        candles = [
-            raw
-            for raw in raw_by_symbol.get((exchange, symbol), [])
-            if raw["ts_open"] >= start and raw["ts_close"] <= end
-        ]
-        if not candles:
-            continue
-        points = [float(candles[0]["oi_open"])]
-        points.extend(float(candle["oi_close"]) for candle in candles)
-        oi_row["trajectory_points"] = points
-        oi_row["trajectory_candles"] = len(candles)
-
-
 def _window_source_table(window_source: str) -> str:
     if window_source == "history":
         return "aggregate_windows_history"
@@ -214,7 +146,6 @@ def load_latest_window_map(
     for row in rows:
         key = (row["exchange"], row["symbol"])
         window_map[key][row["window_code"]][row["metric"]] = row
-    attach_oi_trajectory_points(window_map)
     return window_map
 
 
@@ -617,45 +548,6 @@ def build_stage_history_record(previous_state: dict | None, exchange: str, symbo
     )
 
 
-def _oi_hold_class(oi_state: dict) -> str:
-    retention_ratio = float(oi_state.get("oi_retention_ratio") or 0.0)
-    if retention_ratio >= 0.85:
-        return "сильное"
-    if retention_ratio >= 0.65:
-        return "хорошее"
-    if retention_ratio >= 0.40:
-        return "слабое"
-    if retention_ratio >= 0.0:
-        return "плохое"
-    return "нет"
-
-
-def _oi_pullback_class(oi_state: dict) -> str:
-    pullback_ratio = float(oi_state.get("oi_pullback_ratio") or 0.0)
-    if pullback_ratio <= 0.15:
-        return "почти_нет"
-    if pullback_ratio <= 0.30:
-        return "легкий"
-    if pullback_ratio <= 0.50:
-        return "заметный"
-    if pullback_ratio <= 0.80:
-        return "глубокий"
-    return "срыв"
-
-
-def _oi_smoothness_class(oi_state: dict) -> str:
-    smoothness = float(oi_state.get("oi_smoothness_proxy") or 0.0)
-    if smoothness >= 0.90:
-        return "очень_гладко"
-    if smoothness >= 0.65:
-        return "гладко"
-    if smoothness >= 0.50:
-        return "средне"
-    if smoothness >= 0.35:
-        return "рвано"
-    return "пила"
-
-
 def build_window_record_v2(
     exchange: str,
     symbol: str,
@@ -673,9 +565,9 @@ def build_window_record_v2(
         oi_state["window_weight"],
         oi_state.get("oi_slope_class"),
         oi_state.get("oi_slope_ratio"),
-        _oi_hold_class(oi_state),
-        _oi_pullback_class(oi_state),
-        _oi_smoothness_class(oi_state),
+        None,
+        None,
+        None,
         price_state.get("price_regime"),
         price_state.get("price_direction"),
         False,
@@ -924,21 +816,6 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
             "oi_slope_class_1h": oi_summary["oi_slope_class_1h"],
             "oi_slope_class_4h": oi_summary["oi_slope_class_4h"],
             "oi_growth_pct_1h": oi_summary.get("oi_growth_pct_1h"),
-            "oi_retention_ratio_1h": oi_summary.get("oi_retention_ratio_1h"),
-            "oi_pullback_ratio_1h": oi_summary.get("oi_pullback_ratio_1h"),
-            "oi_smoothness_proxy_1h": oi_summary.get("oi_smoothness_proxy_1h"),
-            "oi_concentration_ratio_1h": oi_summary.get("oi_concentration_ratio_1h"),
-            "oi_tail_share_1h": oi_summary.get("oi_tail_share_1h"),
-            "oi_tail_share_ratio_1h": oi_summary.get("oi_tail_share_ratio_1h"),
-            "oi_flat_tail_ratio_1h": oi_summary.get("oi_flat_tail_ratio_1h"),
-            "oi_hold_class_1h": oi_summary.get("oi_hold_class_1h"),
-            "oi_pullback_class_1h": oi_summary.get("oi_pullback_class_1h"),
-            "oi_smoothness_class_1h": oi_summary.get("oi_smoothness_class_1h"),
-            "oi_concentration_class_1h": oi_summary.get("oi_concentration_class_1h"),
-            "oi_tail_share_class_1h": oi_summary.get("oi_tail_share_class_1h"),
-            "oi_flat_tail_class_1h": oi_summary.get("oi_flat_tail_class_1h"),
-            "oi_form_class_1h": oi_summary.get("oi_form_class_1h"),
-            "oi_form_score_1h": oi_summary.get("oi_form_score_1h"),
         }
 
     next_state_map["__v2_rows__"] = {

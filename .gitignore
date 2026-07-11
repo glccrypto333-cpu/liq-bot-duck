@@ -9,6 +9,11 @@ runtime/
 .DS_Store
 
 .venv/
+.venv_ws_shadow/
+tmp/
+storage_state.json
+*.bak_*
+*.bak.*
 
 # runtime diagnostics
 runtime/fast_snapshot/

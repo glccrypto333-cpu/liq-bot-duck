@@ -8,7 +8,6 @@ from typing import Iterable
 from db import active_universe_sql, fetch
 from autonomous_oi_service import (
     WINDOWS,
-    attach_oi_trajectory_points,
     compute_autonomous_oi_snapshot,
     compute_autonomous_oi_snapshot_from_latest_window_map,
 )
@@ -128,7 +127,6 @@ def load_latest_window_map_for_replay(
     for row in rows:
         key = (row["exchange"], row["symbol"])
         window_map[key][row["window_code"]][row["metric"]] = row
-    attach_oi_trajectory_points(window_map)
     return window_map
 
 
