@@ -45,6 +45,9 @@ class _FakeConn:
     def rollback(self) -> None:
         self.rolled_back = True
 
+    def execute(self, sql: str) -> None:
+        self.cursor_obj.execute(sql)
+
 
 def test_replace_aggregate_layers_atomically_uses_dedicated_connection(monkeypatch) -> None:
     fake_conn = _FakeConn()
@@ -70,3 +73,21 @@ def test_replace_aggregate_layers_atomically_uses_dedicated_connection(monkeypat
     assert len(fake_conn.cursor_obj.executemany_calls) == 1
     insert_sql, _ = fake_conn.cursor_obj.executemany_calls[0]
     assert "ON CONFLICT (metric, window_code, exchange, symbol, ts_open)" in insert_sql
+
+
+def test_connection_factory_does_not_share_context_managed_connections(monkeypatch) -> None:
+    created: list[_FakeConn] = []
+
+    def _connect(*args, **kwargs):
+        conn = _FakeConn()
+        created.append(conn)
+        return conn
+
+    monkeypatch.setattr(db, "DATABASE_URL", "postgresql://example")
+    monkeypatch.setattr(db.psycopg, "connect", _connect)
+
+    first = db._conn()
+    second = db._conn()
+
+    assert first is not second
+    assert len(created) == 2

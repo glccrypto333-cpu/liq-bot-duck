@@ -49,6 +49,8 @@ _TV_LEGEND_TOKEN = {
     "1H": "60", "2H": "2h", "4H": "4h", "6H": "6h", "8H": "8h", "12H": "12h",
     "1D": "1D", "1W": "1W",
 }
+DROPDOWN_ITEM_LOOKUP_ATTEMPTS = 3
+DROPDOWN_ITEM_RETRY_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -212,8 +214,25 @@ async def _apply_timeframe(page, timeframe: str) -> bool:
         )
         if opened:
             await asyncio.sleep(1.0)
-            picked = await page.evaluate(
-                """(label) => {
+            picked = await _pick_dropdown_timeframe(page, tf_label)
+            if picked:
+                _log(f"Таймфрейм {tf_label} применён (дропдаун)")
+                return True
+            _log(f"ТФ {tf_label} не найден в дропдауне")
+            return False
+
+        _log(f"Кнопка/дропдаун ТФ {tf_label} не найдены — оставляю текущий layout")
+        return False
+    except Exception as e:
+        _log(f"Ошибка установки таймфрейма {tf_label}: {e}")
+        return False
+
+
+async def _pick_dropdown_timeframe(page, tf_label: str) -> bool:
+    """Wait briefly for a delayed CoinGlass dropdown item, then click it."""
+    for attempt in range(DROPDOWN_ITEM_LOOKUP_ATTEMPTS):
+        picked = await page.evaluate(
+            """(label) => {
                     let best = null, area = 1e9;
                     for (const e of document.querySelectorAll('li,div,button,span,a')) {
                         const t = (e.innerText || '').trim();
@@ -226,19 +245,13 @@ async def _apply_timeframe(page, timeframe: str) -> bool:
                     if (best) { best.click(); return true; }
                     return false;
                 }""",
-                tf_label,
-            )
-            if picked:
-                _log(f"Таймфрейм {tf_label} применён (дропдаун)")
-                return True
-            _log(f"ТФ {tf_label} не найден в дропдауне")
-            return False
-
-        _log(f"Кнопка/дропдаун ТФ {tf_label} не найдены — оставляю текущий layout")
-        return False
-    except Exception as e:
-        _log(f"Ошибка установки таймфрейма {tf_label}: {e}")
-        return False
+            tf_label,
+        )
+        if picked:
+            return True
+        if attempt + 1 < DROPDOWN_ITEM_LOOKUP_ATTEMPTS:
+            await asyncio.sleep(DROPDOWN_ITEM_RETRY_SECONDS)
+    return False
 
 
 async def _verify_timeframe(page, timeframe: str) -> bool:

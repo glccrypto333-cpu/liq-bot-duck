@@ -698,6 +698,54 @@ def _pct_with_marks(value, thresholds: tuple[float, float, float], *, negative_o
     return base
 
 
+def _account_sentiment(value, side: str) -> str:
+    try:
+        pct = float(value)
+    except Exception:
+        return "➡️"
+    if side == "long":
+        return "⬆️" if pct >= 50.0 else "⬇️"
+    return "⬆️" if pct >= 50.0 else "⬇️"
+
+
+def _build_market_metrics_block(metrics: dict) -> list[str]:
+    """Render the Tiger-compatible market snapshot; metrics never affect stages."""
+    klines = metrics.get("klines") or {}
+    ticker24 = metrics.get("ticker24") or {}
+    oi = metrics.get("oi") or {}
+    accounts = metrics.get("accounts") or {}
+    funding = metrics.get("funding") or {}
+
+    rank = metrics.get("rank") or ">250 / н/д"
+    long_pct = accounts.get("long_pct")
+    short_pct = accounts.get("short_pct")
+    return [
+        f"<b>🏷 Капа-рейтинг:</b> {rank}",
+        "",
+        "<b>💵 Объём:</b>",
+        f"1ч: {_fmt_usd_or_na(klines.get('vol_1h_usd'))} | "
+        f"{_pct_with_marks(klines.get('vol_pct_1h'), (100.0, 1000.0, 10000.0))}",
+        f"4ч: {_fmt_usd_or_na(klines.get('vol_4h_usd'))} | "
+        f"{_pct_with_marks(klines.get('vol_pct_4h'), (100.0, 1000.0, 10000.0))}",
+        "",
+        "<b>📈 Рост цены:</b>",
+        f"1ч: {_pct_with_marks(klines.get('price_pct_1h'), (10.0, 25.0, 100.0))}",
+        f"4ч: {_pct_with_marks(klines.get('price_pct_4h'), (10.0, 25.0, 100.0))}",
+        f"24ч: {_pct_with_marks(ticker24.get('price_pct_24h'), (10.0, 25.0, 100.0))}",
+        "",
+        f"<b>📊 Открытый интерес:</b> сейчас: {_fmt_usd_or_na(oi.get('oi_now_usd'))}",
+        f"5м: {_pct_with_marks(oi.get('oi_pct_5m'), (10.0, 25.0, 100.0))}",
+        f"4ч: {_pct_with_marks(oi.get('oi_pct_4h'), (10.0, 25.0, 100.0))}",
+        "",
+        "<b>👥 Аккаунты:</b>",
+        f"{_account_sentiment(long_pct, 'long')} лонг: {_fmt_pct_or_na(long_pct)} | "
+        f"{_account_sentiment(short_pct, 'short')} шорт: {_fmt_pct_or_na(short_pct)}",
+        "",
+        "<b>🩸 Фандинг:</b>",
+        _pct_with_marks(funding.get('funding_pct'), (0.5, 1.0, 2.0)),
+    ]
+
+
 def _live_market_metrics(symbol: str, exchange: str) -> dict:
     cache_key = f"duck_live_metrics:{exchange}:{symbol}"
     cached = _cache_get(cache_key, ttl=20)
@@ -1095,7 +1143,6 @@ def _build_exchange_semantic_block(symbol: str, current_exchange: str) -> list[s
 def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: list[dict], metric_windows: dict[tuple[str, str], dict], *, title: str, transition_ts=None, transition_reason: str | None = None) -> str:
     symbol = str(core_row.get("symbol") or "").upper()
     exchange = str(core_row.get("exchange") or "").upper()
-    window_map = {str(row.get("window_code")): row for row in window_rows}
     latest_ts = transition_ts or core_row.get("latest_cycle_ts")
 
     header_symbol, header_ts = _build_symbol_header(symbol, exchange, latest_ts)
@@ -1111,13 +1158,9 @@ def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: l
         )
     )
 
-    lines.extend(["", "<b>📊 Открытый интерес</b>", "", "<b>Наклонка OI</b>"])
-    for tf in ("15м", "30м", "1ч", "4ч"):
-        row = window_map.get(tf) or {}
-        lines.append(
-            f"{_visual_oi_slope(row.get('oi_slope_class'))} - {tf} - "
-            f"{_human_oi_slope(row.get('oi_slope_class'))}"
-        )
+    del window_rows, metric_windows, transition_reason
+    lines.extend([""])
+    lines.extend(_build_market_metrics_block(_live_market_metrics(symbol, exchange)))
 
     lines.extend(["", _symbol_links(symbol, exchange)])
     return "\n".join(lines)
@@ -2006,21 +2049,12 @@ def _safe_rows(sql: str, params: tuple = ()) -> list[dict]:
         return fetch(sql, params) or []
     except Exception as exc:
         log(f"telegram db fetch error: {exc}")
-        text = str(exc).lower()
-        if "connection is closed" in text or "nonetype" in text:
-            try:
-                import db as _db_module
-
-                conn = getattr(_db_module, "_DB_CONN", None)
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                setattr(_db_module, "_DB_CONN", None)
-                return fetch(sql, params) or []
-            except Exception as retry_exc:
-                log(f"telegram db fetch retry failed: {retry_exc}")
+        # fetch() owns its connection. Retry once without reaching into db.py
+        # internals, so Telegram cannot close a connection used by main.py.
+        try:
+            return fetch(sql, params) or []
+        except Exception as retry_exc:
+            log(f"telegram db fetch retry failed: {retry_exc}")
         return []
 
 

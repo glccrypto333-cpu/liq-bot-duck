@@ -1188,6 +1188,10 @@ def _select_repairable_oi_gap_rows(
 ) -> list[dict]:
     candidates: list[dict] = []
     for row in universe_health.get("problem_pairs", []):
+        # The live cycle may only repair a pair that blocks data quality.
+        # Informational 4h gaps wait for the next normal collection window.
+        if not row.get("blocking"):
+            continue
         stale_list = row.get("stale_list") or ""
         missing_list = row.get("missing_list") or ""
         reason_code = row.get("reason_code") or ""
@@ -1437,25 +1441,12 @@ def _should_run_oi_gap_repair(cycle_no: int, every_cycles: int) -> bool:
     if not runtime_health:
         return os.getenv("RUN_SYNC_OI_GAP_REPAIR", "0") == "1"
 
-    if int(runtime_health.get("symbols_stale_windows", 0) or 0) > 0:
-        return True
-
-    if int(runtime_health.get("symbols_incomplete_windows", 0) or 0) > 0:
-        return True
-
-    if int(runtime_health.get("symbols_absent_in_duck", 0) or 0) > 0:
-        return True
-
-    if runtime_health.get("data_quality_alerts"):
-        return True
-
     if os.getenv("RUN_SYNC_OI_GAP_REPAIR", "0") != "1":
         return False
 
-    if should_run_maintenance_this_cycle(cycle_no, every_cycles):
-        return True
-
-    return False
+    # Expensive repair stays opt-in and periodic. The normal collector is the
+    # primary recovery path; quarantine/alerts still protect real gaps.
+    return should_run_maintenance_this_cycle(cycle_no, every_cycles)
 
 
 def _write_runtime_health_snapshot(

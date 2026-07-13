@@ -39,8 +39,6 @@ def safe_ddl(cur, sql: str) -> None:
     except psycopg.errors.LockNotAvailable as exc:
         log(f"DDL skipped due lock timeout: {sql[:120]} | {exc}")
 
-_DB_CONN = None
-
 def _apply_session_settings(conn):
     try:
         conn.execute("SET statement_timeout = 0")
@@ -51,39 +49,25 @@ def _apply_session_settings(conn):
 
 
 def _conn():
-    global _DB_CONN
-
     for attempt in range(5):
         try:
-            if _DB_CONN is not None and not _DB_CONN.closed:
-                try:
-                    with _DB_CONN.cursor() as cur:
-                        cur.execute("SELECT 1")
-                    return _DB_CONN
-                except Exception:
-                    try:
-                        _DB_CONN.close()
-                    except Exception:
-                        pass
-                    _DB_CONN = None
-
-            _DB_CONN = psycopg.connect(
+            # Callers use ``with _conn()``. A shared psycopg connection would
+            # therefore be closed by one thread while another uses it.
+            conn = psycopg.connect(
                 DATABASE_URL,
                 autocommit=True,
                 row_factory=dict_row,
                 connect_timeout=5,
             )
 
-            _apply_session_settings(_DB_CONN)
+            _apply_session_settings(conn)
 
-            with _DB_CONN.cursor() as cur:
+            with conn.cursor() as cur:
                 cur.execute("SELECT 1")
 
-            return _DB_CONN
+            return conn
 
         except Exception as e:
-            _DB_CONN = None
-
             if attempt == 4:
                 raise
 

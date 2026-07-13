@@ -96,3 +96,39 @@ def test_stage3_charts_media_error_does_not_lose_signal(monkeypatch, tmp_path):
     assert result.delivery_mode == "text"
     assert result.chart_delivery_failure_reason == "RuntimeError"
     assert "график_не_доставлен:RuntimeError" in result.media_alerts
+
+
+def test_coin_message_replaces_oi_slopes_with_tiger_market_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        telegram_bot,
+        "_live_market_metrics",
+        lambda symbol, exchange: {
+            "rank": "#1235",
+            "klines": {
+                "vol_1h_usd": 43_480_000,
+                "vol_4h_usd": 202_050_000,
+                "vol_pct_1h": -39.63,
+                "vol_pct_4h": -21.18,
+                "price_pct_1h": 20.20,
+                "price_pct_4h": 53.08,
+            },
+            "ticker24": {"price_pct_24h": -20.79},
+            "oi": {"oi_now_usd": 17_900_000, "oi_pct_5m": 0.59, "oi_pct_4h": 34.14},
+            "accounts": {"long_pct": 41.33, "short_pct": 58.67},
+            "funding": {"funding_pct": 0.11},
+        },
+    )
+    message = telegram_bot._build_coin_message(
+        {"symbol": "ABCUSDT", "exchange": "BYBIT", "current_stage": 3, "stage_age_minutes": 0, "latest_cycle_ts": "2026-07-12T10:00:00+00:00"},
+        [],
+        [],
+        {},
+        title="🥇 NEW STAGE 3",
+    )
+
+    assert "<b>🏷 Капа-рейтинг:</b> #1235" in message
+    assert "1ч: $43.48M | ⬇️ -39.63%" in message
+    assert "4ч: ⬆️ +53.08%❗️❗️" in message
+    assert "сейчас: $17.90M" in message
+    assert "⬇️ лонг: +41.33% | ⬆️ шорт: +58.67%" in message
+    assert "<b>Наклонка OI</b>" not in message
