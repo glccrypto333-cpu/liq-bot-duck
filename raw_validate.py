@@ -30,9 +30,13 @@ def _validate_raw_rows(name: str, rows: list[tuple], expected_len: int) -> None:
                 raise RuntimeError(f"raw_validate failed: {name} null value index={i} symbol={symbol}")
 
 
-def _format_missing_details(missing_keys: set[tuple[str, str]]) -> str:
+def _format_missing_details(
+    missing_keys: set[tuple[str, str]],
+    *,
+    label: str = "missing",
+) -> str:
     if not missing_keys:
-        return "missing_exchange_counts=none missing_sample=none"
+        return f"{label}_exchange_counts=none {label}_sample=none"
 
     exchange_counts: dict[str, int] = {}
     for exchange, _symbol in missing_keys:
@@ -47,8 +51,8 @@ def _format_missing_details(missing_keys: set[tuple[str, str]]) -> str:
         for exchange, symbol in sorted(missing_keys)[:8]
     )
     return (
-        f"missing_exchange_counts={exchange_summary} "
-        f"missing_sample={sample}"
+        f"{label}_exchange_counts={exchange_summary} "
+        f"{label}_sample={sample}"
     )
 
 
@@ -80,6 +84,7 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
 
     tolerated_price_volume_missing = int(os.getenv("RAW_VALIDATE_TOLERATED_PRICE_VOLUME_MISSING", "0"))
     tolerated_price_volume_missing_pct = float(os.getenv("RAW_VALIDATE_TOLERATED_PRICE_VOLUME_MISSING_PCT", "0"))
+    tolerated_oi_missing = int(os.getenv("RAW_VALIDATE_TOLERATED_OI_MISSING", "2"))
     tolerated_price_volume_missing_dynamic = math.ceil(len(expected) * tolerated_price_volume_missing_pct)
     tolerated_price_volume_missing_limit = max(
         tolerated_price_volume_missing,
@@ -87,21 +92,28 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
     )
 
     if missing_oi or missing_price or missing_volume:
-        tolerated_partial = (
-            not missing_oi
-            and tolerated_price_volume_missing_limit > 0
+        tolerated_oi_partial = len(missing_oi) <= tolerated_oi_missing
+        tolerated_price_volume_partial = (
+            not missing_price
+            and not missing_volume
+        ) or (
+            tolerated_price_volume_missing_limit > 0
             and missing_price == missing_volume
             and len(missing_price) <= tolerated_price_volume_missing_limit
         )
+        tolerated_partial = tolerated_oi_partial and tolerated_price_volume_partial
         if tolerated_partial:
             log(
                 "raw_validate tolerated partial collect: "
+                f"missing_oi={len(missing_oi)} "
                 f"missing_price={len(missing_price)} "
                 f"missing_volume={len(missing_volume)} "
-                f"{_format_missing_details(missing_price)} "
-                f"tolerance_abs={tolerated_price_volume_missing} "
-                f"tolerance_pct={tolerated_price_volume_missing_pct:.4f} "
-                f"tolerance_limit={tolerated_price_volume_missing_limit}"
+                f"{_format_missing_details(missing_oi, label='missing_oi')} "
+                f"{_format_missing_details(missing_price, label='missing_price')} "
+                f"oi_tolerance={tolerated_oi_missing} "
+                f"price_volume_tolerance_abs={tolerated_price_volume_missing} "
+                f"price_volume_tolerance_pct={tolerated_price_volume_missing_pct:.4f} "
+                f"price_volume_tolerance_limit={tolerated_price_volume_missing_limit}"
             )
         else:
             raise RuntimeError(
@@ -109,8 +121,10 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
                 f"missing_oi={len(missing_oi)} "
                 f"missing_price={len(missing_price)} "
                 f"missing_volume={len(missing_volume)} "
+                f"{_format_missing_details(missing_oi, label='missing_oi')} "
                 f"{_format_missing_details(missing_price if missing_price == missing_volume else missing_price | missing_volume)} "
-                f"tolerance_limit={tolerated_price_volume_missing_limit}"
+                f"oi_tolerance={tolerated_oi_missing} "
+                f"price_volume_tolerance_limit={tolerated_price_volume_missing_limit}"
             )
 
     log(

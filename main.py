@@ -55,7 +55,11 @@ from exchange_clients import (
     reset_request_stats,
 )
 from aggregation_engine import rebuild_aggregate_windows, rebuild_latest_aggregate_windows
-from autonomous_oi_service import run_autonomous_oi_service
+from autonomous_oi_service import (
+    collect_stage1_near_maturity_diagnostics,
+    run_autonomous_oi_service,
+    run_post_stage_analytics_tail,
+)
 from cycle_cadence import should_run_this_cycle, should_run_maintenance_this_cycle
 from export_engine import rebuild_exports
 from telegram_bot import start_polling, send_panel_message, check_stage3_alerts
@@ -299,6 +303,7 @@ def _write_canonical_health(runtime_health: dict, cycle_status: dict | None = No
             "signals_waiting_confirmation": runtime_health.get("signals_waiting_confirmation", 0),
             "signals_already_active": runtime_health.get("signals_already_active", 0),
             "signals_repeat_on_cooldown": runtime_health.get("signals_repeat_on_cooldown", 0),
+            "stage1_near_maturity": runtime_health.get("stage1_near_maturity", {}),
             "new_signals": runtime_health.get("new_signals", []),
             "auto_heal_oi_gaps": runtime_health.get("auto_heal_oi_gaps", {}),
             "auto_heal_listing": runtime_health.get("auto_heal_listing", {}),
@@ -1511,6 +1516,21 @@ def _write_runtime_health_snapshot(
     }
     data_quality_alerts = _build_data_quality_alerts(universe_health)
     data_quality_state = "ok" if not data_quality_alerts else "degraded"
+    try:
+        integrity_rows = fetch(
+            """
+            SELECT COUNT(*) AS total, MAX(detected_at) AS latest_at
+            FROM core_state_integrity_incidents
+            WHERE detected_at >= NOW() - INTERVAL '24 hours'
+            """
+        )
+        integrity_health = integrity_rows[0] if integrity_rows else {"total": 0, "latest_at": None}
+    except Exception as exc:
+        integrity_health = {"total": 0, "latest_at": None, "query_error": type(exc).__name__}
+    integrity_recoveries_24h = int(integrity_health.get("total", 0) or 0)
+    if integrity_recoveries_24h:
+        runtime_alerts.append(f"core_state_integrity_recovery_24h={integrity_recoveries_24h}")
+    stage1_near_maturity = collect_stage1_near_maturity_diagnostics()
     timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
     runtime_health = {
         "updated_at_utc": iso_мск(),
@@ -1580,6 +1600,7 @@ def _write_runtime_health_snapshot(
         "signals_already_active": int(signal_info.get("signals_already_active", 0) or 0),
         "signals_waiting_confirmation": int(signal_info.get("signals_waiting_confirmation", 0) or 0),
         "signals_repeat_on_cooldown": int(signal_info.get("signals_repeat_on_cooldown", 0) or 0),
+        "stage1_near_maturity": stage1_near_maturity,
         "new_signals": list(signal_info.get("new_signals", []) or []),
         "signal_delivery_failed": int(signal_info.get("delivery_failed", 0) or 0),
         "stage3_media_albums_sent": int(signal_info.get("media_albums_sent", 0) or 0),
@@ -1604,6 +1625,11 @@ def _write_runtime_health_snapshot(
         "stage3_media_alerts": list(signal_info.get("media_alerts", []) or []),
         "auto_heal_oi_gaps": dict(_LAST_OI_GAP_REPAIR),
         "auto_heal_listing": dict(_LAST_LISTING_SELF_HEAL),
+        "core_state_integrity": {
+            "recoveries_24h": integrity_recoveries_24h,
+            "latest_recovery_at": integrity_health.get("latest_at"),
+            "query_error": integrity_health.get("query_error"),
+        },
     }
     runtime_health["details"] = {
         "symbols_total": runtime_health["symbols_total"],
@@ -1617,10 +1643,12 @@ def _write_runtime_health_snapshot(
         "symbols_in_data_quality_quarantine": runtime_health["symbols_in_data_quality_quarantine"],
         "data_quality_state": runtime_health["data_quality_state"],
         "data_quality_alerts": runtime_health["data_quality_alerts"],
+        "core_state_integrity": runtime_health["core_state_integrity"],
         "signal_observations_total": runtime_health["signal_observations_total"],
         "signals_already_active": runtime_health["signals_already_active"],
         "signals_waiting_confirmation": runtime_health["signals_waiting_confirmation"],
         "signals_repeat_on_cooldown": runtime_health["signals_repeat_on_cooldown"],
+        "stage1_near_maturity": runtime_health["stage1_near_maturity"],
         "new_signals": runtime_health["new_signals"],
         "signal_delivery_failed": runtime_health["signal_delivery_failed"],
         "stage3_media_albums_sent": runtime_health["stage3_media_albums_sent"],
@@ -2411,13 +2439,14 @@ def background():
             autonomous_oi_count = _timed_watchdog_step(
                 timings,
                 "autonomous_oi_service",
-                run_autonomous_oi_service,
+                lambda: run_autonomous_oi_service(run_post_stage_analytics=False),
                 "WATCHDOG_AUTONOMOUS_OI_SECONDS",
                 60,
             )
             _require_watchdog_success("autonomous_oi_service", autonomous_oi_count)
             stage3_alert_info = _timed_step(timings, "stage3_alerts", check_stage3_alerts)
             stage3_alert_count = int((stage3_alert_info or {}).get("sent_count", 0) or 0)
+            _timed_step(timings, "post_stage_analytics", run_post_stage_analytics_tail)
 
             if os.getenv("SKIP_HEAVY_AGGREGATES") == "1":
                 log("aggregates_full skipped: SKIP_HEAVY_AGGREGATES=1")

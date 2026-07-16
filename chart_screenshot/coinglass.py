@@ -7,8 +7,10 @@
 """
 
 import asyncio
+import fcntl
 import os
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -322,7 +324,35 @@ async def _wait_chart_loaded(page) -> None:
         _log("Элемент графика не найден за таймаут")
 
 
-async def _capture_session(symbol: str, exchange, timeframes) -> ChartCaptureResult:
+_LOCAL_CAPTURE_SEMAPHORE = asyncio.Semaphore(2)
+_GLOBAL_CAPTURE_SLOT_DIR = Path("/tmp/openclaw_chart_capture_slots")
+_GLOBAL_CAPTURE_SLOT_COUNT = 3
+
+
+@asynccontextmanager
+async def _global_capture_slot():
+    """Bound concurrent Chromium instances across all chart bots."""
+    _GLOBAL_CAPTURE_SLOT_DIR.mkdir(parents=True, exist_ok=True)
+    handle = None
+    while handle is None:
+        for index in range(_GLOBAL_CAPTURE_SLOT_COUNT):
+            candidate = (_GLOBAL_CAPTURE_SLOT_DIR / f"slot-{index}").open("a+")
+            try:
+                fcntl.flock(candidate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle = candidate
+                break
+            except BlockingIOError:
+                candidate.close()
+        if handle is None:
+            await asyncio.sleep(0.25)
+    try:
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+async def _capture_session_unlocked(symbol: str, exchange, timeframes) -> ChartCaptureResult:
     """Съёмка нескольких таймфреймов в ОДНОЙ сессии браузера.
     Возвращает список путей к PNG (best-effort: только успешно снятые ТФ)."""
     os.makedirs(CHART_SCREENSHOT_DIR, exist_ok=True)
@@ -451,6 +481,13 @@ async def _capture_session(symbol: str, exchange, timeframes) -> ChartCaptureRes
         capture_seconds_total=round(time.monotonic() - session_started_at, 3),
         failure_reason="capture_failed",
     )
+
+
+async def _capture_session(symbol: str, exchange, timeframes) -> ChartCaptureResult:
+    # One capture per bot plus a server-wide three-browser ceiling prevents bursts.
+    async with _LOCAL_CAPTURE_SEMAPHORE:
+        async with _global_capture_slot():
+            return await _capture_session_unlocked(symbol, exchange, timeframes)
 
 
 async def make_coinglass_screenshots(

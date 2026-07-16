@@ -71,6 +71,7 @@ PATTERN_LABELS = {
 RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
 AUTONOMOUS_OI_PROGRESS_PATH = RUNTIME_DIR / "autonomous_oi_progress.json"
 SYMBOL_WINDOWS_STALE_MINUTES = int(os.getenv("SYMBOL_WINDOWS_STALE_MINUTES", "30"))
+PRICE_FRESHNESS_GUARD_WINDOWS = ("30м", "1ч", "4ч")
 
 
 def _window_source_table(window_source: str) -> str:
@@ -260,6 +261,166 @@ def load_window_updates_by_cycle(
     return by_cycle_ts
 
 
+def _active_stage2_pairs(previous_state_map: dict[tuple[str, str], dict]) -> list[tuple[str, str]]:
+    """Return only stage-2 pairs that need an age-based 2 -> 3 recheck."""
+    pairs: list[tuple[str, str]] = []
+    for key, state in previous_state_map.items():
+        if not isinstance(key, tuple) or len(key) != 2 or not isinstance(state, dict):
+            continue
+        if int(state.get("current_stage") or 0) == 2:
+            pairs.append((str(key[0]), str(key[1])))
+    return pairs
+
+
+def collect_stage1_near_maturity_diagnostics(limit: int = 10) -> dict:
+    """Expose stage-1 pairs that are close to 1 -> 2 without changing stages."""
+    try:
+        rows = fetch(
+            """
+            WITH candidates AS (
+                SELECT
+                    c.exchange,
+                    c.symbol,
+                    c.oi_stage_age_minutes,
+                    CASE
+                        WHEN c.growth_trigger_ts IS NULL THEN NULL
+                        ELSE EXTRACT(EPOCH FROM (NOW() - c.growth_trigger_ts)) / 60.0
+                    END AS trigger_age_minutes,
+                    c.oi_transition_permission,
+                    c.oi_slope_class_15m,
+                    c.oi_slope_class_30m,
+                    c.oi_slope_class_1h,
+                    c.oi_slope_class_4h,
+                    EXISTS (
+                        SELECT 1
+                        FROM aggregate_windows w
+                        WHERE w.exchange = c.exchange
+                          AND w.symbol = c.symbol
+                        LIMIT 1
+                    ) AS hot_map_present
+                FROM oi_core_state c
+                WHERE c.current_stage = 1
+                  AND (
+                      c.oi_transition_permission IN (
+                          'ждем_30_минут_от_триггера',
+                          'ждем_30_минут_в_1'
+                      )
+                      OR (
+                          COALESCE(c.oi_stage_age_minutes, 0) >= 25
+                          AND COALESCE(c.oi_slope_class_15m, '') IN ('weak_up', 'good_up', 'strong_up')
+                          AND COALESCE(c.oi_slope_class_30m, '') IN ('good_up', 'strong_up')
+                      )
+                  )
+            )
+            SELECT
+                *,
+                COUNT(*) OVER() AS total_count,
+                SUM(CASE WHEN hot_map_present THEN 0 ELSE 1 END) OVER() AS absent_total
+            FROM candidates
+            ORDER BY
+                COALESCE(trigger_age_minutes, 0) DESC,
+                COALESCE(oi_stage_age_minutes, 0) DESC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+    except Exception as exc:
+        return {
+            "total": 0,
+            "absent_in_hot_map": 0,
+            "sample": [],
+            "query_error": type(exc).__name__,
+        }
+
+    sample: list[dict] = []
+    total_count = int(rows[0].get("total_count", len(rows)) or 0) if rows else 0
+    if rows and rows[0].get("absent_total") is not None:
+        absent = int(rows[0].get("absent_total") or 0)
+    else:
+        absent = sum(1 for row in rows if not bool(row.get("hot_map_present")))
+    for row in rows:
+        hot_map_present = bool(row.get("hot_map_present"))
+        sample.append(
+            {
+                "exchange": row.get("exchange"),
+                "symbol": row.get("symbol"),
+                "stage_age_minutes": round(float(row.get("oi_stage_age_minutes") or 0.0), 2),
+                "trigger_age_minutes": (
+                    round(float(row.get("trigger_age_minutes") or 0.0), 2)
+                    if row.get("trigger_age_minutes") is not None
+                    else None
+                ),
+                "transition_permission": row.get("oi_transition_permission"),
+                "hot_map_present": hot_map_present,
+                "oi_15m": row.get("oi_slope_class_15m"),
+                "oi_30m": row.get("oi_slope_class_30m"),
+                "oi_1h": row.get("oi_slope_class_1h"),
+                "oi_4h": row.get("oi_slope_class_4h"),
+            }
+        )
+
+    return {
+        "total": total_count,
+        "absent_in_hot_map": absent,
+        "sample": sample,
+    }
+
+
+def _merge_window_maps(
+    target: dict[tuple[str, str], dict[str, dict[str, dict]]],
+    replacement: dict[tuple[str, str], dict[str, dict[str, dict]]],
+) -> None:
+    """Overlay a small, as-of-cycle candidate snapshot onto the live map."""
+    for key, windows in replacement.items():
+        target[key] = windows
+
+
+def _as_aware_ts(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _has_fresh_price_gate_windows(payload: dict, cycle_ts: datetime) -> bool:
+    """PRICE 30м/1ч/4ч must belong to the current source cycle for promotion."""
+    expected_ts = _as_aware_ts(cycle_ts)
+    if expected_ts is None:
+        return False
+    for window_code in PRICE_FRESHNESS_GUARD_WINDOWS:
+        row = (payload.get(window_code) or {}).get("PRICE")
+        row_ts = _as_aware_ts(row.get("source_cycle_ts") if isinstance(row, dict) else None)
+        if row_ts != expected_ts:
+            return False
+    return True
+
+
+def _apply_price_freshness_guard(
+    previous_stage: int,
+    target_stage: int,
+    payload: dict,
+    cycle_ts: datetime,
+) -> tuple[int, str | None]:
+    """Do not promote mature stage-1/2 pairs when current-cycle price is missing."""
+    if previous_stage not in (1, 2):
+        return target_stage, None
+    if target_stage <= previous_stage:
+        return target_stage, None
+    if _has_fresh_price_gate_windows(payload, cycle_ts):
+        return target_stage, None
+    return previous_stage, "удержание:нет_свежей_цены_30м_1ч_4ч"
+
+
 def load_autonomous_oi_progress() -> datetime | None:
     if not AUTONOMOUS_OI_PROGRESS_PATH.exists():
         return None
@@ -276,15 +437,80 @@ def save_autonomous_oi_progress(last_source_cycle_ts: datetime | None) -> None:
         return
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     payload = {"last_source_cycle_ts": last_source_cycle_ts.isoformat()}
-    AUTONOMOUS_OI_PROGRESS_PATH.write_text(
+    tmp_path = AUTONOMOUS_OI_PROGRESS_PATH.with_name(
+        f"{AUTONOMOUS_OI_PROGRESS_PATH.name}.tmp"
+    )
+    tmp_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    os.replace(tmp_path, AUTONOMOUS_OI_PROGRESS_PATH)
+
+
+def reconcile_core_state_integrity(
+    state_map: dict[tuple[str, str], dict],
+    guard_rows: list[dict],
+) -> list[tuple[str, str]]:
+    """Restore an unresolved stage 3 if the mutable core row silently vanished."""
+    recovered: list[tuple[str, str]] = []
+    for guard in guard_rows:
+        if int(guard.get("current_stage") or 0) != 3:
+            continue
+        key = (guard["exchange"], guard["symbol"])
+        current = state_map.get(key)
+        if current and int(current.get("current_stage") or 0) >= 3:
+            continue
+        restored = dict(current or {})
+        restored.update(
+            {
+                "exchange": key[0],
+                "symbol": key[1],
+                "current_stage": 3,
+                "oi_stage_age_minutes": float(guard.get("stage_age_minutes") or 0.0),
+                "latest_cycle_ts": guard.get("latest_cycle_ts"),
+                "oi_transition_permission": "удержание_3:восстановлено_инвариантом",
+                "decision_reason": "восстановление_3_после_тихой_потери_core_state",
+            }
+        )
+        state_map[key] = restored
+        recovered.append(key)
+    return recovered
 
 
 def load_previous_core_state_map() -> dict[tuple[str, str], dict]:
     rows = fetch("SELECT * FROM oi_core_state")
-    return {(row["exchange"], row["symbol"]): row for row in rows}
+    state_map = {(row["exchange"], row["symbol"]): row for row in rows}
+    guard_rows = fetch(
+        """
+        SELECT exchange, symbol, current_stage, stage_age_minutes, latest_cycle_ts
+        FROM core_state_integrity_guard
+        WHERE current_stage = 3
+        """
+    )
+    recovered = reconcile_core_state_integrity(state_map, guard_rows)
+    if recovered:
+        execute(
+            """
+            INSERT INTO core_state_integrity_incidents(
+                exchange, symbol, restored_stage, guard_latest_cycle_ts
+            )
+            SELECT guard.exchange, guard.symbol, guard.current_stage, guard.latest_cycle_ts
+            FROM core_state_integrity_guard guard
+            WHERE guard.current_stage = 3
+              AND (guard.exchange, guard.symbol) IN (
+                  SELECT * FROM UNNEST(%s::TEXT[], %s::TEXT[])
+              )
+            """,
+            (
+                [exchange for exchange, _ in recovered],
+                [symbol for _, symbol in recovered],
+            ),
+        )
+        log(
+            "core_state_integrity restored unresolved stage3: "
+            + ", ".join(f"{exchange}:{symbol}" for exchange, symbol in recovered)
+        )
+    return state_map
 
 
 def build_symbol_window_payload(window_map: dict[str, dict[str, dict]]) -> dict[str, dict[str, dict] | None]:
@@ -699,6 +925,14 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
         if missing_senior_background_reason and target_stage > 1:
             target_stage = 1
             guard_reason = missing_senior_background_reason
+        target_stage, price_freshness_guard_reason = _apply_price_freshness_guard(
+            previous_stage,
+            target_stage,
+            payload,
+            cycle_ts,
+        )
+        if price_freshness_guard_reason:
+            guard_reason = price_freshness_guard_reason
         if stale_windows:
             target_stage = 0
             guard_reason = (
@@ -1105,6 +1339,20 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
             latest_window_map[key].setdefault(row["window_code"], {})
             latest_window_map[key][row["window_code"]][row["metric"]] = row
 
+        # A pair can remain in stage 2 while its next raw OI point arrives late.
+        # Re-evaluate only those pairs from history as of this global cycle so
+        # the live path matches the replay's age-based early-release decision.
+        stage2_pairs = _active_stage2_pairs(state_map)
+        if stage2_pairs:
+            _merge_window_maps(
+                latest_window_map,
+                load_latest_window_map(
+                    source_cycle,
+                    window_source="history",
+                    tracked_pairs=stage2_pairs,
+                ),
+            )
+
         final_core_rows, final_window_rows, history_rows, state_map = compute_autonomous_oi_snapshot_from_latest_window_map(
             latest_window_map,
             cycle_ts=source_cycle,
@@ -1126,7 +1374,21 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
     return final_core_rows, final_window_rows, all_history_rows, state_map, source_cycles[-1]
 
 
-def run_autonomous_oi_service(cycle_ts: datetime | None = None) -> int:
+def run_post_stage_analytics_tail(cycle_ts: datetime | None = None) -> None:
+    cycle_ts = cycle_ts or datetime.now(timezone.utc)
+    last_source_cycle_ts = load_autonomous_oi_progress()
+    analytics_cycle_ts = last_source_cycle_ts or cycle_ts
+    post_stage_started = time.perf_counter()
+    update_post_stage_analytics([], analytics_cycle_ts)
+    post_stage_seconds = time.perf_counter() - post_stage_started
+    log(f"post_stage_analytics_seconds={post_stage_seconds:.2f}")
+
+
+def run_autonomous_oi_service(
+    cycle_ts: datetime | None = None,
+    *,
+    run_post_stage_analytics: bool = True,
+) -> int:
     cycle_ts = cycle_ts or datetime.now(timezone.utc)
     last_source_cycle_ts = load_autonomous_oi_progress()
     core_rows, window_rows, history_rows, next_state_map, last_source_cycle_ts = compute_autonomous_oi_snapshot_incremental_to_cycle(
@@ -1151,10 +1413,11 @@ def run_autonomous_oi_service(cycle_ts: datetime | None = None) -> int:
             + " ".join(f"{k}={v}" for k, v in prune_counts.items())
         )
     save_autonomous_oi_progress(last_source_cycle_ts)
-    post_stage_started = time.perf_counter()
-    update_post_stage_analytics(history_rows, last_source_cycle_ts or cycle_ts)
-    post_stage_seconds = time.perf_counter() - post_stage_started
-    log(f"post_stage_analytics_seconds={post_stage_seconds:.2f}")
+    if run_post_stage_analytics:
+        post_stage_started = time.perf_counter()
+        update_post_stage_analytics(history_rows, last_source_cycle_ts or cycle_ts)
+        post_stage_seconds = time.perf_counter() - post_stage_started
+        log(f"post_stage_analytics_seconds={post_stage_seconds:.2f}")
     log(
         f"autonomous_oi_service ok: symbols={len(core_rows)} "
         f"windows={len(window_rows)} history={len(history_rows)}"

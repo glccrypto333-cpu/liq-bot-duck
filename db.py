@@ -313,6 +313,44 @@ def init_db() -> None:
         )
         """)
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS core_state_universe_guard(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            state_table TEXT NOT NULL,
+            current_stage INTEGER,
+            first_detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            detections INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(exchange, symbol, state_table)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS core_state_integrity_guard(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            current_stage INTEGER NOT NULL,
+            stage_age_minutes DOUBLE PRECISION,
+            latest_cycle_ts TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY(exchange, symbol)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS core_state_integrity_incidents(
+            id BIGSERIAL PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            restored_stage INTEGER NOT NULL,
+            guard_latest_cycle_ts TIMESTAMPTZ,
+            detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """)
+        safe_ddl(
+            cur,
+            "CREATE INDEX IF NOT EXISTS idx_core_state_integrity_incidents_detected "
+            "ON core_state_integrity_incidents(detected_at DESC)",
+        )
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS window_state_v2(
             exchange TEXT NOT NULL,
             symbol TEXT NOT NULL,
@@ -1225,6 +1263,21 @@ def replace_oi_core_state(rows: list[tuple]) -> None:
             latest_cycle_ts = EXCLUDED.latest_cycle_ts,
             updated_at = NOW()
         """, rows)
+        # Keep a tiny independent checkpoint: core state is phase memory, not
+        # a disposable cache. It lets the service reject a silent state loss.
+        cur.execute("""
+        INSERT INTO core_state_integrity_guard(
+            exchange, symbol, current_stage, stage_age_minutes, latest_cycle_ts, updated_at
+        )
+        SELECT exchange, symbol, current_stage, oi_stage_age_minutes, latest_cycle_ts, NOW()
+        FROM oi_core_state
+        ON CONFLICT (exchange, symbol)
+        DO UPDATE SET
+            current_stage = EXCLUDED.current_stage,
+            stage_age_minutes = EXCLUDED.stage_age_minutes,
+            latest_cycle_ts = EXCLUDED.latest_cycle_ts,
+            updated_at = NOW()
+        """)
 
 
 def replace_oi_window_state(rows: list[tuple]) -> None:
@@ -1357,8 +1410,85 @@ def replace_window_state_v2(rows: list[tuple]) -> None:
         """, rows)
 
 
+def _unique_transition_history_v2_rows(rows: list[tuple]) -> list[tuple]:
+    if not rows:
+        return []
+    unique_rows = []
+    seen = set()
+    for row in rows:
+        key = (row[0], row[1], row[2], row[3], row[4], row[7])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+    cycles = list({row[4] for row in unique_rows})
+    existing_rows = fetch(
+        """
+        SELECT exchange, symbol, from_stage, to_stage, cycle_ts, reason
+        FROM transition_history_v2
+        WHERE cycle_ts = ANY(%s)
+        """,
+        (cycles,),
+    )
+    existing_keys = {
+        (
+            row["exchange"],
+            row["symbol"],
+            row["from_stage"],
+            row["to_stage"],
+            row["cycle_ts"],
+            row["reason"],
+        )
+        for row in existing_rows
+    }
+    return [
+        row for row in unique_rows
+        if (row[0], row[1], row[2], row[3], row[4], row[7]) not in existing_keys
+    ]
+
+
+def _unique_oi_stage_history_rows(rows: list[tuple]) -> list[tuple]:
+    if not rows:
+        return []
+    unique_rows = []
+    seen = set()
+    for row in rows:
+        key = (row[0], row[1], row[2], row[3], row[7], row[4])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+    cycles = list({row[7] for row in unique_rows})
+    existing_rows = fetch(
+        """
+        SELECT exchange, symbol, from_stage, to_stage, cycle_ts, transition_reason
+        FROM oi_stage_history
+        WHERE cycle_ts = ANY(%s)
+        """,
+        (cycles,),
+    )
+    existing_keys = {
+        (
+            row["exchange"],
+            row["symbol"],
+            row["from_stage"],
+            row["to_stage"],
+            row["cycle_ts"],
+            row["transition_reason"],
+        )
+        for row in existing_rows
+    }
+    return [
+        row for row in unique_rows
+        if (row[0], row[1], row[2], row[3], row[7], row[4]) not in existing_keys
+    ]
+
+
 def insert_transition_history_v2(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
+        return
+    rows = _unique_transition_history_v2_rows(rows)
+    if not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
@@ -1378,6 +1508,9 @@ def insert_transition_history_v2(rows: list[tuple]) -> None:
 
 def insert_oi_stage_history(rows: list[tuple]) -> None:
     if not DATABASE_URL or not rows:
+        return
+    rows = _unique_oi_stage_history_rows(rows)
+    if not rows:
         return
     with _conn() as conn, conn.cursor() as cur:
         cur.executemany("""
@@ -1484,6 +1617,33 @@ def prune_inactive_state_rows() -> dict[str, int]:
             return {}
 
         counts: dict[str, int] = {}
+
+        # Core state is phase memory, not a cache. A temporary universe miss
+        # must never erase stage 2/3 and manufacture a later "new" stage 3.
+        for state_table in ("oi_core_state", "core_state_v2"):
+            cur.execute(
+                f"""
+                INSERT INTO core_state_universe_guard(
+                    exchange, symbol, state_table, current_stage,
+                    first_detected_at, last_detected_at, detections
+                )
+                SELECT exchange, symbol, %s, current_stage, NOW(), NOW(), 1
+                FROM {state_table} state
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM active_symbol_universe au
+                    WHERE au.exchange = state.exchange
+                      AND au.symbol = state.symbol
+                )
+                ON CONFLICT (exchange, symbol, state_table)
+                DO UPDATE SET
+                    current_stage = EXCLUDED.current_stage,
+                    last_detected_at = NOW(),
+                    detections = core_state_universe_guard.detections + 1
+                """,
+                (state_table,),
+            )
+            counts[f"protected_{state_table}"] = cur.rowcount
+
         delete_specs = [
             (
                 "oi_window_state",
@@ -1504,28 +1664,6 @@ def prune_inactive_state_rows() -> dict[str, int]:
                     SELECT 1 FROM active_symbol_universe au
                     WHERE au.exchange = w.exchange
                       AND au.symbol = w.symbol
-                )
-                """,
-            ),
-            (
-                "oi_core_state",
-                """
-                DELETE FROM oi_core_state c
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM active_symbol_universe au
-                    WHERE au.exchange = c.exchange
-                      AND au.symbol = c.symbol
-                )
-                """,
-            ),
-            (
-                "core_state_v2",
-                """
-                DELETE FROM core_state_v2 c
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM active_symbol_universe au
-                    WHERE au.exchange = c.exchange
-                      AND au.symbol = c.symbol
                 )
                 """,
             ),
