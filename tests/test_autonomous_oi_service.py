@@ -11,11 +11,17 @@ if str(ROOT) not in sys.path:
 from autonomous_oi_service import (
     AUTONOMOUS_OI_PROGRESS_PATH,
     _apply_price_freshness_guard,
+    _record_price_freshness_guard_block,
+    _record_transition_observation,
+    build_stage_chain_continuity_report,
+    build_window_freshness_by_kind,
     collect_stage1_near_maturity_diagnostics,
+    get_runtime_observability_metrics,
     _resolve_growth_trigger_ts,
     build_core_record,
     compute_autonomous_oi_snapshot_incremental_to_cycle,
     reconcile_core_state_integrity,
+    reset_runtime_observability_metrics,
     run_autonomous_oi_service,
     run_post_stage_analytics_tail,
     save_autonomous_oi_progress,
@@ -68,6 +74,103 @@ def make_persistent_oi_summary(
         "oi_slope_class_1h": oi_1h,
         "oi_slope_class_4h": oi_4h,
     }
+
+
+def test_runtime_observability_records_price_freshness_guard_blocks():
+    reset_runtime_observability_metrics()
+
+    _record_price_freshness_guard_block(
+        exchange="BINANCE",
+        symbol="TESTUSDT",
+        previous_stage=2,
+        requested_stage=3,
+        held_stage=2,
+        reason="удержание:нет_свежей_цены_30м_1ч_4ч",
+    )
+
+    metrics = get_runtime_observability_metrics()
+    guard = metrics["price_freshness_guard"]
+    assert guard["blocked_promotions_total"] == 1
+    assert guard["blocked_2_to_3"] == 1
+    assert guard["blocked_1_to_2"] == 0
+    assert guard["sample"][0]["pair"] == "BINANCE:TESTUSDT"
+
+
+def test_runtime_observability_records_transition_and_degrade_reasons():
+    reset_runtime_observability_metrics()
+
+    _record_transition_observation(
+        previous_stage=3,
+        target_stage=0,
+        decision_reason="stage3_reset",
+        guard_reason="oi_4h=weak_down",
+        oi_summary=make_oi_summary(oi_4h="weak_down"),
+        exchange="BYBIT",
+        symbol="DROPUSDT",
+    )
+
+    metrics = get_runtime_observability_metrics()
+    assert metrics["transition_metrics"]["by_transition"]["3_to_0"] == 1
+    assert metrics["degrade_reasons"]["by_reason"]["oi_4h_weak_down"] == 1
+    assert metrics["degrade_reasons"]["sample"][0]["pair"] == "BYBIT:DROPUSDT"
+
+
+def test_window_freshness_by_kind_counts_problem_pairs_by_metric_and_window():
+    summary = build_window_freshness_by_kind(
+        [
+            {
+                "exchange": "BINANCE",
+                "symbol": "ALLUSDT",
+                "missing_list": "PRICE:1ч, OI:30м",
+                "stale_list": "OI:4ч=240м, PRICE:30м=35м",
+            },
+            {
+                "exchange": "BYBIT",
+                "symbol": "GAPUSDT",
+                "missing_list": "VOLUME:15м",
+                "stale_list": "OI:30м=40м",
+            },
+        ]
+    )
+
+    assert summary["missing"]["PRICE"]["1h"] == 1
+    assert summary["missing"]["OI"]["30m"] == 1
+    assert summary["missing"]["VOLUME"]["15m"] == 1
+    assert summary["stale"]["OI"]["30m"] == 1
+    assert summary["stale"]["OI"]["4h"] == 1
+    assert summary["stale"]["PRICE"]["30m"] == 1
+
+
+def test_stage_chain_continuity_report_flags_silent_stage_reset():
+    report = build_stage_chain_continuity_report(
+        [
+            {
+                "exchange": "BYBIT",
+                "symbol": "NFLXUSDT",
+                "cycle_ts_msk": "2026-07-21 13:55",
+                "prev_to": 3,
+                "from_stage": 0,
+                "to_stage": 1,
+            },
+            {
+                "exchange": "BINANCE",
+                "symbol": "OKUSDT",
+                "cycle_ts_msk": "2026-07-21 14:00",
+                "prev_to": 1,
+                "from_stage": 1,
+                "to_stage": 2,
+            },
+        ],
+        lookback_hours=24,
+        recent_minutes=30,
+    )
+
+    assert report["total"] == 1
+    assert report["recent_total"] == 1
+    assert report["health"] == "critical"
+    assert report["sample"][0]["pair"] == "BYBIT:NFLXUSDT"
+    assert report["sample"][0]["expected_from_stage"] == 3
+    assert report["sample"][0]["actual_from_stage"] == 0
 
 
 def test_stage_2_without_saved_trigger_does_not_restore_ancient_trigger_from_age() -> None:

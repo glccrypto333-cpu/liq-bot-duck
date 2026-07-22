@@ -72,6 +72,280 @@ RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
 AUTONOMOUS_OI_PROGRESS_PATH = RUNTIME_DIR / "autonomous_oi_progress.json"
 SYMBOL_WINDOWS_STALE_MINUTES = int(os.getenv("SYMBOL_WINDOWS_STALE_MINUTES", "30"))
 PRICE_FRESHNESS_GUARD_WINDOWS = ("30м", "1ч", "4ч")
+OBSERVABILITY_SAMPLE_LIMIT = 10
+
+
+def _new_runtime_observability_metrics() -> dict:
+    return {
+        "price_freshness_guard": {
+            "blocked_promotions_total": 0,
+            "blocked_1_to_2": 0,
+            "blocked_2_to_3": 0,
+            "sample": [],
+        },
+        "stage2_history_recheck": {
+            "checked_total": 0,
+            "history_loaded_pairs": 0,
+            "produced_core_rows": 0,
+            "produced_transitions": 0,
+            "sample": [],
+        },
+        "transition_metrics": {
+            "total": 0,
+            "by_transition": {},
+            "sample": [],
+        },
+        "degrade_reasons": {
+            "total": 0,
+            "by_reason": {},
+            "sample": [],
+        },
+    }
+
+
+_RUNTIME_OBSERVABILITY_METRICS = _new_runtime_observability_metrics()
+
+
+def reset_runtime_observability_metrics() -> None:
+    global _RUNTIME_OBSERVABILITY_METRICS
+    _RUNTIME_OBSERVABILITY_METRICS = _new_runtime_observability_metrics()
+
+
+def get_runtime_observability_metrics() -> dict:
+    return json.loads(json.dumps(_RUNTIME_OBSERVABILITY_METRICS, ensure_ascii=False, default=str))
+
+
+def _append_observability_sample(bucket: dict, row: dict) -> None:
+    sample = bucket.setdefault("sample", [])
+    if len(sample) < OBSERVABILITY_SAMPLE_LIMIT:
+        sample.append(row)
+
+
+def _increment_counter(mapping: dict, key: str, amount: int = 1) -> None:
+    mapping[key] = int(mapping.get(key, 0) or 0) + int(amount)
+
+
+def _record_price_freshness_guard_block(
+    *,
+    exchange: str,
+    symbol: str,
+    previous_stage: int,
+    requested_stage: int,
+    held_stage: int,
+    reason: str,
+) -> None:
+    bucket = _RUNTIME_OBSERVABILITY_METRICS["price_freshness_guard"]
+    bucket["blocked_promotions_total"] += 1
+    if int(previous_stage) == 1 and int(requested_stage) >= 2:
+        bucket["blocked_1_to_2"] += 1
+    if int(previous_stage) == 2 and int(requested_stage) >= 3:
+        bucket["blocked_2_to_3"] += 1
+    _append_observability_sample(
+        bucket,
+        {
+            "pair": f"{exchange}:{symbol}",
+            "previous_stage": int(previous_stage),
+            "requested_stage": int(requested_stage),
+            "held_stage": int(held_stage),
+            "reason": reason,
+        },
+    )
+
+
+def _classify_degrade_reason(
+    previous_stage: int,
+    target_stage: int,
+    guard_reason: str,
+    oi_summary: dict | None,
+) -> str:
+    oi_summary = oi_summary or {}
+    reason_text = str(guard_reason or "")
+    oi_30m = str(oi_summary.get("oi_slope_class_30m") or "")
+    oi_1h = str(oi_summary.get("oi_slope_class_1h") or "")
+    oi_4h = str(oi_summary.get("oi_slope_class_4h") or "")
+
+    if previous_stage == 3 and target_stage < 3:
+        if oi_4h == "strong_down":
+            return "oi_4h_strong_down"
+        if oi_4h == "weak_down":
+            return "oi_4h_weak_down"
+        if "stale_windows" in reason_text:
+            return "stale_windows"
+        return "stage3_safety_other"
+
+    if previous_stage == 2 and target_stage < 2:
+        if oi_30m == "strong_down":
+            return "oi_30m_strong_down"
+        if oi_30m == "weak_down":
+            return "oi_30m_weak_down"
+        if oi_1h == "strong_down":
+            return "oi_1h_strong_down"
+        if oi_1h == "weak_down":
+            return "oi_1h_weak_down"
+        if "цена" in reason_text or "price" in reason_text:
+            return "price_guard"
+        return "stage2_degrade_other"
+
+    if "stale_windows" in reason_text:
+        return "stale_windows"
+    return "other"
+
+
+def _record_transition_observation(
+    *,
+    previous_stage: int,
+    target_stage: int,
+    decision_reason: str,
+    guard_reason: str,
+    oi_summary: dict | None,
+    exchange: str,
+    symbol: str,
+) -> None:
+    previous_stage = int(previous_stage or 0)
+    target_stage = int(target_stage or 0)
+    if previous_stage == target_stage:
+        return
+
+    transition_bucket = _RUNTIME_OBSERVABILITY_METRICS["transition_metrics"]
+    transition_bucket["total"] += 1
+    transition_key = f"{previous_stage}_to_{target_stage}"
+    _increment_counter(transition_bucket["by_transition"], transition_key)
+    _append_observability_sample(
+        transition_bucket,
+        {
+            "pair": f"{exchange}:{symbol}",
+            "transition": transition_key,
+            "reason": decision_reason,
+            "guard": guard_reason,
+        },
+    )
+
+    if target_stage < previous_stage:
+        degrade_bucket = _RUNTIME_OBSERVABILITY_METRICS["degrade_reasons"]
+        degrade_bucket["total"] += 1
+        reason_key = _classify_degrade_reason(previous_stage, target_stage, guard_reason, oi_summary)
+        _increment_counter(degrade_bucket["by_reason"], reason_key)
+        _append_observability_sample(
+            degrade_bucket,
+            {
+                "pair": f"{exchange}:{symbol}",
+                "transition": transition_key,
+                "reason": reason_key,
+                "guard": guard_reason,
+            },
+        )
+
+
+def _record_stage2_history_recheck(
+    *,
+    checked_pairs: list[tuple[str, str]],
+    history_window_map: dict[tuple[str, str], dict],
+    core_rows: list[tuple],
+    history_rows: list[tuple],
+) -> None:
+    bucket = _RUNTIME_OBSERVABILITY_METRICS["stage2_history_recheck"]
+    checked_total = len(checked_pairs)
+    bucket["checked_total"] += checked_total
+    bucket["history_loaded_pairs"] += len(history_window_map)
+    bucket["produced_core_rows"] = len(core_rows)
+    bucket["produced_transitions"] += len(history_rows)
+    for exchange, symbol in checked_pairs[:OBSERVABILITY_SAMPLE_LIMIT]:
+        _append_observability_sample(
+            bucket,
+            {
+                "pair": f"{exchange}:{symbol}",
+                "loaded_from_history": (exchange, symbol) in history_window_map,
+            },
+        )
+
+
+_WINDOW_KIND_KEYS = ("OI", "PRICE", "VOLUME")
+_WINDOW_CODE_TO_PUBLIC_KEY = {
+    "15м": "15m",
+    "30м": "30m",
+    "1ч": "1h",
+    "4ч": "4h",
+    "12ч": "12h",
+    "24ч": "24h",
+}
+
+
+def _blank_window_kind_counter() -> dict:
+    return {
+        metric: {public_key: 0 for public_key in _WINDOW_CODE_TO_PUBLIC_KEY.values()}
+        for metric in _WINDOW_KIND_KEYS
+    }
+
+
+def _parse_window_problem_list(value: object) -> list[tuple[str, str]]:
+    if not value:
+        return []
+    parsed: list[tuple[str, str]] = []
+    for chunk in str(value).split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        token = token.split("=", 1)[0].strip()
+        if ":" not in token:
+            continue
+        metric_raw, window_raw = [part.strip() for part in token.split(":", 1)]
+        metric = metric_raw.upper()
+        window_code = window_raw.lower()
+        if metric in _WINDOW_KIND_KEYS and window_code in _WINDOW_CODE_TO_PUBLIC_KEY:
+            parsed.append((metric, _WINDOW_CODE_TO_PUBLIC_KEY[window_code]))
+    return parsed
+
+
+def build_window_freshness_by_kind(problem_pairs: list[dict] | None) -> dict:
+    summary = {
+        "missing": _blank_window_kind_counter(),
+        "stale": _blank_window_kind_counter(),
+    }
+    for row in problem_pairs or []:
+        for metric, window_key in _parse_window_problem_list(row.get("missing_list")):
+            summary["missing"][metric][window_key] += 1
+        for metric, window_key in _parse_window_problem_list(row.get("stale_list")):
+            summary["stale"][metric][window_key] += 1
+    return summary
+
+
+def build_stage_chain_continuity_report(
+    discontinuity_rows: list[dict] | None,
+    *,
+    lookback_hours: int,
+    recent_minutes: int,
+    total_count: int | None = None,
+) -> dict:
+    rows = [
+        row for row in list(discontinuity_rows or [])
+        if row.get("prev_to") is not None
+        and int(row.get("prev_to") or 0) != int(row.get("from_stage") or 0)
+    ]
+    sample = []
+    for row in rows[:OBSERVABILITY_SAMPLE_LIMIT]:
+        sample.append(
+            {
+                "pair": f"{row.get('exchange')}:{row.get('symbol')}",
+                "cycle_ts_msk": row.get("cycle_ts_msk"),
+                "expected_from_stage": int(row.get("prev_to") or 0),
+                "actual_from_stage": int(row.get("from_stage") or 0),
+                "to_stage": int(row.get("to_stage") or 0),
+            }
+        )
+
+    recent_total = len(rows)
+    health = "ok"
+    if recent_total:
+        health = "critical"
+
+    return {
+        "health": health,
+        "lookback_hours": int(lookback_hours),
+        "recent_minutes": int(recent_minutes),
+        "total": int(total_count if total_count is not None else len(rows)),
+        "recent_total": recent_total,
+        "sample": sample,
+    }
 
 
 def _window_source_table(window_source: str) -> str:
@@ -925,6 +1199,7 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
         if missing_senior_background_reason and target_stage > 1:
             target_stage = 1
             guard_reason = missing_senior_background_reason
+        requested_stage_before_price_guard = target_stage
         target_stage, price_freshness_guard_reason = _apply_price_freshness_guard(
             previous_stage,
             target_stage,
@@ -933,6 +1208,14 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
         )
         if price_freshness_guard_reason:
             guard_reason = price_freshness_guard_reason
+            _record_price_freshness_guard_block(
+                exchange=exchange,
+                symbol=symbol,
+                previous_stage=previous_stage,
+                requested_stage=requested_stage_before_price_guard,
+                held_stage=target_stage,
+                reason=price_freshness_guard_reason,
+            )
         if stale_windows:
             target_stage = 0
             guard_reason = (
@@ -953,6 +1236,15 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
         elif missing_senior_background_reason and target_stage <= 1:
             transition_permission = "нет_старшего_фона_4ч"
         decision_reason = f"{decision_reason}; guard={guard_reason}"
+        _record_transition_observation(
+            previous_stage=previous_stage,
+            target_stage=target_stage,
+            decision_reason=decision_reason,
+            guard_reason=str(guard_reason or ""),
+            oi_summary=oi_summary,
+            exchange=exchange,
+            symbol=symbol,
+        )
 
         for index, window_code in enumerate(WINDOWS):
             window_rows.append(
@@ -1343,14 +1635,16 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
         # Re-evaluate only those pairs from history as of this global cycle so
         # the live path matches the replay's age-based early-release decision.
         stage2_pairs = _active_stage2_pairs(state_map)
+        stage2_history_window_map: dict[tuple[str, str], dict] = {}
         if stage2_pairs:
+            stage2_history_window_map = load_latest_window_map(
+                source_cycle,
+                window_source="history",
+                tracked_pairs=stage2_pairs,
+            )
             _merge_window_maps(
                 latest_window_map,
-                load_latest_window_map(
-                    source_cycle,
-                    window_source="history",
-                    tracked_pairs=stage2_pairs,
-                ),
+                stage2_history_window_map,
             )
 
         final_core_rows, final_window_rows, history_rows, state_map = compute_autonomous_oi_snapshot_from_latest_window_map(
@@ -1358,6 +1652,13 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
             cycle_ts=source_cycle,
             previous_state_map=state_map,
         )
+        if stage2_pairs:
+            _record_stage2_history_recheck(
+                checked_pairs=stage2_pairs,
+                history_window_map=stage2_history_window_map,
+                core_rows=final_core_rows,
+                history_rows=history_rows,
+            )
         all_history_rows.extend(history_rows)
         v2_rows = state_map.get("__v2_rows__", {}) if isinstance(state_map, dict) else {}
         final_core_rows_v2 = list(v2_rows.get("core_rows_v2", []))
@@ -1390,6 +1691,7 @@ def run_autonomous_oi_service(
     run_post_stage_analytics: bool = True,
 ) -> int:
     cycle_ts = cycle_ts or datetime.now(timezone.utc)
+    reset_runtime_observability_metrics()
     last_source_cycle_ts = load_autonomous_oi_progress()
     core_rows, window_rows, history_rows, next_state_map, last_source_cycle_ts = compute_autonomous_oi_snapshot_incremental_to_cycle(
         cycle_ts=cycle_ts,

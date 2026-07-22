@@ -56,7 +56,10 @@ from exchange_clients import (
 )
 from aggregation_engine import rebuild_aggregate_windows, rebuild_latest_aggregate_windows
 from autonomous_oi_service import (
+    build_stage_chain_continuity_report,
+    build_window_freshness_by_kind,
     collect_stage1_near_maturity_diagnostics,
+    get_runtime_observability_metrics,
     run_autonomous_oi_service,
     run_post_stage_analytics_tail,
 )
@@ -304,6 +307,13 @@ def _write_canonical_health(runtime_health: dict, cycle_status: dict | None = No
             "signals_already_active": runtime_health.get("signals_already_active", 0),
             "signals_repeat_on_cooldown": runtime_health.get("signals_repeat_on_cooldown", 0),
             "stage1_near_maturity": runtime_health.get("stage1_near_maturity", {}),
+            "price_freshness_guard": runtime_health.get("price_freshness_guard", {}),
+            "stage2_history_recheck": runtime_health.get("stage2_history_recheck", {}),
+            "transition_metrics": runtime_health.get("transition_metrics", {}),
+            "degrade_reasons": runtime_health.get("degrade_reasons", {}),
+            "stage_chain_continuity": runtime_health.get("stage_chain_continuity", {}),
+            "window_freshness_by_kind": runtime_health.get("window_freshness_by_kind", {}),
+            "quarantine_lifecycle": runtime_health.get("quarantine_lifecycle", {}),
             "new_signals": runtime_health.get("new_signals", []),
             "auto_heal_oi_gaps": runtime_health.get("auto_heal_oi_gaps", {}),
             "auto_heal_listing": runtime_health.get("auto_heal_listing", {}),
@@ -1454,6 +1464,84 @@ def _should_run_oi_gap_repair(cycle_no: int, every_cycles: int) -> bool:
     return should_run_maintenance_this_cycle(cycle_no, every_cycles)
 
 
+def _collect_stage_chain_continuity() -> dict:
+    lookback_hours = int(os.getenv("STAGE_CHAIN_DISCONTINUITY_LOOKBACK_HOURS", "24"))
+    recent_minutes = int(os.getenv("STAGE_CHAIN_DISCONTINUITY_RECENT_MINUTES", "30"))
+    try:
+        total_rows = fetch(
+            """
+            WITH h AS (
+                SELECT
+                    exchange,
+                    symbol,
+                    cycle_ts,
+                    from_stage,
+                    to_stage,
+                    LAG(to_stage) OVER (
+                        PARTITION BY exchange, symbol
+                        ORDER BY cycle_ts, id
+                    ) AS prev_to
+                FROM oi_stage_history
+                WHERE cycle_ts >= NOW() - (%s || ' hours')::interval
+            )
+            SELECT COUNT(*) AS total
+            FROM h
+            WHERE prev_to IS NOT NULL
+              AND prev_to <> from_stage
+            """,
+            (str(lookback_hours),),
+        )
+        recent_rows = fetch(
+            """
+            WITH h AS (
+                SELECT
+                    exchange,
+                    symbol,
+                    cycle_ts,
+                    from_stage,
+                    to_stage,
+                    LAG(to_stage) OVER (
+                        PARTITION BY exchange, symbol
+                        ORDER BY cycle_ts, id
+                    ) AS prev_to
+                FROM oi_stage_history
+                WHERE cycle_ts >= NOW() - (%s || ' hours')::interval
+            )
+            SELECT
+                exchange,
+                symbol,
+                to_char(cycle_ts AT TIME ZONE 'Europe/Moscow', 'YYYY-MM-DD HH24:MI') AS cycle_ts_msk,
+                prev_to,
+                from_stage,
+                to_stage
+            FROM h
+            WHERE prev_to IS NOT NULL
+              AND prev_to <> from_stage
+              AND cycle_ts >= NOW() - (%s || ' minutes')::interval
+            ORDER BY cycle_ts DESC, exchange, symbol
+            LIMIT 10
+            """,
+            (str(lookback_hours), str(recent_minutes)),
+        )
+        total_count = int((total_rows[0] or {}).get("total", 0) or 0) if total_rows else 0
+        return build_stage_chain_continuity_report(
+            recent_rows,
+            lookback_hours=lookback_hours,
+            recent_minutes=recent_minutes,
+            total_count=total_count,
+        )
+    except Exception as exc:
+        return {
+            "health": "unknown",
+            "lookback_hours": lookback_hours,
+            "recent_minutes": recent_minutes,
+            "total": 0,
+            "recent_total": 0,
+            "sample": [],
+            "query_error": type(exc).__name__,
+        }
+
+
 def _write_runtime_health_snapshot(
     timings: list[tuple[str, float]],
     bybit_symbols: list[str],
@@ -1531,6 +1619,22 @@ def _write_runtime_health_snapshot(
     if integrity_recoveries_24h:
         runtime_alerts.append(f"core_state_integrity_recovery_24h={integrity_recoveries_24h}")
     stage1_near_maturity = collect_stage1_near_maturity_diagnostics()
+    stage_observability = get_runtime_observability_metrics()
+    stage_chain_continuity = _collect_stage_chain_continuity()
+    if int(stage_chain_continuity.get("recent_total", 0) or 0) > 0:
+        runtime_alerts.append(
+            f"stage_chain_discontinuity={stage_chain_continuity.get('recent_total')}"
+        )
+    window_freshness_by_kind = build_window_freshness_by_kind(
+        universe_health.get("problem_pairs", [])
+    )
+    data_quality_quarantine_rows = _data_quality_quarantine_rows(limit=20)
+    quarantine_lifecycle = {
+        "active_total": int(universe_summary.get("incomplete_pairs", 0) or 0)
+        + int(universe_summary.get("no_windows_pairs", 0) or 0),
+        "data_quality_active_total": len(data_quality_quarantine_rows),
+        "sample": data_quality_quarantine_rows,
+    }
     timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
     runtime_health = {
         "updated_at_utc": iso_мск(),
@@ -1601,6 +1705,13 @@ def _write_runtime_health_snapshot(
         "signals_waiting_confirmation": int(signal_info.get("signals_waiting_confirmation", 0) or 0),
         "signals_repeat_on_cooldown": int(signal_info.get("signals_repeat_on_cooldown", 0) or 0),
         "stage1_near_maturity": stage1_near_maturity,
+        "price_freshness_guard": stage_observability.get("price_freshness_guard", {}),
+        "stage2_history_recheck": stage_observability.get("stage2_history_recheck", {}),
+        "transition_metrics": stage_observability.get("transition_metrics", {}),
+        "degrade_reasons": stage_observability.get("degrade_reasons", {}),
+        "stage_chain_continuity": stage_chain_continuity,
+        "window_freshness_by_kind": window_freshness_by_kind,
+        "quarantine_lifecycle": quarantine_lifecycle,
         "new_signals": list(signal_info.get("new_signals", []) or []),
         "signal_delivery_failed": int(signal_info.get("delivery_failed", 0) or 0),
         "stage3_media_albums_sent": int(signal_info.get("media_albums_sent", 0) or 0),
@@ -1649,6 +1760,12 @@ def _write_runtime_health_snapshot(
         "signals_waiting_confirmation": runtime_health["signals_waiting_confirmation"],
         "signals_repeat_on_cooldown": runtime_health["signals_repeat_on_cooldown"],
         "stage1_near_maturity": runtime_health["stage1_near_maturity"],
+        "price_freshness_guard": runtime_health["price_freshness_guard"],
+        "stage2_history_recheck": runtime_health["stage2_history_recheck"],
+        "transition_metrics": runtime_health["transition_metrics"],
+        "degrade_reasons": runtime_health["degrade_reasons"],
+        "window_freshness_by_kind": runtime_health["window_freshness_by_kind"],
+        "quarantine_lifecycle": runtime_health["quarantine_lifecycle"],
         "new_signals": runtime_health["new_signals"],
         "signal_delivery_failed": runtime_health["signal_delivery_failed"],
         "stage3_media_albums_sent": runtime_health["stage3_media_albums_sent"],
