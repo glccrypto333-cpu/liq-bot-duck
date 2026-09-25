@@ -11,9 +11,11 @@ import subprocess
 import re
 import asyncio
 import socket as _socket
+import sys
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
+from queue import Full, Queue
 import csv
 from pathlib import Path
 import requests
@@ -21,10 +23,21 @@ import requests
 from card_renderers import build_phase_history_lines
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ПАПКА_ДАННЫХ, APP_VERSION
 from logger import log
-from db import fetch, execute
+from db import fetch, execute, sync_stage3_volume_queue, mark_stage3_volume_queue_sent, mark_stage3_volume_queue_blocked
 from phase_common import value_slope_ratio
 from reset_stage3 import reset_stage3
 from time_utils import iso_мск
+from quote_turnover_snapshot import (
+    POINTS_PER_4H,
+    build_current_4h_distribution,
+    evaluate_stage3_volume_candidate,
+    stage3_price_veto_reason,
+)
+
+_UNIVERSE_RUNTIME = Path("/home/alexey/openclaw/runtime")
+if str(_UNIVERSE_RUNTIME) not in sys.path:
+    sys.path.insert(0, str(_UNIVERSE_RUNTIME))
+from asset_universe_guard import decide as _asset_universe_decide
 
 BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 _polling_started = False
@@ -33,6 +46,10 @@ _export_lock = threading.Lock()
 _csv_lock = threading.Lock()
 RUNTIME_REPORTS_DIR = Path(__file__).resolve().parent / "runtime_reports"
 RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
+SIGNAL_CHANNEL_TARGET_FILE = RUNTIME_DIR / "signal_channel_chat_id.txt"
+SIGNAL_CHANNEL_QUEUE_MAXSIZE = 128
+_signal_channel_delivery_queue: Queue[dict] = Queue(maxsize=SIGNAL_CHANNEL_QUEUE_MAXSIZE)
+_signal_channel_worker_started = False
 POLLING_LOCK_PATH = ПАПКА_ДАННЫХ / "telegram_polling.lock"
 _polling_lock_file = None
 BYBIT_SYMBOL_ALIASES = {
@@ -510,35 +527,32 @@ def _pct_change(current, previous):
         return None
 
 
-def _sum_quote_volume(rows: list, start: int, end: int | None = None):
+def _sum_quote_volume(rows: list, start: int, end: int | None = None, *, quote_index: int = 7):
     try:
         sliced = rows[start:end]
         if not sliced:
             return None
-        return sum(float(row[7]) for row in sliced)
+        return sum(float(row[quote_index]) for row in sliced)
     except Exception:
         return None
 
 
-def _fetch_binance_kline_metrics(symbol: str) -> dict:
-    sym = _resolve_binance_symbol(symbol)
-    if not sym:
-        return {
-            "price_pct_1h": None,
-            "price_pct_4h": None,
-            "vol_1h_usd": None,
-            "vol_4h_usd": None,
-            "vol_pct_1h": None,
-            "vol_pct_4h": None,
-        }
-    data = _http_json(
-        f"{BINANCE_FAPI_BASE}/fapi/v1/klines",
-        {"symbol": sym, "interval": "1m", "limit": 480},
-        ttl=20,
-        cache_key=f"binance_klines_1m:{sym}",
-    )
-    rows = data if isinstance(data, list) else []
-    out = {
+def _closed_minute_kline_rows(rows: list, *, now_ms: int | None = None) -> list:
+    """Remove only the still-forming one-minute candle from an ordered kline list."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    closed: list = []
+    for row in rows or ():
+        try:
+            if int(row[0]) + 60_000 <= int(now_ms):
+                closed.append(row)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return closed
+
+
+def _empty_kline_metrics() -> dict:
+    return {
         "price_pct_1h": None,
         "price_pct_4h": None,
         "vol_1h_usd": None,
@@ -546,6 +560,20 @@ def _fetch_binance_kline_metrics(symbol: str) -> dict:
         "vol_pct_1h": None,
         "vol_pct_4h": None,
     }
+
+
+def _fetch_binance_kline_metrics(symbol: str) -> dict:
+    sym = _resolve_binance_symbol(symbol)
+    if not sym:
+        return _empty_kline_metrics()
+    data = _http_json(
+        f"{BINANCE_FAPI_BASE}/fapi/v1/klines",
+        {"symbol": sym, "interval": "1m", "limit": 481},
+        ttl=20,
+        cache_key=f"binance_klines_1m:{sym}",
+    )
+    rows = _closed_minute_kline_rows(data if isinstance(data, list) else [])
+    out = _empty_kline_metrics()
     if len(rows) < 60:
         return out
     try:
@@ -571,6 +599,42 @@ def _fetch_binance_kline_metrics(symbol: str) -> dict:
     return out
 
 
+def _fetch_bybit_kline_metrics(symbol: str) -> dict:
+    """Fallback quote-turnover metrics for a contract absent from Binance."""
+    sym, _ = _resolve_bybit_symbol(symbol)
+    if not sym:
+        return _empty_kline_metrics()
+    data = _http_json(
+        f"{BYBIT_API_BASE}/v5/market/kline",
+        {"category": "linear", "symbol": sym, "interval": "1", "limit": 481},
+        ttl=20,
+        cache_key=f"bybit_klines_1m:{sym}",
+    ) or {}
+    rows = ((data.get("result") or {}).get("list")) if isinstance(data, dict) else []
+    rows = sorted(rows if isinstance(rows, list) else [], key=lambda row: int(row[0]))
+    rows = _closed_minute_kline_rows(rows)
+    out = _empty_kline_metrics()
+    if len(rows) < 60:
+        return out
+    try:
+        close_now = float(rows[-1][4])
+        out["price_pct_1h"] = _pct_change(close_now, float(rows[-60][1]))
+        out["vol_1h_usd"] = _sum_quote_volume(rows, -60, None, quote_index=6)
+    except (TypeError, ValueError, IndexError):
+        pass
+    if len(rows) >= 240:
+        try:
+            out["price_pct_4h"] = _pct_change(close_now, float(rows[-240][1]))
+            out["vol_4h_usd"] = _sum_quote_volume(rows, -240, None, quote_index=6)
+        except (TypeError, ValueError, IndexError):
+            pass
+    if len(rows) >= 120:
+        out["vol_pct_1h"] = _pct_change(out["vol_1h_usd"], _sum_quote_volume(rows, -120, -60, quote_index=6))
+    if len(rows) >= 480:
+        out["vol_pct_4h"] = _pct_change(out["vol_4h_usd"], _sum_quote_volume(rows, -480, -240, quote_index=6))
+    return out
+
+
 def _fetch_binance_24h_metrics(symbol: str) -> dict:
     sym = _resolve_binance_symbol(symbol)
     if not sym:
@@ -584,6 +648,28 @@ def _fetch_binance_24h_metrics(symbol: str) -> dict:
     return {
         "price_pct_24h": _safe_float(data.get("priceChangePercent")),
         "vol_usd_24h": _safe_float(data.get("quoteVolume")),
+    }
+
+
+def _bybit_linear_ticker(symbol: str) -> dict:
+    sym, _ = _resolve_bybit_symbol(symbol)
+    if not sym:
+        return {}
+    data = _http_json(
+        f"{BYBIT_API_BASE}/v5/market/tickers",
+        {"category": "linear", "symbol": sym},
+        ttl=20,
+        cache_key=f"bybit_ticker:{sym}",
+    ) or {}
+    rows = ((data.get("result") or {}).get("list")) if isinstance(data, dict) else []
+    return rows[0] if isinstance(rows, list) and rows else {}
+
+
+def _fetch_bybit_24h_metrics(symbol: str) -> dict:
+    row = _bybit_linear_ticker(symbol)
+    return {
+        "price_pct_24h": _safe_float(row.get("price24hPcnt"), scale=100.0),
+        "vol_usd_24h": _safe_float(row.get("turnover24h")),
     }
 
 
@@ -623,6 +709,38 @@ def _fetch_binance_oi_metrics(symbol: str) -> dict:
     return out
 
 
+def _bybit_open_interest_rows(symbol: str, interval: str) -> list[dict]:
+    sym, _ = _resolve_bybit_symbol(symbol)
+    if not sym:
+        return []
+    data = _http_json(
+        f"{BYBIT_API_BASE}/v5/market/open-interest",
+        {"category": "linear", "symbol": sym, "intervalTime": interval, "limit": 2},
+        ttl=20,
+        cache_key=f"bybit_oi_hist:{sym}:{interval}",
+    ) or {}
+    rows = ((data.get("result") or {}).get("list")) if isinstance(data, dict) else []
+    if not isinstance(rows, list):
+        return []
+    return sorted(rows, key=lambda row: int(row.get("timestamp") or 0))
+
+
+def _fetch_bybit_oi_metrics(symbol: str) -> dict:
+    ticker = _bybit_linear_ticker(symbol)
+    rows_5m = _bybit_open_interest_rows(symbol, "5min")
+    rows_4h = _bybit_open_interest_rows(symbol, "4h")
+    out = {
+        "oi_now_usd": _safe_float(ticker.get("openInterestValue")),
+        "oi_pct_5m": None,
+        "oi_pct_4h": None,
+    }
+    if len(rows_5m) >= 2:
+        out["oi_pct_5m"] = _pct_change(rows_5m[-1].get("openInterest"), rows_5m[-2].get("openInterest"))
+    if len(rows_4h) >= 2:
+        out["oi_pct_4h"] = _pct_change(rows_4h[-1].get("openInterest"), rows_4h[-2].get("openInterest"))
+    return out
+
+
 def _fetch_binance_account_ratio(symbol: str) -> dict:
     sym = _resolve_binance_symbol(symbol)
     if not sym:
@@ -640,6 +758,24 @@ def _fetch_binance_account_ratio(symbol: str) -> dict:
     return {
         "long_pct": _safe_float(row.get("longAccount"), scale=100.0),
         "short_pct": _safe_float(row.get("shortAccount"), scale=100.0),
+    }
+
+
+def _fetch_bybit_account_ratio(symbol: str) -> dict:
+    sym, _ = _resolve_bybit_symbol(symbol)
+    if not sym:
+        return {"long_pct": None, "short_pct": None}
+    data = _http_json(
+        f"{BYBIT_API_BASE}/v5/market/account-ratio",
+        {"category": "linear", "symbol": sym, "period": "5min", "limit": 1},
+        ttl=20,
+        cache_key=f"bybit_account_ratio:{sym}",
+    ) or {}
+    rows = ((data.get("result") or {}).get("list")) if isinstance(data, dict) else []
+    row = rows[0] if isinstance(rows, list) and rows else {}
+    return {
+        "long_pct": _safe_float(row.get("buyRatio"), scale=100.0),
+        "short_pct": _safe_float(row.get("sellRatio"), scale=100.0),
     }
 
 
@@ -715,6 +851,10 @@ def _build_market_metrics_block(metrics: dict) -> list[str]:
     oi = metrics.get("oi") or {}
     accounts = metrics.get("accounts") or {}
     funding = metrics.get("funding") or {}
+    market_source = str(metrics.get("market_source") or "").upper()
+    funding_source = str(metrics.get("funding_source") or "BYBIT").upper()
+    source_label = {"BINANCE": "Binance", "BYBIT": "Bybit"}.get(market_source, "н/д")
+    funding_label = {"BINANCE": "Binance", "BYBIT": "Bybit"}.get(funding_source, "н/д")
 
     rank = metrics.get("rank") or ">250 / н/д"
     long_pct = accounts.get("long_pct")
@@ -722,26 +862,26 @@ def _build_market_metrics_block(metrics: dict) -> list[str]:
     return [
         f"<b>🏷 Капа-рейтинг:</b> {rank}",
         "",
-        "<b>💵 Объём:</b>",
+        f"<b>💵 Объём ({source_label}):</b>",
         f"1ч: {_fmt_usd_or_na(klines.get('vol_1h_usd'))} | "
         f"{_pct_with_marks(klines.get('vol_pct_1h'), (100.0, 1000.0, 10000.0))}",
         f"4ч: {_fmt_usd_or_na(klines.get('vol_4h_usd'))} | "
         f"{_pct_with_marks(klines.get('vol_pct_4h'), (100.0, 1000.0, 10000.0))}",
         "",
-        "<b>📈 Рост цены:</b>",
+        f"<b>📈 Рост цены ({source_label}):</b>",
         f"1ч: {_pct_with_marks(klines.get('price_pct_1h'), (10.0, 25.0, 100.0))}",
         f"4ч: {_pct_with_marks(klines.get('price_pct_4h'), (10.0, 25.0, 100.0))}",
         f"24ч: {_pct_with_marks(ticker24.get('price_pct_24h'), (10.0, 25.0, 100.0))}",
         "",
-        f"<b>📊 Открытый интерес:</b> сейчас: {_fmt_usd_or_na(oi.get('oi_now_usd'))}",
+        f"<b>📊 Открытый интерес ({source_label}):</b> сейчас: {_fmt_usd_or_na(oi.get('oi_now_usd'))}",
         f"5м: {_pct_with_marks(oi.get('oi_pct_5m'), (10.0, 25.0, 100.0))}",
         f"4ч: {_pct_with_marks(oi.get('oi_pct_4h'), (10.0, 25.0, 100.0))}",
         "",
-        "<b>👥 Аккаунты:</b>",
+        f"<b>👥 Аккаунты ({source_label}):</b>",
         f"{_account_sentiment(long_pct, 'long')} лонг: {_fmt_pct_or_na(long_pct)} | "
         f"{_account_sentiment(short_pct, 'short')} шорт: {_fmt_pct_or_na(short_pct)}",
         "",
-        "<b>🩸 Фандинг:</b>",
+        f"<b>🩸 Фандинг ({funding_label}):</b>",
         _pct_with_marks(funding.get('funding_pct'), (0.5, 1.0, 2.0)),
     ]
 
@@ -751,13 +891,25 @@ def _live_market_metrics(symbol: str, exchange: str) -> dict:
     cached = _cache_get(cache_key, ttl=20)
     if cached is not None:
         return cached
+    binance_symbol = _resolve_binance_symbol(symbol)
+    market_source = "BINANCE" if binance_symbol else "BYBIT"
+    if market_source == "BINANCE":
+        kline_fetcher = _fetch_binance_kline_metrics
+        ticker_fetcher = _fetch_binance_24h_metrics
+        oi_fetcher = _fetch_binance_oi_metrics
+        accounts_fetcher = _fetch_binance_account_ratio
+    else:
+        kline_fetcher = _fetch_bybit_kline_metrics
+        ticker_fetcher = _fetch_bybit_24h_metrics
+        oi_fetcher = _fetch_bybit_oi_metrics
+        accounts_fetcher = _fetch_bybit_account_ratio
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {
             "rank": executor.submit(_coingecko_rank, symbol),
-            "klines": executor.submit(_fetch_binance_kline_metrics, symbol),
-            "ticker24": executor.submit(_fetch_binance_24h_metrics, symbol),
-            "oi": executor.submit(_fetch_binance_oi_metrics, symbol),
-            "accounts": executor.submit(_fetch_binance_account_ratio, symbol),
+            "klines": executor.submit(kline_fetcher, symbol),
+            "ticker24": executor.submit(ticker_fetcher, symbol),
+            "oi": executor.submit(oi_fetcher, symbol),
+            "accounts": executor.submit(accounts_fetcher, symbol),
             "funding": executor.submit(_fetch_bybit_funding, symbol, exchange),
         }
         out = {}
@@ -767,8 +919,157 @@ def _live_market_metrics(symbol: str, exchange: str) -> dict:
             except Exception as exc:
                 log(f"telegram live metrics future error: key={key} exc={exc}")
                 out[key] = {} if key != "rank" else ">250 / н/д"
+    out["market_source"] = market_source
+    out["volume_source"] = market_source
     _cache_set(cache_key, out)
     return out
+
+
+def _stage3_volume_gate(metrics: dict) -> tuple[bool, str]:
+    """Hard signal gate: only a known 4h quote-turnover rise of at least 100% passes."""
+    try:
+        growth = (metrics.get("klines") or {}).get("vol_pct_4h")
+        if growth is None:
+            return False, "missing_4h_volume"
+        if float(growth) < 100.0:
+            return False, "below_100pct"
+        return True, "pass"
+    except (AttributeError, TypeError, ValueError):
+        return False, "missing_4h_volume"
+
+
+def _db_quote_turnover_state(symbol: str, stage3_transition_ts=None, queue_exchange=None) -> dict:
+    """Read the canonical persisted source-native volume evidence used by the Stage-3 gate."""
+    binance_symbol = _resolve_binance_symbol(symbol)
+    if binance_symbol:
+        source, source_symbol = "BINANCE", binance_symbol
+    else:
+        source_symbol, _ = _resolve_bybit_symbol(symbol)
+        source = "BYBIT"
+    if not source_symbol:
+        return {"source": source, "symbol": "", "ready": False, "quality_reason": "missing_contract", "growth_4h_pct": None}
+    rows = _safe_rows(f"""
+        SELECT q.ready, q.quality_reason, q.growth_4h_pct,
+               q.previous_1h_quote, q.current_1h_quote, q.growth_1h_pct,
+               q.previous_4h_quote, q.current_4h_quote,
+               q.previous_4h_points, q.current_4h_points, q.freshness_seconds,
+               q.source_cycle_ts, q.latest_ts_close,
+               first_queue.status AS existing_queue_status,
+               first_queue.volume_unlocked_at AS first_volume_unlocked_at,
+               NULLIF(first_queue.volume_snapshot->>'quote_window_latest_close','')::timestamptz
+                   AS first_volume_unlock_cycle_ts,
+               current_window.ts_opens AS current_4h_quote_opens,
+               current_window.quote_points AS current_4h_quote_points
+        FROM quote_turnover_state q
+        LEFT JOIN LATERAL (
+            SELECT
+                ARRAY_AGG(recent.ts_open ORDER BY recent.ts_open) AS ts_opens,
+                ARRAY_AGG(recent.quote_turnover ORDER BY recent.ts_open) AS quote_points
+            FROM (
+                SELECT v.ts_open, v.quote_turnover
+                FROM volume_raw v
+                WHERE v.exchange = q.exchange AND v.symbol = q.symbol
+                  AND v.ts_close <= q.latest_ts_close
+                ORDER BY v.ts_open DESC
+                LIMIT {POINTS_PER_4H}
+            ) recent
+        ) current_window ON TRUE
+        LEFT JOIN stage3_volume_queue first_queue
+          ON first_queue.exchange=%s
+         AND first_queue.symbol=%s
+         AND first_queue.stage3_transition_ts=%s
+        WHERE q.exchange = %s AND q.symbol = %s
+    """, (queue_exchange, symbol, stage3_transition_ts, source, source_symbol))
+    state = dict(rows[0]) if rows else {}
+    state["source"] = source
+    state["symbol"] = source_symbol
+    state.setdefault("ready", False)
+    state.setdefault("quality_reason", "missing_state")
+    state.setdefault("growth_4h_pct", None)
+    distribution = build_current_4h_distribution(
+        state.pop("current_4h_quote_points", None) or [],
+        ts_opens=state.pop("current_4h_quote_opens", None) or [],
+        expected_latest_close=state.get("latest_ts_close"),
+    )
+    state["current_4h_distribution_status"] = "incomplete_or_non_contiguous_raw_window"
+    if distribution is not None:
+        current_total = state.get("current_4h_quote")
+        try:
+            from math import isclose
+            matches_gate_window = current_total is not None and isclose(
+                sum(distribution["hourly_quote_totals"]),
+                float(current_total),
+                rel_tol=1e-9,
+                abs_tol=1e-6,
+            )
+        except (TypeError, ValueError):
+            matches_gate_window = False
+        if matches_gate_window:
+            state["current_4h_distribution"] = distribution
+            state["current_4h_distribution_status"] = "ok"
+        else:
+            state["current_4h_distribution"] = None
+            state["current_4h_distribution_status"] = "window_total_mismatch"
+    else:
+        state["current_4h_distribution"] = None
+    return state
+
+
+def _stage3_volume_observation_snapshot(state: dict) -> dict:
+    source_cycle_ts = state.get("source_cycle_ts")
+    return {
+        "source": state.get("source"),
+        "source_symbol": state.get("symbol"),
+        "source_cycle_ts": source_cycle_ts.isoformat() if hasattr(source_cycle_ts, "isoformat") else source_cycle_ts,
+        "volume_ready": bool(state.get("ready")),
+        "volume_quality_reason": state.get("quality_reason"),
+        "quote_window_latest_close": (
+            state.get("latest_ts_close").isoformat()
+            if hasattr(state.get("latest_ts_close"), "isoformat")
+            else state.get("latest_ts_close")
+        ),
+        "current_4h_distribution_status": state.get("current_4h_distribution_status") or (
+            "ok" if state.get("current_4h_distribution") is not None else "unavailable"
+        ),
+        "previous_1h_quote": state.get("previous_1h_quote"),
+        "current_1h_quote": state.get("current_1h_quote"),
+        "growth_1h_pct": state.get("growth_1h_pct"),
+        "previous_4h_quote": state.get("previous_4h_quote"),
+        "current_4h_quote": state.get("current_4h_quote"),
+        "growth_4h_pct": state.get("growth_4h_pct"),
+        "previous_4h_points": state.get("previous_4h_points"),
+        "current_4h_points": state.get("current_4h_points"),
+        "freshness_seconds": state.get("freshness_seconds"),
+        "current_4h_distribution": state.get("current_4h_distribution"),
+    }
+
+
+def _apply_db_volume_snapshot(metrics: dict, snapshot: dict) -> dict:
+    """Render 1h/4h turnover from the exact DB snapshot used by the signal gate."""
+    out = dict(metrics or {})
+    klines = dict(out.get("klines") or {})
+    klines.update({
+        "vol_1h_usd": snapshot.get("current_1h_quote"),
+        "vol_pct_1h": snapshot.get("growth_1h_pct"),
+        "vol_4h_usd": snapshot.get("current_4h_quote"),
+        "vol_pct_4h": snapshot.get("growth_4h_pct"),
+    })
+    out["klines"] = klines
+    source = str(snapshot.get("source") or "н/д").upper()
+    out["market_source"] = source
+    out["volume_source"] = source
+    return out
+
+
+def _db_quote_turnover_gate(state: dict) -> tuple[bool, str]:
+    if not state.get("ready"):
+        return False, str(state.get("quality_reason") or "missing_state")
+    try:
+        if float(state.get("growth_4h_pct")) < 100.0:
+            return False, "below_100pct"
+    except (TypeError, ValueError):
+        return False, "missing_4h_volume"
+    return True, "pass"
 
 
 def _human_price_window(regime: str | None, direction: str | None) -> str:
@@ -1155,12 +1456,21 @@ def _build_coin_message(core_row: dict, window_rows: list[dict], history_rows: l
             current_stage=current_stage,
             current_age_minutes=core_row.get("stage_age_minutes"),
             humanize_reason=_human_phase_reason,
+            volume_unlocked_at=core_row.get("volume_unlocked_at"),
         )
     )
 
+    bybit_note = _bybit_availability_note(symbol, exchange)
+    if bybit_note:
+        lines.extend(["", bybit_note])
+
     del window_rows, metric_windows, transition_reason
     lines.extend([""])
-    lines.extend(_build_market_metrics_block(_live_market_metrics(symbol, exchange)))
+    market_metrics = _live_market_metrics(symbol, exchange)
+    volume_snapshot = core_row.get("volume_snapshot")
+    if isinstance(volume_snapshot, dict):
+        market_metrics = _apply_db_volume_snapshot(market_metrics, volume_snapshot)
+    lines.extend(_build_market_metrics_block(market_metrics))
 
     lines.extend(["", _symbol_links(symbol, exchange)])
     return "\n".join(lines)
@@ -1485,6 +1795,191 @@ def _send_media_group_result(
     )
 
 
+def _signal_channel_id() -> str | None:
+    """Return the runtime-captured channel target; this is never sourced from .env."""
+    try:
+        value = SIGNAL_CHANNEL_TARGET_FILE.read_text(encoding="utf-8").strip()
+        return value or None
+    except OSError:
+        return None
+
+
+def _capture_signal_channel_id(channel_post: dict | None) -> bool:
+    """Persist the first real channel_post target without exposing its ID in logs."""
+    chat = (channel_post or {}).get("chat") or {}
+    channel_id = str(chat.get("id") or "").strip()
+    if chat.get("type") != "channel" or not channel_id or _signal_channel_id():
+        return False
+    try:
+        RUNTIME_DIR.mkdir(exist_ok=True)
+        temporary = SIGNAL_CHANNEL_TARGET_FILE.with_suffix(".tmp")
+        temporary.write_text(channel_id, encoding="utf-8")
+        os.replace(temporary, SIGNAL_CHANNEL_TARGET_FILE)
+        log("signal channel captured; channel copies enabled")
+        return True
+    except Exception as exc:
+        log(f"signal channel capture failed: {type(exc).__name__}")
+        return False
+
+
+def _enqueue_signal_channel_copy(
+    text: str,
+    paths: list[str],
+    parse_mode: str | None,
+) -> bool:
+    """Best-effort bounded hand-off. It never performs channel I/O in the signal path."""
+    channel_id = _signal_channel_id()
+    if not channel_id:
+        return False
+    try:
+        _signal_channel_delivery_queue.put_nowait(
+            {
+                "chat_id": channel_id,
+                "text": text,
+                "paths": list(paths or ()),
+                "parse_mode": parse_mode,
+            }
+        )
+        return True
+    except Full:
+        log("signal channel queue full; copy dropped")
+        return False
+    except Exception as exc:
+        log(f"signal channel queue hand-off failed: {type(exc).__name__}")
+        return False
+
+
+def _channel_send_text(channel_id: str, text: str, parse_mode: str | None) -> None:
+    payload = {"chat_id": channel_id, "text": _safe_tg_text(text), "disable_web_page_preview": True}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    response = requests.post(f"{BASE}/sendMessage", json=payload, timeout=30)
+    _telegram_result_from_response(response)
+
+
+def _channel_send_photo(channel_id: str, path: str, text: str, parse_mode: str | None) -> None:
+    if len(text) > TG_CAPTION_LIMIT:
+        with open(path, "rb") as fh:
+            response = requests.post(
+                f"{BASE}/sendPhoto",
+                data={"chat_id": channel_id},
+                files={"photo": (Path(path).name or "chart.png", fh, "image/png")},
+                timeout=45,
+            )
+        _telegram_result_from_response(response)
+        _channel_send_text(channel_id, text, parse_mode)
+        return
+    data = {"chat_id": channel_id, "caption": text}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    with open(path, "rb") as fh:
+        response = requests.post(
+            f"{BASE}/sendPhoto",
+            data=data,
+            files={"photo": (Path(path).name or "chart.png", fh, "image/png")},
+            timeout=45,
+        )
+    _telegram_result_from_response(response)
+
+
+def _channel_send_album(channel_id: str, paths: list[str], text: str, parse_mode: str | None) -> None:
+    caption = text if len(text) <= TG_CAPTION_LIMIT else None
+    handles = []
+    try:
+        media = []
+        files = {}
+        for index, path in enumerate(paths):
+            field = f"photo{index}"
+            item = {"type": "photo", "media": f"attach://{field}"}
+            if index == 0 and caption:
+                item["caption"] = caption
+                if parse_mode:
+                    item["parse_mode"] = parse_mode
+            media.append(item)
+            handle = open(path, "rb")
+            handles.append(handle)
+            files[field] = (Path(path).name or f"chart{index}.png", handle, "image/png")
+        response = requests.post(
+            f"{BASE}/sendMediaGroup",
+            data={"chat_id": channel_id, "media": json.dumps(media, ensure_ascii=False)},
+            files=files,
+            timeout=60,
+        )
+        _telegram_result_from_response(response)
+    finally:
+        for handle in handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
+    if caption is None:
+        _channel_send_text(channel_id, text, parse_mode)
+
+
+def _deliver_signal_channel_job(job: dict) -> None:
+    paths = [str(path) for path in (job.get("paths") or ()) if path and os.path.exists(path)]
+    channel_id = str(job.get("chat_id") or "")
+    if not channel_id:
+        raise ValueError("missing channel target")
+    if not paths:
+        _channel_send_text(channel_id, str(job.get("text") or ""), job.get("parse_mode"))
+    elif len(paths) == 1:
+        _channel_send_photo(channel_id, paths[0], str(job.get("text") or ""), job.get("parse_mode"))
+    else:
+        _channel_send_album(channel_id, paths, str(job.get("text") or ""), job.get("parse_mode"))
+
+
+def _process_signal_channel_job(job: dict) -> None:
+    """Deliver once and always release worker-owned chart files."""
+    try:
+        _deliver_signal_channel_job(job)
+    except Exception as exc:
+        log(f"signal channel delivery failed: {type(exc).__name__}")
+    finally:
+        for path in job.get("paths") or ():
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _signal_channel_delivery_worker() -> None:
+    log("signal channel worker started")
+    while True:
+        job = _signal_channel_delivery_queue.get()
+        try:
+            _process_signal_channel_job(job)
+        finally:
+            _signal_channel_delivery_queue.task_done()
+
+
+def _start_signal_channel_worker() -> None:
+    global _signal_channel_worker_started
+    if _signal_channel_worker_started or not TELEGRAM_BOT_TOKEN:
+        return
+    _signal_channel_worker_started = True
+    threading.Thread(target=_signal_channel_delivery_worker, daemon=True).start()
+
+
+def _finish_stage3_primary_delivery(
+    result: TelegramDeliveryResult,
+    *,
+    to_group: bool,
+    text: str,
+    parse_mode: str | None,
+    chart_paths: list[str],
+) -> TelegramDeliveryResult:
+    """Queue only confirmed primary signal deliveries; never let channel failure escape."""
+    if not to_group or not result.ok:
+        return result
+    try:
+        if _enqueue_signal_channel_copy(text, chart_paths, parse_mode):
+            chart_paths.clear()  # worker now owns cleanup of the generated files
+    except Exception as exc:
+        log(f"signal channel copy isolated after primary delivery: {type(exc).__name__}")
+    return result
+
+
 def _empty_chart_result(*, requested: bool = False, failure_reason: str | None = None) -> dict:
     return {
         "requested": requested,
@@ -1591,6 +2086,8 @@ def send_stage3_alert_result(
     text: str,
     reply_markup: dict | None = None,
     parse_mode: str | None = "HTML",
+    *,
+    to_group: bool = False,
 ) -> TelegramDeliveryResult:
     started_at = time.monotonic()
     chart_result = _try_chart_screenshot(row)
@@ -1618,6 +2115,15 @@ def send_stage3_alert_result(
     if chart_capture_seconds >= CHART_CAPTURE_WARN_SECONDS:
         media_alerts.append(f"долгая_съемка:{chart_capture_seconds:.1f}с")
 
+    def finish(result: TelegramDeliveryResult) -> TelegramDeliveryResult:
+        return _finish_stage3_primary_delivery(
+            result,
+            to_group=to_group,
+            text=text,
+            parse_mode=parse_mode,
+            chart_paths=chart_paths,
+        )
+
     try:
         if chart_paths:
             try:
@@ -1631,7 +2137,7 @@ def send_stage3_alert_result(
                             parse_mode=parse_mode,
                         )
                         chart_send_seconds = time.monotonic() - send_started_at
-                        return _with_media_metrics(
+                        return finish(_with_media_metrics(
                             result,
                             delivery_mode="photo",
                             chart_requested=chart_requested,
@@ -1650,11 +2156,11 @@ def send_stage3_alert_result(
                                 chart_send_seconds=chart_send_seconds,
                                 total_delivery_seconds=time.monotonic() - started_at,
                             ),
-                        )
+                        ))
                     result = _send_photo_result(chart_paths[0], caption=None, parse_mode=parse_mode)
                     chart_send_seconds = time.monotonic() - send_started_at
                     send_message_result(text, reply_markup=reply_markup, parse_mode=parse_mode)
-                    return _with_media_metrics(
+                    return finish(_with_media_metrics(
                         result,
                         delivery_mode="photo+text",
                         chart_requested=chart_requested,
@@ -1673,12 +2179,12 @@ def send_stage3_alert_result(
                             chart_send_seconds=chart_send_seconds,
                             total_delivery_seconds=time.monotonic() - started_at,
                         ),
-                    )
+                    ))
 
                 if len(text) <= TG_CAPTION_LIMIT:
                     result = _send_media_group_result(chart_paths, caption=text, parse_mode=parse_mode)
                     chart_send_seconds = time.monotonic() - send_started_at
-                    return _with_media_metrics(
+                    return finish(_with_media_metrics(
                         result,
                         delivery_mode="album",
                         chart_requested=chart_requested,
@@ -1697,11 +2203,11 @@ def send_stage3_alert_result(
                             chart_send_seconds=chart_send_seconds,
                             total_delivery_seconds=time.monotonic() - started_at,
                         ),
-                    )
+                    ))
                 result = _send_media_group_result(chart_paths, caption=None, parse_mode=parse_mode)
                 chart_send_seconds = time.monotonic() - send_started_at
                 send_message_result(text, reply_markup=reply_markup, parse_mode=parse_mode)
-                return _with_media_metrics(
+                return finish(_with_media_metrics(
                     result,
                     delivery_mode="album+text",
                     chart_requested=chart_requested,
@@ -1720,14 +2226,14 @@ def send_stage3_alert_result(
                         chart_send_seconds=chart_send_seconds,
                         total_delivery_seconds=time.monotonic() - started_at,
                     ),
-                )
+                ))
             except Exception as exc:
                 chart_delivery_failure_reason = type(exc).__name__
                 media_alerts.append(f"график_не_доставлен:{chart_delivery_failure_reason}")
                 log(f"stage3 chart delivery failed, fallback to text: {exc}")
 
         text_result = send_message_result(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        return _with_media_metrics(
+        return finish(_with_media_metrics(
             text_result,
             delivery_mode="text",
             chart_requested=chart_requested,
@@ -1746,7 +2252,7 @@ def send_stage3_alert_result(
                 chart_send_seconds=chart_send_seconds,
                 total_delivery_seconds=time.monotonic() - started_at,
             ),
-        )
+        ))
     finally:
         for chart_path in chart_paths:
             try:
@@ -1942,6 +2448,26 @@ def _runtime_snapshot() -> tuple[dict, dict]:
             }
         )
     return runtime, cycle
+
+
+def _stage3_cycle_budget_state() -> dict:
+    _, cycle = _runtime_snapshot()
+    latency_class = str(cycle.get("cycle_latency_class") or "").strip().lower()
+    try:
+        reserve_pct = float(cycle.get("cycle_reserve_pct") or 0.0)
+    except Exception:
+        reserve_pct = 0.0
+    try:
+        thin_reserve_pct = float(os.getenv("STAGE3_ALERTS_THIN_RESERVE_PCT", "25") or "25")
+    except Exception:
+        thin_reserve_pct = 25.0
+    is_thin = latency_class in {"thin_reserve", "tight"} or reserve_pct < thin_reserve_pct
+    return {
+        "cycle_latency_class": latency_class,
+        "cycle_reserve_pct": reserve_pct,
+        "thin_reserve_pct": thin_reserve_pct,
+        "is_thin_reserve": is_thin,
+    }
 
 
 def _build_control_panel_text() -> str:
@@ -2175,6 +2701,17 @@ def _resolve_bybit_symbol(symbol: str) -> tuple[str, str]:
         if _symbol_exists_on_exchange("BYBIT", base):
             return base, "mapped"
     return "", ""
+
+
+def _bybit_availability_note(symbol: str, exchange: str) -> str:
+    if str(exchange or "").upper().strip() == "BYBIT":
+        return ""
+    bybit_symbol, mode = _resolve_bybit_symbol(symbol)
+    if bybit_symbol and mode in {"alias", "mapped"}:
+        return f"⚠️ Bybit аналог: <b>{_esc_html(bybit_symbol)}</b>"
+    if not bybit_symbol:
+        return "⚠️ На Bybit этой монеты нет"
+    return ""
 
 
 def _compact_links(exchange: str, symbol: str, elapsed_text: str = "", cycle_num=None) -> str:
@@ -3198,6 +3735,80 @@ def _read_stage3_alerted_keys(include_legacy: bool = False) -> set[str]:
     return keys
 
 
+def _json_object(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
+
+def _enrich_stage3_decision_snapshot(row: dict) -> dict:
+    """Flatten canonical core_state_v2 summaries for explainable Stage3 history."""
+    enriched = dict(row)
+    oi = _json_object(row.get("oi_summary"))
+    price = _json_object(row.get("price_summary"))
+    volume = _json_object(row.get("volume_summary"))
+    enriched["oi_pattern_code"] = row.get("oi_pattern_code") or oi.get("oi_pattern_code")
+    enriched["oi_pattern_label"] = row.get("oi_pattern_label") or oi.get("oi_pattern_label")
+    enriched["price_state_summary"] = row.get("price_state_summary") or price.get("price_state")
+    enriched["volume_state_summary"] = row.get("volume_state_summary") or volume.get("volume_state")
+    enriched["oi_stage_age_minutes"] = row.get("oi_stage_age_minutes") or row.get("stage_age_minutes")
+    enriched["decision_reason"] = row.get("decision_reason") or row.get("phase_reason")
+    return enriched
+
+
+STAGE3_HISTORY_RETENTION_DAYS = max(1, int(os.getenv("STAGE3_HISTORY_RETENTION_DAYS", "7") or "7"))
+STAGE3_HISTORY_MAX_ROWS = max(100, int(os.getenv("STAGE3_HISTORY_MAX_ROWS", "5000") or "5000"))
+
+
+def _prune_stage3_alert_history() -> None:
+    """Keep explainability history bounded in both Postgres and CSV."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=STAGE3_HISTORY_RETENTION_DAYS)
+    path = _stage3_alert_history_path()
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            kept = []
+            for item in rows:
+                try:
+                    created = datetime.fromisoformat(str(item.get("created_at_utc") or "").replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    kept.append(item)
+                    continue
+                if created >= cutoff:
+                    kept.append(item)
+            kept = kept[-STAGE3_HISTORY_MAX_ROWS:]
+            if len(kept) != len(rows):
+                with path.open("w", encoding="utf-8", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=[
+                        "created_at_utc", "alert_key", "exchange", "symbol", "current_stage",
+                        "oi_pattern_code", "oi_pattern_label", "price_state_summary",
+                        "volume_state_summary", "oi_stage_age_minutes", "latest_cycle_ts",
+                        "decision_reason",
+                    ])
+                    writer.writeheader()
+                    writer.writerows(kept)
+    except Exception as exc:
+        logger.warning("Не удалось ограничить CSV историю stage3: %s", exc)
+    try:
+        execute(
+            "DELETE FROM telegram_stage3_alert_history WHERE created_at < NOW() - (%s * INTERVAL '1 day')",
+            (STAGE3_HISTORY_RETENTION_DAYS,),
+        )
+        execute(
+            "DELETE FROM telegram_stage3_alert_history WHERE id NOT IN (SELECT id FROM telegram_stage3_alert_history ORDER BY created_at DESC, id DESC LIMIT %s)",
+            (STAGE3_HISTORY_MAX_ROWS,),
+        )
+    except Exception as exc:
+        logger.warning("Не удалось ограничить DB историю stage3: %s", exc)
+
+
 def _append_stage3_alert_history(row: dict, alert_key: str) -> None:
     path = _stage3_alert_history_path()
     new_file = not path.exists()
@@ -3276,6 +3887,8 @@ def _append_stage3_alert_history(row: dict, alert_key: str) -> None:
     except Exception as exc:
         logger.warning("Не удалось записать историю stage3 alerts в БД: %s", exc)
 
+
+    _prune_stage3_alert_history()
 
 def _append_stage3_delivery_history(
     row: dict,
@@ -3380,12 +3993,34 @@ def _build_stage3_alert_text(r: dict) -> str:
     )
 def check_stage3_alerts() -> dict:
     alerted = _read_stage3_alerted_keys()
+    try:
+        max_new_per_cycle = max(0, int(os.getenv("STAGE3_ALERTS_MAX_NEW_PER_CYCLE", "2") or "2"))
+    except Exception:
+        max_new_per_cycle = 2
+    try:
+        low_reserve_max_new_per_cycle = max(
+            0,
+            int(os.getenv("STAGE3_ALERTS_LOW_RESERVE_MAX_NEW_PER_CYCLE", "1") or "1"),
+        )
+    except Exception:
+        low_reserve_max_new_per_cycle = 1
+
+    budget_state = _stage3_cycle_budget_state()
+    adaptive_limit_applied = False
+    if budget_state["is_thin_reserve"] and low_reserve_max_new_per_cycle:
+        max_new_per_cycle = min(max_new_per_cycle, low_reserve_max_new_per_cycle) if max_new_per_cycle else low_reserve_max_new_per_cycle
+        adaptive_limit_applied = True
 
     rows = _safe_rows("""
         SELECT
             c.*,
             th.cycle_ts AS stage3_transition_ts,
             th.reason AS stage3_transition_reason,
+            phase_obs.oi_1h AS stage3_oi_1h_class,
+            phase_obs.cycle_ts AS stage3_oi_1h_cycle_ts,
+            price_obs.price_30m_class AS stage3_price_30m_class,
+            price_obs.price_1h_class AS stage3_price_1h_class,
+            price_obs.cycle_ts AS stage3_price_cycle_ts,
             EXTRACT(EPOCH FROM (NOW() - COALESCE(th.cycle_ts, c.latest_cycle_ts))) / 60.0 AS stage3_transition_age_minutes
         FROM core_state_v2 c
         LEFT JOIN LATERAL (
@@ -3397,10 +4032,125 @@ def check_stage3_alerts() -> dict:
             ORDER BY th.cycle_ts DESC, th.created_at DESC
             LIMIT 1
         ) th ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT p.cycle_ts, p.oi_1h
+            FROM phase_decision_observations p
+            WHERE p.exchange=c.exchange
+              AND p.symbol=c.symbol
+              AND p.cycle_ts=c.latest_cycle_ts
+            ORDER BY p.id DESC
+            LIMIT 1
+        ) phase_obs ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT
+                cycle_ts,
+                MAX(price_direction) FILTER (WHERE window_code='30м') AS price_30m_class,
+                MAX(price_direction) FILTER (WHERE window_code='1ч') AS price_1h_class
+            FROM window_state_v2 w
+            WHERE w.exchange=c.exchange
+              AND w.symbol=c.symbol
+              AND w.cycle_ts=c.latest_cycle_ts
+              AND w.window_code IN ('30м','1ч')
+            GROUP BY cycle_ts
+        ) price_obs ON TRUE
         WHERE c.current_stage = 3
-        ORDER BY COALESCE(th.cycle_ts, c.latest_cycle_ts) DESC
-        LIMIT 50
+        ORDER BY COALESCE(th.cycle_ts, c.latest_cycle_ts) ASC
+        LIMIT 2000
     """)
+
+    # One current transition per pair stays queued until the canonical phase exits 3.
+    queue_candidates = []
+    universe_decisions = {}
+    for row in rows:
+        transition_ts = row.get("stage3_transition_ts")
+        exchange = str(row.get("exchange") or "").upper()
+        symbol = str(row.get("symbol") or "").upper()
+        if not transition_ts or not exchange or not symbol:
+            continue
+        universe_decision = _asset_universe_decide(exchange, symbol)
+        universe_decisions[(exchange, symbol)] = universe_decision
+        state = _db_quote_turnover_state(symbol, transition_ts, exchange)
+        allowed_by_volume, _ = _db_quote_turnover_gate(state)
+        decision = evaluate_stage3_volume_candidate(
+            current_stage=3,
+            ready=bool(state.get("ready")),
+            growth_4h_pct=state.get("growth_4h_pct"),
+            observed_at=state.get("source_cycle_ts") if allowed_by_volume else None,
+            previous_status=state.get("existing_queue_status"),
+            volume_unlocked_at=state.get("first_volume_unlocked_at"),
+        )
+        volume_unlock_cycle_ts = state.get("first_volume_unlock_cycle_ts")
+        if (
+            state.get("first_volume_unlocked_at") is None
+            and decision["volume_unlocked_at"] is not None
+        ):
+            # First crossing this cycle: use the exact closed-window anchor. Later
+            # checks must keep using the anchor persisted with the first snapshot.
+            volume_unlock_cycle_ts = state.get("latest_ts_close")
+        source_cycle_ts = state.get("source_cycle_ts")
+        observation_snapshot = _stage3_volume_observation_snapshot(state)
+        oi_1h_class = str(row.get("stage3_oi_1h_class") or "").lower() or None
+        oi_cycle_ts = row.get("stage3_oi_1h_cycle_ts")
+        price_30m_class = str(row.get("stage3_price_30m_class") or "").lower() or None
+        price_1h_class = str(row.get("stage3_price_1h_class") or "").lower() or None
+        price_cycle_ts = row.get("stage3_price_cycle_ts")
+        if observation_snapshot is None:
+            observation_snapshot = {}
+        observation_snapshot["oi_1h_class"] = oi_1h_class
+        observation_snapshot["oi_cycle_ts"] = oi_cycle_ts.isoformat() if oi_cycle_ts else None
+        observation_snapshot["price_30m_class"] = price_30m_class
+        observation_snapshot["price_1h_class"] = price_1h_class
+        observation_snapshot["price_cycle_ts"] = price_cycle_ts.isoformat() if price_cycle_ts else None
+        # OI veto is a Telegram-queue gate only: a fresh phase observation must
+        # post-date this Stage-3 transition and be no later than first volume unlock.
+        oi_decline_before_unlock = (
+            oi_1h_class in {"weak_down", "strong_down"}
+            and oi_cycle_ts is not None
+            and oi_cycle_ts > transition_ts
+            and (
+                decision["volume_unlocked_at"] is None
+                or oi_cycle_ts <= decision["volume_unlocked_at"]
+            )
+        )
+        price_veto_reason = stage3_price_veto_reason(
+            price_30m_class=price_30m_class,
+            price_1h_class=price_1h_class,
+            price_cycle_ts=price_cycle_ts,
+            transition_ts=transition_ts,
+            volume_unlocked_at=decision["volume_unlocked_at"],
+            volume_unlock_cycle_ts=volume_unlock_cycle_ts,
+        )
+        # Freeze the first qualifying evidence for delivery; keep each cycle separately below.
+        volume_snapshot = observation_snapshot if decision["volume_unlocked_at"] is not None else None
+        queue_status = decision["status"] if universe_decision.allowed else "blocked_universe"
+        block_reason = None if universe_decision.allowed else str(universe_decision.reason)
+        if oi_decline_before_unlock:
+            queue_status = "invalidated_oi1h"
+            block_reason = "blocked:oi_1h_decline_before_volume"
+        elif price_veto_reason:
+            queue_status = "invalidated_price"
+            block_reason = price_veto_reason
+        queue_candidates.append({
+            "exchange": exchange,
+            "symbol": symbol,
+            "transition_ts": transition_ts,
+            "observed_at": source_cycle_ts or row.get("latest_cycle_ts") or transition_ts,
+            "source": state.get("source"),
+            "source_symbol": state.get("symbol"),
+            "ready": bool(state.get("ready")),
+            "gate_status": decision["status"],
+            "delivery_block_reason": block_reason,
+            "observation_snapshot": observation_snapshot,
+            "status": queue_status,
+            "volume_unlocked_at": decision["volume_unlocked_at"],
+            "growth_4h_pct": state.get("growth_4h_pct"),
+            "quality_reason": state.get("quality_reason"),
+            "volume_snapshot": volume_snapshot,
+            "oi_1h_class": oi_1h_class,
+            "oi_cycle_ts": oi_cycle_ts,
+        })
+    queue_state = sync_stage3_volume_queue(queue_candidates)
+    queued = queue_state.get("candidates") or {}
 
     sent = 0
     already_active = 0
@@ -3408,36 +4158,80 @@ def check_stage3_alerts() -> dict:
     delivery_failed = 0
     new_signals: list[dict] = []
     media_metrics = _stage3_media_metric_template()
+    limit_reached = False
+    universe_filtered = 0
+    volume_waiting = 0
+    oi_filtered = 0
+    price_filtered = 0
 
-    for r in rows:
-        try:
-            if float(r.get("stage3_transition_age_minutes") or 999999) > 30.0:
-                continue
-        except Exception:
-            continue
-        transition_ts = r.get("stage3_transition_ts")
+    for row in rows:
+        if max_new_per_cycle and sent >= max_new_per_cycle:
+            limit_reached = True
+            break
+        transition_ts = row.get("stage3_transition_ts")
         if not transition_ts:
             log(
                 "stage3 alert skipped: missing canonical 2->3 transition "
-                f"{r.get('exchange')} {r.get('symbol')}"
+                f"{row.get('exchange')} {row.get('symbol')}"
             )
             continue
         observations_total += 1
-        key = "|".join([
-            str(r.get("exchange")),
-            str(r.get("symbol")),
-            str(transition_ts),
-        ])
-
-        if key in alerted:
+        exchange = str(row.get("exchange") or "").upper()
+        symbol = str(row.get("symbol") or "").upper()
+        key = "|".join([exchange, symbol, str(transition_ts)])
+        queue_record = queued.get((exchange, symbol)) or {}
+        queue_status = str(queue_record.get("status") or "")
+        if key in alerted or queue_status == "sent":
             already_active += 1
+            if key in alerted and queue_status != "sent":
+                mark_stage3_volume_queue_sent(exchange, symbol, transition_ts)
             continue
 
+        universe_decision = universe_decisions.get((exchange, symbol))
+        if universe_decision is None:
+            universe_decision = _asset_universe_decide(exchange, symbol)
+        if queue_status == "invalidated_oi1h":
+            oi_filtered += 1
+            log(
+                "stage3 alert candidate invalidated by OI 1h before volume unlock: "
+                f"{key} oi={queue_record.get('oi_1h_class')} "
+                f"cycle={queue_record.get('oi_cycle_ts')}"
+            )
+            continue
+        if queue_status == "invalidated_price":
+            price_filtered += 1
+            snapshot = queue_record.get("volume_snapshot") or {}
+            log(
+                "stage3 alert candidate invalidated by price at first volume unlock: "
+                f"{key} price30m={snapshot.get('price_30m_class')} "
+                f"price1h={snapshot.get('price_1h_class')} "
+                f"cycle={snapshot.get('price_cycle_ts')}"
+            )
+            continue
+        if not universe_decision.allowed:
+            mark_stage3_volume_queue_blocked(exchange, symbol, transition_ts, str(universe_decision.reason))
+            universe_filtered += 1
+            log(f"stage3 alert filtered by asset universe: {key} reason={universe_decision.reason}")
+            continue
+        if queue_status != "unlocked" or not queue_record.get("volume_snapshot"):
+            volume_waiting += 1
+            log(
+                "stage3 alert waiting for DB 4h volume: "
+                f"{key} status={queue_status or 'missing'} "
+                f"growth={queue_record.get('growth_4h_pct')} "
+                f"quality={queue_record.get('quality_reason')}"
+            )
+            continue
+
+        enriched = _enrich_stage3_decision_snapshot(row)
+        enriched["volume_snapshot"] = queue_record.get("volume_snapshot")
+        enriched["volume_unlocked_at"] = queue_record.get("volume_unlocked_at")
         delivery = send_stage3_alert_result(
-            r,
-            _build_stage3_alert_text(r),
+            enriched,
+            _build_stage3_alert_text(enriched),
             _main_keyboard(),
             parse_mode="HTML",
+            to_group=True,
         )
         _accumulate_stage3_media_metrics(media_metrics, delivery)
         if not delivery.ok:
@@ -3445,13 +4239,14 @@ def check_stage3_alerts() -> dict:
             delivery_failed += 1
             continue
 
-        _append_stage3_alert_history(r, key)
-        _append_stage3_delivery_history(r, key, delivery)
+        mark_stage3_volume_queue_sent(exchange, symbol, transition_ts)
+        _append_stage3_alert_history(enriched, key)
+        _append_stage3_delivery_history(enriched, key, delivery)
         sent += 1
         new_signals.append(
             {
-                "exchange": str(r.get("exchange") or ""),
-                "symbol": str(r.get("symbol") or ""),
+                "exchange": exchange,
+                "symbol": symbol,
                 "transition_ts": str(transition_ts),
                 "alert_key": key,
                 "message_id": delivery.message_id,
@@ -3463,9 +4258,7 @@ def check_stage3_alerts() -> dict:
                 "chart_delivery_failure_reason": delivery.chart_delivery_failure_reason,
                 "chart_requested_timeframes": list(delivery.chart_requested_timeframes),
                 "chart_captured_timeframes": list(delivery.chart_captured_timeframes),
-                "chart_timeframe_verification_failures": list(
-                    delivery.chart_timeframe_verification_failures
-                ),
+                "chart_timeframe_verification_failures": list(delivery.chart_timeframe_verification_failures),
                 "chart_capture_seconds": delivery.chart_capture_seconds,
                 "chart_send_seconds": delivery.chart_send_seconds,
                 "total_delivery_seconds": delivery.total_delivery_seconds,
@@ -3473,24 +4266,40 @@ def check_stage3_alerts() -> dict:
             }
         )
 
-    waiting_rows = _safe_rows(
-        """
-        SELECT COUNT(*) AS cnt
-        FROM core_state_v2
+    waiting_rows = _safe_rows("""
+        SELECT COUNT(*) AS cnt FROM core_state_v2
         WHERE current_stage IN (1, 2)
           AND strpos(COALESCE(transition_permission, ''), 'ждем_') = 1
-        """
-    )
+    """)
     waiting_confirmation = int((waiting_rows[0] or {}).get("cnt", 0) or 0) if waiting_rows else 0
-
     return {
         "sent_count": sent,
         "signal_observations_total": observations_total,
         "signals_already_active": already_active,
         "signals_waiting_confirmation": waiting_confirmation,
+        "signals_waiting_volume": volume_waiting,
         "signals_repeat_on_cooldown": 0,
         "delivery_failed": delivery_failed,
+        "signals_filtered_by_universe": universe_filtered,
+        "signals_filtered_by_volume": volume_waiting,
+        "signals_filtered_by_oi_1h": oi_filtered,
+        "signals_filtered_by_price_at_volume_unlock": price_filtered,
+        "stage3_volume_queue": {
+            "waiting": int(queue_state.get("waiting", 0) or 0),
+            "unlocked": int(queue_state.get("unlocked", 0) or 0),
+            "oi_invalidated_72h": int(queue_state.get("oi_invalidated_72h", 0) or 0),
+            "oi_filtered_this_cycle": oi_filtered,
+            "price_invalidated_72h": int(queue_state.get("price_invalidated_72h", 0) or 0),
+            "price_filtered_this_cycle": price_filtered,
+            "sent_this_cycle": sent,
+            "observations_72h": int(queue_state.get("observations_72h", 0) or 0),
+        },
         "new_signals": new_signals,
+        "stage3_alerts_limit_reached": limit_reached,
+        "stage3_alerts_max_new_per_cycle": max_new_per_cycle,
+        "stage3_alerts_adaptive_limit_applied": adaptive_limit_applied,
+        "stage3_alerts_cycle_latency_class": budget_state["cycle_latency_class"],
+        "stage3_alerts_cycle_reserve_pct": budget_state["cycle_reserve_pct"],
         **media_metrics,
     }
 def _archive_index_path() -> Path:
@@ -3768,13 +4577,16 @@ def _loop() -> None:
         try:
             response = requests.get(
                 f"{BASE}/getUpdates",
-                params={"timeout": 30, "offset": _offset + 1},
+                params={"timeout": 30, "offset": _offset + 1, "allowed_updates": ["message", "callback_query", "channel_post"]},
                 timeout=40,
             )
             response.raise_for_status()
 
             for item in response.json().get("result", []):
                 _offset = item["update_id"]
+
+                if _capture_signal_channel_id(item.get("channel_post")):
+                    continue
 
                 message = item.get("message", {}) or {}
                 text = message.get("text", "")
@@ -3918,6 +4730,7 @@ def start_polling() -> None:
 
     _polling_started = True
     try:
+        _start_signal_channel_worker()
         threading.Thread(target=_loop, daemon=True).start()
     except Exception:
         _polling_started = False

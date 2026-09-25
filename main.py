@@ -41,6 +41,9 @@ from db import (
     load_quarantine_symbols,
     load_data_quality_quarantine_symbols,
     sync_data_quality_quarantine,
+    refresh_quote_turnover_state,
+    quote_turnover_state_summary,
+    select_quote_turnover_backfill_targets,
     fetch,
     prune_inactive_state_rows,
 )
@@ -57,6 +60,7 @@ from exchange_clients import (
 from aggregation_engine import rebuild_aggregate_windows, rebuild_latest_aggregate_windows
 from autonomous_oi_service import (
     build_stage_chain_continuity_report,
+    build_quarantine_lifecycle,
     build_window_freshness_by_kind,
     collect_stage1_near_maturity_diagnostics,
     get_runtime_observability_metrics,
@@ -133,7 +137,7 @@ def _write_text_atomic(path: str | Path, payload: str) -> None:
 def _write_json_atomic(path: str | Path, payload: dict) -> None:
     _write_text_atomic(
         path,
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
     )
 
 
@@ -153,11 +157,16 @@ def _canonical_global_block_reason(runtime_health: dict, cycle_status: dict | No
         return "cycle_overrun_hard"
 
     if symbols_total > 0:
-        no_windows = int(summary.get("no_windows_pairs", 0) or 0)
-        stale30 = int(summary.get("stale30_pairs", 0) or 0)
-        incomplete = int(summary.get("incomplete_pairs", 0) or 0)
-        if no_windows >= symbols_total or stale30 >= symbols_total or incomplete >= symbols_total:
-            return "data_pipeline_stalled"
+        canonical_quality_ok = (
+            runtime_health.get("duck_universe_health") == "ok"
+            and runtime_health.get("data_quality_state") == "ok"
+        )
+        if not canonical_quality_ok:
+            no_windows = int(summary.get("no_windows_pairs", 0) or 0)
+            stale30 = int(summary.get("stale30_pairs", 0) or 0)
+            incomplete = int(summary.get("incomplete_pairs", 0) or 0)
+            if no_windows >= symbols_total or stale30 >= symbols_total or incomplete >= symbols_total:
+                return "data_pipeline_stalled"
 
     listing_summary = runtime_health.get("listing_summary") or {}
     if runtime_health.get("duck_listing_health") == "error" and int(listing_summary.get("active_total", 0) or 0) == 0:
@@ -304,10 +313,14 @@ def _write_canonical_health(runtime_health: dict, cycle_status: dict | None = No
             "watchdog_health": runtime_health.get("watchdog_health"),
             "signals_observations": runtime_health.get("signal_observations_total", 0),
             "signals_waiting_confirmation": runtime_health.get("signals_waiting_confirmation", 0),
+            "signals_waiting_volume": runtime_health.get("signals_waiting_volume", 0),
+            "quote_turnover": runtime_health.get("quote_turnover", {}),
+            "stage3_volume_queue": runtime_health.get("stage3_volume_queue", {}),
             "signals_already_active": runtime_health.get("signals_already_active", 0),
             "signals_repeat_on_cooldown": runtime_health.get("signals_repeat_on_cooldown", 0),
             "stage1_near_maturity": runtime_health.get("stage1_near_maturity", {}),
             "price_freshness_guard": runtime_health.get("price_freshness_guard", {}),
+            "stage1_history_recheck": runtime_health.get("stage1_history_recheck", {}),
             "stage2_history_recheck": runtime_health.get("stage2_history_recheck", {}),
             "transition_metrics": runtime_health.get("transition_metrics", {}),
             "degrade_reasons": runtime_health.get("degrade_reasons", {}),
@@ -522,7 +535,6 @@ WITH req(metric, window_code) AS (
     built_at
   FROM aggregate_windows
   WHERE (metric, window_code) IN (SELECT metric, window_code FROM req)
-    AND source_cycle_ts >= %s::timestamptz - interval '35 minutes'
   ORDER BY
     exchange, symbol, metric, window_code,
     source_cycle_ts DESC NULLS LAST,
@@ -763,6 +775,22 @@ def _classify_universe_problem(problem_row: dict, context: dict | None) -> dict:
             "reason_code": "разрыв_сырого_oi",
             "reason_level": "warning",
             "reason_hint": "price_volume_свежие_а_oi_сырье_идет_с_дырой",
+        }
+
+    stale_items = {
+        item.split("=", 1)[0].strip()
+        for item in stale_list.split(",")
+        if item.strip()
+    }
+    if (
+        stale_items
+        and stale_items.issubset({"OI:4ч", "PRICE:4ч"})
+        and not missing_list
+    ):
+        return {
+            "reason_code": "старший_фон_4ч_восстановление",
+            "reason_level": "info",
+            "reason_hint": "короткий_контур_живой_старший_фон_догонит_после_прогрева",
         }
 
     if problem_row.get("missing_cnt", 0):
@@ -1046,7 +1074,7 @@ def _collect_universe_health(source_cycle_ts: datetime | None = None) -> dict:
         if source_cycle_ts is None:
             raise RuntimeError("empty aggregate_windows.source_cycle_ts")
 
-        health_rows = fetch(UNIVERSE_HEALTH_LATEST_ROWS_SQL, (source_cycle_ts, source_cycle_ts))
+        health_rows = fetch(UNIVERSE_HEALTH_LATEST_ROWS_SQL, (source_cycle_ts,))
         detail_rows = [
             row for row in health_rows
             if int(row.get("missing_cnt", 0) or 0) > 0
@@ -1397,6 +1425,25 @@ def _aligned_cycle_sleep_seconds(elapsed: float) -> float:
     return sleep_seconds
 
 
+def _cycle_step_fits_budget(
+    *,
+    elapsed_seconds: float,
+    expected_seconds: float,
+    reserve_seconds: float,
+) -> bool:
+    return elapsed_seconds + expected_seconds + reserve_seconds <= ИНТЕРВАЛ_ЦИКЛА_СЕК
+
+
+def _cleanup_old_fits_budget(elapsed_seconds: float) -> bool:
+    expected_cleanup_seconds = float(os.getenv("CLEANUP_OLD_EXPECTED_SECONDS", "20"))
+    cleanup_reserve_seconds = float(os.getenv("CLEANUP_OLD_RESERVE_SECONDS", "15"))
+    return _cycle_step_fits_budget(
+        elapsed_seconds=elapsed_seconds,
+        expected_seconds=expected_cleanup_seconds,
+        reserve_seconds=cleanup_reserve_seconds,
+    )
+
+
 def _validate_runtime_contract() -> None:
     violations: list[str] = []
 
@@ -1488,6 +1535,7 @@ def _collect_stage_chain_continuity() -> dict:
             FROM h
             WHERE prev_to IS NOT NULL
               AND prev_to <> from_stage
+              AND NOT (prev_to = 1 AND from_stage = 0 AND to_stage = 1)
             """,
             (str(lookback_hours),),
         )
@@ -1517,11 +1565,15 @@ def _collect_stage_chain_continuity() -> dict:
             FROM h
             WHERE prev_to IS NOT NULL
               AND prev_to <> from_stage
-              AND cycle_ts >= NOW() - (%s || ' minutes')::interval
+              AND NOT (prev_to = 1 AND from_stage = 0 AND to_stage = 1)
+              AND cycle_ts >= GREATEST(
+                  NOW() - (%s || ' minutes')::interval,
+                  %s::timestamptz
+              )
             ORDER BY cycle_ts DESC, exchange, symbol
             LIMIT 10
             """,
-            (str(lookback_hours), str(recent_minutes)),
+            (str(lookback_hours), str(recent_minutes), _PROCESS_STARTED_AT_MSK),
         )
         total_count = int((total_rows[0] or {}).get("total", 0) or 0) if total_rows else 0
         return build_stage_chain_continuity_report(
@@ -1616,8 +1668,6 @@ def _write_runtime_health_snapshot(
     except Exception as exc:
         integrity_health = {"total": 0, "latest_at": None, "query_error": type(exc).__name__}
     integrity_recoveries_24h = int(integrity_health.get("total", 0) or 0)
-    if integrity_recoveries_24h:
-        runtime_alerts.append(f"core_state_integrity_recovery_24h={integrity_recoveries_24h}")
     stage1_near_maturity = collect_stage1_near_maturity_diagnostics()
     stage_observability = get_runtime_observability_metrics()
     stage_chain_continuity = _collect_stage_chain_continuity()
@@ -1629,13 +1679,15 @@ def _write_runtime_health_snapshot(
         universe_health.get("problem_pairs", [])
     )
     data_quality_quarantine_rows = _data_quality_quarantine_rows(limit=20)
-    quarantine_lifecycle = {
-        "active_total": int(universe_summary.get("incomplete_pairs", 0) or 0)
-        + int(universe_summary.get("no_windows_pairs", 0) or 0),
-        "data_quality_active_total": len(data_quality_quarantine_rows),
-        "sample": data_quality_quarantine_rows,
-    }
+    quarantine_lifecycle = build_quarantine_lifecycle(
+        universe_health.get("problem_pairs", []),
+        data_quality_quarantine_rows,
+    )
     timing_text = " ".join([f"{name}={round(seconds, 2)}s" for name, seconds in timings])
+    try:
+        quote_turnover_summary = quote_turnover_state_summary()
+    except Exception as exc:
+        quote_turnover_summary = {"total": 0, "ready": 0, "warming": 0, "stale": 0, "error": type(exc).__name__}
     runtime_health = {
         "updated_at_utc": iso_мск(),
         "app_version": APP_VERSION,
@@ -1653,6 +1705,8 @@ def _write_runtime_health_snapshot(
         "collect_reserve_health": collect_reserve_health,
         "runtime_alerts": runtime_alerts,
         "runtime_alert_count": len(runtime_alerts),
+        "quote_turnover": quote_turnover_summary,
+        "stage3_volume_queue": dict((stage3_alert_info or {}).get("stage3_volume_queue") or {}),
         "cycle_health": cycle_health,
         "bybit_symbols": len(bybit_symbols),
         "binance_symbols": len(binance_symbols),
@@ -1703,9 +1757,11 @@ def _write_runtime_health_snapshot(
         "signal_observations_total": int(signal_info.get("signal_observations_total", 0) or 0),
         "signals_already_active": int(signal_info.get("signals_already_active", 0) or 0),
         "signals_waiting_confirmation": int(signal_info.get("signals_waiting_confirmation", 0) or 0),
+        "signals_waiting_volume": int(signal_info.get("signals_waiting_volume", 0) or 0),
         "signals_repeat_on_cooldown": int(signal_info.get("signals_repeat_on_cooldown", 0) or 0),
         "stage1_near_maturity": stage1_near_maturity,
         "price_freshness_guard": stage_observability.get("price_freshness_guard", {}),
+        "stage1_history_recheck": stage_observability.get("stage1_history_recheck", {}),
         "stage2_history_recheck": stage_observability.get("stage2_history_recheck", {}),
         "transition_metrics": stage_observability.get("transition_metrics", {}),
         "degrade_reasons": stage_observability.get("degrade_reasons", {}),
@@ -1758,9 +1814,13 @@ def _write_runtime_health_snapshot(
         "signal_observations_total": runtime_health["signal_observations_total"],
         "signals_already_active": runtime_health["signals_already_active"],
         "signals_waiting_confirmation": runtime_health["signals_waiting_confirmation"],
+        "signals_waiting_volume": runtime_health["signals_waiting_volume"],
+        "quote_turnover": runtime_health["quote_turnover"],
+        "stage3_volume_queue": runtime_health["stage3_volume_queue"],
         "signals_repeat_on_cooldown": runtime_health["signals_repeat_on_cooldown"],
         "stage1_near_maturity": runtime_health["stage1_near_maturity"],
         "price_freshness_guard": runtime_health["price_freshness_guard"],
+        "stage1_history_recheck": runtime_health["stage1_history_recheck"],
         "stage2_history_recheck": runtime_health["stage2_history_recheck"],
         "transition_metrics": runtime_health["transition_metrics"],
         "degrade_reasons": runtime_health["degrade_reasons"],
@@ -1903,7 +1963,7 @@ def _timed_step(timings: list[tuple[str, float]], name: str, fn):
 
 
 
-def _collect_binance_symbol(symbol: str):
+def _collect_binance_symbol(symbol: str, *, kline_limit: int = 24):
     oi_rows = []
     price_rows = []
     volume_rows = []
@@ -1915,7 +1975,7 @@ def _collect_binance_symbol(symbol: str):
         failures.append(("BINANCE", symbol, "OI", exc))
 
     try:
-        p, v = fetch_binance_kline_5m(symbol, 24)
+        p, v = fetch_binance_kline_5m(symbol, kline_limit)
         price_rows.extend(p)
         volume_rows.extend(v)
     except Exception as exc:
@@ -1924,12 +1984,16 @@ def _collect_binance_symbol(symbol: str):
     return oi_rows, price_rows, volume_rows, failures
 
 
-def collect(symbols_bybit, symbols_binance):
+def collect(symbols_bybit, symbols_binance, quote_turnover_backfill_targets=None):
     collect_started = time.time()
     reset_request_stats()
     oi_rows, price_rows, volume_rows = [], [], []
     failures = []
     now = datetime.now(timezone.utc)
+    quote_turnover_backfill_targets = set(quote_turnover_backfill_targets or set())
+
+    def kline_limit_for(exchange: str, symbol: str) -> int:
+        return 120 if (exchange, symbol) in quote_turnover_backfill_targets else 24
 
     def record_failure(exchange: str, symbol: str, data_type: str, exc: Exception) -> None:
         failures.append((now, exchange, symbol, data_type, type(exc).__name__, str(exc)[:500]))
@@ -1944,7 +2008,7 @@ def collect(symbols_bybit, symbols_binance):
             record_failure("BYBIT", s, "OI", exc)
 
         try:
-            p, v = fetch_bybit_kline_5m(s, 24)
+            p, v = fetch_bybit_kline_5m(s, kline_limit_for("BYBIT", s))
             local_price.extend(p)
             local_volume.extend(v)
         except Exception as exc:
@@ -1980,7 +2044,11 @@ def collect(symbols_bybit, symbols_binance):
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(_collect_binance_symbol, symbol)
+            executor.submit(
+                _collect_binance_symbol,
+                symbol,
+                kline_limit=kline_limit_for("BINANCE", symbol),
+            )
             for symbol in binance_collect_symbols
         ]
 
@@ -2137,6 +2205,7 @@ def collect(symbols_bybit, symbols_binance):
         "collect_seconds": collect_seconds,
         "collect_health": collect_health,
         "failure_health": failure_health,
+        "quote_turnover_backfill_targets": len(quote_turnover_backfill_targets),
     }
 
 
@@ -2170,7 +2239,7 @@ def insert_collected_raw(batch: dict) -> int:
 
 def validate_aggregate_windows() -> dict:
     required_windows = ["15м", "30м", "1ч", "4ч", "12ч", "24ч"]
-    blocking_windows = {"15м", "30м", "1ч", "4ч", "12ч"}
+    blocking_windows = {"15м", "30м", "1ч", "4ч"}
     window_minutes = {
         "15м": 15,
         "30м": 30,
@@ -2389,8 +2458,18 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
             timings.append((name, elapsed))
             streak = _timed_watchdog_step._timeout_streaks.get(name, 0) + 1
             _timed_watchdog_step._timeout_streaks[name] = streak
-            stdout_tail = (exc.stdout or "").strip().splitlines()[-20:]
-            stderr_tail = (exc.stderr or "").strip().splitlines()[-20:]
+            stdout_text = (
+                exc.stdout.decode("utf-8", errors="replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            )
+            stderr_text = (
+                exc.stderr.decode("utf-8", errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
+            stdout_tail = stdout_text.strip().splitlines()[-20:]
+            stderr_tail = stderr_text.strip().splitlines()[-20:]
             if stdout_tail:
                 log(
                     f"WATCHDOG_TIMEOUT_STDOUT step={name} "
@@ -2531,13 +2610,27 @@ def background():
             universe_state = _runtime_universe_state()
             bybit_symbols = universe_state["bybit_symbols"]
             binance_symbols = universe_state["binance_symbols"]
-            collect_batch = _timed_step(timings, "collect", lambda: collect(bybit_symbols, binance_symbols))
+            try:
+                quote_backfill_limit = max(0, int(os.getenv("QUOTE_TURNOVER_BACKFILL_PAIRS_PER_CYCLE", "48") or "48"))
+            except (TypeError, ValueError):
+                quote_backfill_limit = 48
+            quote_backfill_targets = _timed_step(
+                timings,
+                "quote_turnover_backfill_select",
+                lambda: select_quote_turnover_backfill_targets(quote_backfill_limit),
+            )
+            collect_batch = _timed_step(
+                timings,
+                "collect",
+                lambda: collect(bybit_symbols, binance_symbols, quote_backfill_targets),
+            )
             collect_batch = _timed_step(timings, "raw_validate", lambda: validate_collected_raw(collect_batch, bybit_symbols, binance_symbols))
             _timed_step(timings, "insert_raw", lambda: insert_collected_raw(collect_batch))
             source_cycle_ts = collect_batch.get("cycle_ts")
             if source_cycle_ts is None:
                 raise CycleStop("missing_collect_cycle_ts", "lower contour stopped: collect batch missing cycle_ts")
             _timed_step(timings, "aggregates_hot", lambda: rebuild_latest_aggregate_windows(source_cycle_ts))
+            _timed_step(timings, "quote_turnover_state", lambda: refresh_quote_turnover_state(source_cycle_ts))
             _timed_step(
                 timings,
                 "data_quality_quarantine",
@@ -2597,7 +2690,23 @@ def background():
                 log(f"aggregates_full skipped: cycle={cycle_no} every={aggregate_full_rebuild_every_cycles}")
 
             if cycle_no % aggregate_validate_every_cycles == 0:
-                _timed_step(timings, "aggregates_validate", validate_aggregate_windows)
+                expected_validate_seconds = float(os.getenv("AGGREGATES_VALIDATE_EXPECTED_SECONDS", "12"))
+                validate_reserve_seconds = float(os.getenv("AGGREGATES_VALIDATE_RESERVE_SECONDS", "10"))
+                elapsed_before_validate = time.time() - cycle_started
+                if not _cycle_step_fits_budget(
+                    elapsed_seconds=elapsed_before_validate,
+                    expected_seconds=expected_validate_seconds,
+                    reserve_seconds=validate_reserve_seconds,
+                ):
+                    log(
+                        "aggregates_validate skipped: "
+                        f"cycle budget elapsed={elapsed_before_validate:.2f}s "
+                        f"expected={expected_validate_seconds:.2f}s "
+                        f"reserve={validate_reserve_seconds:.2f}s "
+                        f"interval={ИНТЕРВАЛ_ЦИКЛА_СЕК}s"
+                    )
+                else:
+                    _timed_step(timings, "aggregates_validate", validate_aggregate_windows)
             else:
                 log(f"aggregates_validate skipped: cycle={cycle_no} every={aggregate_validate_every_cycles}")
             audit_count = -1
@@ -2697,10 +2806,10 @@ def background():
 
         try:
             if should_run_maintenance_this_cycle(cycle_no, cleanup_old_every_cycles):
-                expected_cleanup_seconds = float(os.getenv("CLEANUP_OLD_EXPECTED_SECONDS", "20"))
-                cleanup_reserve_seconds = float(os.getenv("CLEANUP_OLD_RESERVE_SECONDS", "10"))
                 elapsed_before_cleanup = time.time() - cycle_started
-                if elapsed_before_cleanup + expected_cleanup_seconds + cleanup_reserve_seconds > ИНТЕРВАЛ_ЦИКЛА_СЕК:
+                expected_cleanup_seconds = float(os.getenv("CLEANUP_OLD_EXPECTED_SECONDS", "20"))
+                cleanup_reserve_seconds = float(os.getenv("CLEANUP_OLD_RESERVE_SECONDS", "15"))
+                if not _cleanup_old_fits_budget(elapsed_before_cleanup):
                     log(
                         "cleanup_old skipped: "
                         f"cycle budget elapsed={elapsed_before_cleanup:.2f}s "

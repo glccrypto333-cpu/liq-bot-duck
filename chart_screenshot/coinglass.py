@@ -21,6 +21,7 @@ from .config import (
     CHART_VIEWPORT_WIDTH,
     CHART_VIEWPORT_HEIGHT,
     HEADLESS,
+    PLAYWRIGHT_BROWSERS_PATH,
     COINGLASS_EMAIL,
     COINGLASS_PASSWORD,
     COINGLASS_STORAGE_STATE_PATH,
@@ -72,6 +73,12 @@ class ChartCaptureResult:
 
 def _log(msg: str) -> None:
     print(f"[CoinGlass] {msg}", flush=True)
+
+
+def is_coinglass_application_error(body_text: str | None) -> bool:
+    """Detect CoinGlass' permanent client-side error page (HTTP 200, no chart DOM)."""
+    text = str(body_text or "").lower()
+    return "application error" in text and "client-side exception" in text
 
 
 async def _dismiss_consent(page) -> None:
@@ -201,16 +208,22 @@ async def _apply_timeframe(page, timeframe: str) -> bool:
                 _log(f"Таймфрейм {tf_label} применён (бар)")
                 return True
 
-        # 2) Через дропдаун (стрелка справа от 1D, ~left 470-545, top<38, узкая IconButton)
+        # 2) Через дропдаун справа от 1D. Не используем абсолютные координаты:
+        # при разных состояниях CoinGlass панель сдвигается, но стрелка остаётся
+        # соседней кнопкой 1D и содержит SVG viewBox=0 0 16 8.
         opened = await page.evaluate(
             """() => {
-                for (const e of document.querySelectorAll('button')) {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const day = buttons.find(e => (e.innerText || '').trim() === '1D' && e.getBoundingClientRect().width > 0);
+                const dayRect = day ? day.getBoundingClientRect() : null;
+                const trigger = buttons.find(e => {
                     const r = e.getBoundingClientRect();
-                    if (r.top < 38 && r.left >= 470 && r.left <= 545 && r.width > 0 && r.width < 40 && r.height > 0) {
-                        e.click();
-                        return true;
-                    }
-                }
+                    const svg = e.querySelector('svg');
+                    const box = svg && svg.getAttribute('viewBox');
+                    return box === '0 0 16 8' && r.width > 0 && r.height > 0 &&
+                        (!dayRect || Math.abs(r.left - dayRect.right) <= 24);
+                });
+                if (trigger) { trigger.click(); return true; }
                 return false;
             }"""
         )
@@ -235,16 +248,9 @@ async def _pick_dropdown_timeframe(page, tf_label: str) -> bool:
     for attempt in range(DROPDOWN_ITEM_LOOKUP_ATTEMPTS):
         picked = await page.evaluate(
             """(label) => {
-                    let best = null, area = 1e9;
-                    for (const e of document.querySelectorAll('li,div,button,span,a')) {
-                        const t = (e.innerText || '').trim();
-                        const r = e.getBoundingClientRect();
-                        if (t === label && r.width > 0 && r.height > 0 && r.top > 20) {
-                            const a = r.width * r.height;
-                            if (a < area) { area = a; best = e; }
-                        }
-                    }
-                    if (best) { best.click(); return true; }
+                    const item = Array.from(document.querySelectorAll('li[role="menuitem"]'))
+                        .find(e => (e.innerText || '').trim() === label && e.getBoundingClientRect().width > 0);
+                    if (item) { item.click(); return true; }
                     return false;
                 }""",
             tf_label,
@@ -306,8 +312,15 @@ def dropdown_timeframe_has_reliable_evidence(timeframe: str, evidence: str | Non
     return bool(expected and evidence and str(evidence).strip().lower() == expected.lower())
 
 
-async def _wait_chart_loaded(page) -> None:
+async def _wait_chart_loaded(page) -> str:
     """Ждёт загрузки графика (iframe + canvas + исчезновение спиннера)."""
+    try:
+        body_text = await page.locator("body").inner_text(timeout=1500)
+        if is_coinglass_application_error(body_text):
+            _log("CoinGlass вернул client-side Application error — страница без графика")
+            return "application_error"
+    except Exception:
+        pass
     try:
         await page.wait_for_selector("iframe", timeout=CHART_LOAD_TIMEOUT_MS)
         await asyncio.sleep(1)
@@ -322,6 +335,7 @@ async def _wait_chart_loaded(page) -> None:
             pass
     except Exception:
         _log("Элемент графика не найден за таймаут")
+    return "ok"
 
 
 _LOCAL_CAPTURE_SEMAPHORE = asyncio.Semaphore(2)
@@ -374,7 +388,19 @@ async def _capture_session_unlocked(symbol: str, exchange, timeframes) -> ChartC
             from playwright.async_api import async_playwright
 
             pw = await async_playwright().start()
-            browser = await pw.chromium.launch(headless=HEADLESS)
+            launch_kwargs = {"headless": HEADLESS}
+            for candidate in (
+                Path(PLAYWRIGHT_BROWSERS_PATH).glob(
+                    "chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell"
+                )
+            ):
+                launch_kwargs["executable_path"] = str(candidate)
+                break
+            else:
+                for candidate in Path(PLAYWRIGHT_BROWSERS_PATH).glob("chromium-*/chrome-linux64/chrome"):
+                    launch_kwargs["executable_path"] = str(candidate)
+                    break
+            browser = await pw.chromium.launch(**launch_kwargs)
 
             context_kwargs = {
                 "viewport": {"width": CHART_VIEWPORT_WIDTH, "height": CHART_VIEWPORT_HEIGHT},
@@ -415,7 +441,17 @@ async def _capture_session_unlocked(symbol: str, exchange, timeframes) -> ChartC
             # Переходим на график и ждём загрузки
             await page.goto(chart_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
-            await _wait_chart_loaded(page)
+            chart_load_status = await _wait_chart_loaded(page)
+            if chart_load_status == "application_error":
+                await browser.close()
+                await pw.stop()
+                return ChartCaptureResult(
+                    photo_paths=[],
+                    requested_timeframes=tuple(tfs),
+                    captured_timeframes=(),
+                    capture_seconds_total=round(time.monotonic() - session_started_at, 3),
+                    failure_reason="page_application_error",
+                )
             await asyncio.sleep(4)  # первичный рендер индикаторов
 
             # Съёмка каждого ТФ в этой же сессии

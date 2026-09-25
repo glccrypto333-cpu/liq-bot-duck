@@ -70,7 +70,7 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
 
     _validate_raw_rows("oi", oi_rows, 8)
     _validate_raw_rows("price", price_rows, 8)
-    _validate_raw_rows("volume", volume_rows, 5)
+    _validate_raw_rows("volume", volume_rows, 6)
 
     expected = {("BYBIT", s) for s in symbols_bybit} | {("BINANCE", s) for s in symbols_binance}
 
@@ -85,14 +85,20 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
     tolerated_price_volume_missing = int(os.getenv("RAW_VALIDATE_TOLERATED_PRICE_VOLUME_MISSING", "0"))
     tolerated_price_volume_missing_pct = float(os.getenv("RAW_VALIDATE_TOLERATED_PRICE_VOLUME_MISSING_PCT", "0"))
     tolerated_oi_missing = int(os.getenv("RAW_VALIDATE_TOLERATED_OI_MISSING", "2"))
+    tolerated_oi_missing_pct = float(os.getenv("RAW_VALIDATE_TOLERATED_OI_MISSING_PCT", "0.01"))
     tolerated_price_volume_missing_dynamic = math.ceil(len(expected) * tolerated_price_volume_missing_pct)
+    tolerated_oi_missing_dynamic = math.ceil(len(expected) * tolerated_oi_missing_pct)
     tolerated_price_volume_missing_limit = max(
         tolerated_price_volume_missing,
         tolerated_price_volume_missing_dynamic,
     )
+    tolerated_oi_missing_limit = max(tolerated_oi_missing, tolerated_oi_missing_dynamic)
 
     if missing_oi or missing_price or missing_volume:
-        tolerated_oi_partial = len(missing_oi) <= tolerated_oi_missing
+        # A handful of locally unavailable/new listings must be quarantined
+        # downstream, not stop collection and decisions for the whole market.
+        # Request failures and broad OI loss still fail closed below.
+        tolerated_oi_partial = len(missing_oi) <= tolerated_oi_missing_limit
         tolerated_price_volume_partial = (
             not missing_price
             and not missing_volume
@@ -110,7 +116,9 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
                 f"missing_volume={len(missing_volume)} "
                 f"{_format_missing_details(missing_oi, label='missing_oi')} "
                 f"{_format_missing_details(missing_price, label='missing_price')} "
-                f"oi_tolerance={tolerated_oi_missing} "
+                f"oi_tolerance_abs={tolerated_oi_missing} "
+                f"oi_tolerance_pct={tolerated_oi_missing_pct:.4f} "
+                f"oi_tolerance_limit={tolerated_oi_missing_limit} "
                 f"price_volume_tolerance_abs={tolerated_price_volume_missing} "
                 f"price_volume_tolerance_pct={tolerated_price_volume_missing_pct:.4f} "
                 f"price_volume_tolerance_limit={tolerated_price_volume_missing_limit}"
@@ -123,7 +131,9 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
                 f"missing_volume={len(missing_volume)} "
                 f"{_format_missing_details(missing_oi, label='missing_oi')} "
                 f"{_format_missing_details(missing_price if missing_price == missing_volume else missing_price | missing_volume)} "
-                f"oi_tolerance={tolerated_oi_missing} "
+                f"oi_tolerance_abs={tolerated_oi_missing} "
+                f"oi_tolerance_pct={tolerated_oi_missing_pct:.4f} "
+                f"oi_tolerance_limit={tolerated_oi_missing_limit} "
                 f"price_volume_tolerance_limit={tolerated_price_volume_missing_limit}"
             )
 

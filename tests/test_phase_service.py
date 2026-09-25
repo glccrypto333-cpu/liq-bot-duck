@@ -101,7 +101,7 @@ def test_2_to_3_is_blocked_by_4h_oi_weak_down() -> None:
     stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 30.0, 60.0)
     assert target_stage == 2
     assert stage == 2
-    assert reason == "удержание_2:30м_или_1ч_еще_не_созрели"
+    assert reason == "удержание_2:oi_4h_decline:weak_down"
 
 
 def test_2_to_3_requires_mature_30m_and_mature_1h() -> None:
@@ -136,7 +136,17 @@ def test_15m_strong_down_does_not_drop_stage_2_but_blocks_fresh_stage_3() -> Non
     assert reason == "удержание_2:15м_локально_слабое"
 
 
-def test_30m_decline_drops_stage_2_to_1() -> None:
+def test_30m_strong_down_drops_stage_2_to_1() -> None:
+    previous_state = {"current_stage": 2}
+    summary = make_oi_summary(oi_30m="strong_down", oi_1h="good_up", oi_4h="good_up")
+    target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+    stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 12.0, 40.0)
+    assert target_stage == 1
+    assert stage == 1
+    assert reason == "снижение_2_1:oi_30м=strong_down"
+
+
+def test_30m_weak_down_drops_stage_2_to_1_per_canonical_matrix() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_30m="weak_down", oi_1h="good_up", oi_4h="good_up")
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
@@ -146,7 +156,7 @@ def test_30m_decline_drops_stage_2_to_1() -> None:
     assert reason == "снижение_2_1:oi_30м=weak_down"
 
 
-def test_1h_decline_drops_stage_2_to_1() -> None:
+def test_1h_decline_drops_stage_2_to_1_per_canonical_matrix() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_30m="good_up", oi_1h="weak_down", oi_4h="good_up")
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
@@ -156,14 +166,102 @@ def test_1h_decline_drops_stage_2_to_1() -> None:
     assert reason == "снижение_2_1:oi_1ч=weak_down"
 
 
-def test_stage_2_drops_to_1_when_live_build_is_gone_even_without_explicit_decline() -> None:
+def test_strong_1h_decline_also_drops_stage_2_to_1() -> None:
+    previous_state = {"current_stage": 2}
+    summary = make_oi_summary(oi_30m="good_up", oi_1h="strong_down", oi_4h="good_up")
+    target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+    stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 12.0, 40.0)
+    assert target_stage == 1
+    assert stage == 1
+    assert reason == "снижение_2_1:oi_1ч=strong_down"
+
+
+def test_target_stage_below_2_drops_stage_2_to_1_per_canonical_matrix() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_15m="flat", oi_30m="flat", oi_1h="good_up", oi_4h="good_up")
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
     stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 480.0, 480.0)
     assert target_stage == 1
     assert stage == 1
-    assert reason == "снижение_2_1:живой_набор_умер"
+    assert reason == "снижение_2_1:target_stage<=1"
+
+
+def test_4h_hard_decline_drops_stage_2_to_1_per_canonical_matrix() -> None:
+    previous_state = {"current_stage": 2}
+    summary = make_oi_summary(oi_30m="good_up", oi_4h="strong_down")
+    target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+    stage, _ = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 45.0, 60.0)
+    assert target_stage == 0
+    assert stage == 1
+
+
+def test_4h_weak_down_does_not_downgrade_stage_2() -> None:
+    previous_state = {"current_stage": 2}
+    summary = make_oi_summary(oi_30m="good_up", oi_1h="strong_up", oi_4h="weak_down")
+    target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+    stage, _ = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 20.0, 40.0)
+    assert target_stage == 2
+    assert stage == 2
+
+
+def test_local_price_1h_or_30m_block_does_not_downgrade_stage_2() -> None:
+    previous_state = {"current_stage": 2}
+    summary = make_oi_summary(oi_15m="good_up", oi_30m="good_up", oi_1h="good_up", oi_4h="good_up")
+    for price_state in ("цена_1ч_вниз", "цена_30м_вниз"):
+        price_summary = (price_state, "локальный_блок_новой_3", False, 2)
+        target_stage, _ = determine_target_stage(summary, price_summary, VOLUME_DUMMY)
+        stage, _ = apply_stage_guardrails(previous_state, target_stage, summary, price_summary, VOLUME_DUMMY, 45.0, 60.0)
+        assert target_stage == 2
+        assert stage == 2
+
+
+def test_stage2_hard_price_block_downgrades_to_stage1_per_canonical_matrix() -> None:
+    previous_state = {"current_stage": 2}
+    summary = make_oi_summary(oi_15m="good_up", oi_30m="good_up", oi_1h="good_up", oi_4h="good_up")
+    stage, reason = apply_stage_guardrails(previous_state, 0, summary, PRICE_BLOCK, VOLUME_DUMMY, 45.0, 60.0)
+    permission = compute_transition_permission(previous_state, 0, 45.0, summary, PRICE_BLOCK, 60.0)
+    assert stage == 1
+    assert reason == "снижение_2_1:цена_4ч=цена_4ч_сильно_вниз"
+    assert permission == "снижение_2_1_по_цене_4ч"
+
+
+def test_transition_permission_matches_canonical_stage2_downgrade_matrix() -> None:
+    previous_state = {"current_stage": 2}
+    assert compute_transition_permission(
+        previous_state, 1, 45.0,
+        make_oi_summary(oi_30m="weak_down", oi_1h="good_up", oi_4h="good_up"), PRICE_OK, 60.0
+    ) == "снижение_2_1_по_oi_30м"
+    assert compute_transition_permission(
+        previous_state, 1, 45.0,
+        make_oi_summary(oi_30m="good_up", oi_1h="weak_down", oi_4h="good_up"), PRICE_OK, 60.0
+    ) == "снижение_2_1_по_oi_1ч"
+    assert compute_transition_permission(
+        previous_state, 1, 45.0,
+        make_oi_summary(oi_30m="good_up", oi_1h="strong_down", oi_4h="good_up"), PRICE_OK, 60.0
+    ) == "снижение_2_1_по_oi_1ч"
+    assert compute_transition_permission(
+        previous_state, 1, 45.0,
+        make_oi_summary(oi_30m="flat", oi_1h="good_up", oi_4h="good_up"), PRICE_OK, 60.0
+    ) == "снижение_2_1_по_target_stage"
+    assert compute_transition_permission(
+        previous_state, 0, 45.0,
+        make_oi_summary(oi_30m="strong_down", oi_1h="good_up", oi_4h="good_up"), PRICE_OK, 60.0
+    ) == "снижение_2_1_по_oi_30м"
+    assert compute_transition_permission(
+        previous_state, 0, 45.0,
+        make_oi_summary(oi_30m="good_up", oi_1h="good_up", oi_4h="strong_down"), PRICE_OK, 60.0
+    ) == "снижение_2_1_по_oi_4ч"
+
+
+def test_2_to_1_guardrail_downgrade_is_reported_consistently() -> None:
+    previous_state = {"current_stage": 2}
+    summary = make_oi_summary(oi_15m="flat", oi_30m="flat", oi_1h="good_up", oi_4h="good_up")
+    target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+    stage, guard_reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 480.0, 480.0)
+    permission = compute_transition_permission(previous_state, target_stage, 480.0, summary, PRICE_OK, 480.0)
+    assert stage == 1
+    assert guard_reason == "снижение_2_1:target_stage<=1"
+    assert permission == "снижение_2_1_по_target_stage"
 
 
 def test_4h_strong_down_resets_stage_1_to_0() -> None:

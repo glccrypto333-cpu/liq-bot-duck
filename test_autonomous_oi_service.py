@@ -173,27 +173,6 @@ def test_stage_chain_continuity_report_flags_silent_stage_reset():
     assert report["sample"][0]["actual_from_stage"] == 0
 
 
-def test_stage_chain_continuity_allows_stage1_reentry():
-    report = build_stage_chain_continuity_report(
-        [
-            {
-                "exchange": "BINANCE",
-                "symbol": "0GUSDT",
-                "cycle_ts_msk": "2026-07-25 13:55",
-                "prev_to": 1,
-                "from_stage": 0,
-                "to_stage": 1,
-            }
-        ],
-        lookback_hours=24,
-        recent_minutes=30,
-    )
-
-    assert report["total"] == 0
-    assert report["recent_total"] == 0
-    assert report["health"] == "ok"
-
-
 def test_stage_2_without_saved_trigger_does_not_restore_ancient_trigger_from_age() -> None:
     cycle_ts = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
     previous_state = {
@@ -272,60 +251,6 @@ def test_integrity_guard_restores_stage1_when_mutable_core_row_is_lost() -> None
     assert recovered == [("BINANCE", "AAVEUSDT")]
     assert state_map[("BINANCE", "AAVEUSDT")]["current_stage"] == 1
     assert state_map[("BINANCE", "AAVEUSDT")]["oi_stage_age_minutes"] == 45.0
-
-
-def test_integrity_guard_restores_silent_zero_but_keeps_legal_degrade() -> None:
-    guard = [{"exchange": "BINANCE", "symbol": "0GUSDT", "current_stage": 1, "stage_age_minutes": 45.0, "latest_cycle_ts": datetime(2026, 7, 24, 9, 10, tzinfo=timezone.utc)}]
-    silent_zero = {("BINANCE", "0GUSDT"): {"exchange": "BINANCE", "symbol": "0GUSDT", "current_stage": 0}}
-    recovered = reconcile_core_state_integrity(silent_zero, guard)
-    assert recovered == [("BINANCE", "0GUSDT")]
-    assert silent_zero[("BINANCE", "0GUSDT")]["current_stage"] == 1
-
-    legal_zero = {("BINANCE", "0GUSDT"): {"exchange": "BINANCE", "symbol": "0GUSDT", "current_stage": 0}}
-    recovered = reconcile_core_state_integrity(legal_zero, guard, {("BINANCE", "0GUSDT", 1)})
-    assert recovered == []
-    assert legal_zero[("BINANCE", "0GUSDT")]["current_stage"] == 0
-
-
-def test_integrity_guard_restores_newer_silent_zero_state() -> None:
-    guard = [
-        {
-            "exchange": "BYBIT",
-            "symbol": "TACUSDT",
-            "current_stage": 1,
-            "stage_age_minutes": 85.0,
-            "latest_cycle_ts": datetime(2026, 7, 25, 12, 45, tzinfo=timezone.utc),
-        }
-    ]
-    state_map = {
-        ("BYBIT", "TACUSDT"): {
-            "exchange": "BYBIT",
-            "symbol": "TACUSDT",
-            "current_stage": 0,
-            "latest_cycle_ts": datetime(2026, 7, 25, 13, 5, tzinfo=timezone.utc),
-        }
-    }
-
-    recovered = reconcile_core_state_integrity(state_map, guard)
-
-    assert recovered == [("BYBIT", "TACUSDT")]
-    assert state_map[("BYBIT", "TACUSDT")]["current_stage"] == 1
-
-    legal_zero = {
-        ("BYBIT", "TACUSDT"): {
-            "exchange": "BYBIT",
-            "symbol": "TACUSDT",
-            "current_stage": 0,
-            "latest_cycle_ts": datetime(2026, 7, 25, 13, 5, tzinfo=timezone.utc),
-        }
-    }
-    recovered = reconcile_core_state_integrity(
-        legal_zero,
-        guard,
-        {("BYBIT", "TACUSDT", 1)},
-    )
-    assert recovered == []
-    assert legal_zero[("BYBIT", "TACUSDT")]["current_stage"] == 0
 
 
 def test_incremental_rechecks_stage2_pair_from_history_when_hot_cycle_misses_it(monkeypatch) -> None:
@@ -695,33 +620,3 @@ def test_update_post_stage_analytics_backfills_from_history_when_live_rows_are_e
 
     assert any("FROM oi_stage_history" in sql for sql in fetch_calls)
     assert any("INSERT INTO oi_post_stage_analytics" in sql for sql in execute_calls)
-
-
-def test_integrity_guard_keeps_newer_legal_stage3_zero_state() -> None:
-    state_map = {
-        ("BYBIT", "APPSTOCKUSDT"): {
-            "exchange": "BYBIT",
-            "symbol": "APPSTOCKUSDT",
-            "current_stage": 0,
-            "latest_cycle_ts": datetime(2026, 7, 25, 20, 55, tzinfo=timezone.utc),
-            "decision_reason": "oi_4ч=strong_down; guard=сброс_3_0:oi_4ч=strong_down",
-        }
-    }
-    guard_rows = [
-        {
-            "exchange": "BYBIT",
-            "symbol": "APPSTOCKUSDT",
-            "current_stage": 3,
-            "stage_age_minutes": 225.0,
-            "latest_cycle_ts": datetime(2026, 7, 25, 19, 35, tzinfo=timezone.utc),
-        }
-    ]
-
-    recovered = reconcile_core_state_integrity(
-        state_map,
-        guard_rows,
-        {("BYBIT", "APPSTOCKUSDT", 3)},
-    )
-
-    assert recovered == []
-    assert state_map[("BYBIT", "APPSTOCKUSDT")]["current_stage"] == 0

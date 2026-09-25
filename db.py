@@ -5,6 +5,7 @@ from psycopg.rows import dict_row
 from config import DATABASE_URL, RAW_RETENTION_DAYS
 import os
 import time
+from quote_turnover_snapshot import build_quote_turnover_state_rows
 
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "60000"))
 from logger import log
@@ -129,9 +130,70 @@ def init_db() -> None:
             exchange TEXT NOT NULL,
             symbol TEXT NOT NULL,
             volume DOUBLE PRECISION NOT NULL,
+            quote_turnover DOUBLE PRECISION,
             cycle_ts TIMESTAMPTZ,
             source TEXT,
             collected_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS quote_turnover_state(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            source_cycle_ts TIMESTAMPTZ NOT NULL,
+            latest_ts_close TIMESTAMPTZ,
+            previous_4h_quote DOUBLE PRECISION,
+            current_4h_quote DOUBLE PRECISION,
+            growth_4h_pct DOUBLE PRECISION,
+            previous_1h_quote DOUBLE PRECISION,
+            current_1h_quote DOUBLE PRECISION,
+            growth_1h_pct DOUBLE PRECISION,
+            previous_4h_points INTEGER NOT NULL DEFAULT 0,
+            current_4h_points INTEGER NOT NULL DEFAULT 0,
+            freshness_seconds DOUBLE PRECISION,
+            ready BOOLEAN NOT NULL DEFAULT FALSE,
+            quality_reason TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY(exchange, symbol)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stage3_volume_queue(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            stage3_transition_ts TIMESTAMPTZ NOT NULL,
+            queued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status TEXT NOT NULL,
+            volume_unlocked_at TIMESTAMPTZ,
+            growth_4h_pct DOUBLE PRECISION,
+            quality_reason TEXT,
+            volume_snapshot JSONB,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            terminal_at TIMESTAMPTZ,
+            sent_at TIMESTAMPTZ,
+            oi_1h_class TEXT,
+            oi_cycle_ts TIMESTAMPTZ,
+            PRIMARY KEY(exchange, symbol)
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stage3_volume_queue_observations(
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            stage3_transition_ts TIMESTAMPTZ NOT NULL,
+            observed_at TIMESTAMPTZ NOT NULL,
+            source_exchange TEXT,
+            source_symbol TEXT,
+            data_source_cycle_ts TIMESTAMPTZ,
+            volume_ready BOOLEAN NOT NULL DEFAULT FALSE,
+            growth_4h_pct DOUBLE PRECISION,
+            quality_reason TEXT,
+            gate_status TEXT NOT NULL,
+            queue_status TEXT NOT NULL,
+            delivery_block_reason TEXT,
+            volume_snapshot JSONB,
+            recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY(exchange, symbol, stage3_transition_ts, observed_at)
         )
         """)
         cur.execute("""
@@ -385,6 +447,28 @@ def init_db() -> None:
         )
         """)
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS phase_decision_observations(
+            id BIGSERIAL PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            cycle_ts TIMESTAMPTZ NOT NULL,
+            previous_stage INTEGER NOT NULL,
+            target_stage INTEGER NOT NULL,
+            stage_age_minutes DOUBLE PRECISION,
+            stage_age_before_transition DOUBLE PRECISION,
+            stage_age_after_transition DOUBLE PRECISION,
+            trigger_age_minutes DOUBLE PRECISION,
+            oi_15m TEXT,
+            oi_30m TEXT,
+            oi_1h TEXT,
+            oi_4h TEXT,
+            decision_reason TEXT,
+            guard_reason TEXT,
+            transition_permission_pre TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS debug_cases_v2(
             id BIGSERIAL PRIMARY KEY,
             exchange TEXT NOT NULL,
@@ -446,6 +530,18 @@ def init_db() -> None:
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_oi_raw_candle ON oi_raw(exchange, symbol, ts_open)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_price_raw_candle ON price_raw(exchange, symbol, ts_open)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_volume_raw_candle ON volume_raw(exchange, symbol, ts_open)")
+        safe_ddl(cur, "ALTER TABLE volume_raw ADD COLUMN IF NOT EXISTS quote_turnover DOUBLE PRECISION")
+        safe_ddl(cur, "ALTER TABLE quote_turnover_state ADD COLUMN IF NOT EXISTS previous_1h_quote DOUBLE PRECISION")
+        safe_ddl(cur, "ALTER TABLE quote_turnover_state ADD COLUMN IF NOT EXISTS current_1h_quote DOUBLE PRECISION")
+        safe_ddl(cur, "ALTER TABLE quote_turnover_state ADD COLUMN IF NOT EXISTS growth_1h_pct DOUBLE PRECISION")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_quote_turnover_state_ready ON quote_turnover_state(ready, quality_reason)")
+        safe_ddl(cur, "ALTER TABLE stage3_volume_queue ADD COLUMN IF NOT EXISTS volume_snapshot JSONB")
+        safe_ddl(cur, "ALTER TABLE stage3_volume_queue ADD COLUMN IF NOT EXISTS oi_1h_class TEXT")
+        safe_ddl(cur, "ALTER TABLE stage3_volume_queue ADD COLUMN IF NOT EXISTS oi_cycle_ts TIMESTAMPTZ")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_stage3_volume_queue_status ON stage3_volume_queue(status, updated_at)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_stage3_volume_queue_terminal ON stage3_volume_queue(terminal_at)")
+        safe_ddl(cur, "ALTER TABLE stage3_volume_queue_observations ADD COLUMN IF NOT EXISTS delivery_block_reason TEXT")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_stage3_volume_observations_retention ON stage3_volume_queue_observations(observed_at)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_aggregate_windows_key ON aggregate_windows(metric, window_code, exchange, symbol, ts_open)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_aggregate_windows_history_key ON aggregate_windows_history(metric, window_code, exchange, symbol, ts_open)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_aggregate_windows_history_latest ON aggregate_windows_history(exchange, symbol, window_code, ts_close DESC)")
@@ -455,6 +551,9 @@ def init_db() -> None:
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_core_state_v2_key ON core_state_v2(exchange, symbol)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_window_state_v2_key ON window_state_v2(exchange, symbol, window_code)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_post_stage_v2_key ON post_stage_analytics_v2(exchange, symbol, stage_triggered, triggered_at)")
+        safe_ddl(cur, "ALTER TABLE phase_decision_observations ADD COLUMN IF NOT EXISTS stage_age_before_transition DOUBLE PRECISION")
+        safe_ddl(cur, "ALTER TABLE phase_decision_observations ADD COLUMN IF NOT EXISTS stage_age_after_transition DOUBLE PRECISION")
+        safe_ddl(cur, "ALTER TABLE phase_decision_observations ADD COLUMN IF NOT EXISTS transition_permission_pre TEXT")
         safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_pattern_code TEXT")
         safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_pattern_label TEXT")
         safe_ddl(cur, "ALTER TABLE oi_core_state ADD COLUMN IF NOT EXISTS oi_direction_summary TEXT")
@@ -557,6 +656,18 @@ def init_db() -> None:
             activated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             source TEXT NOT NULL DEFAULT 'runtime_limit',
             PRIMARY KEY(exchange, symbol)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS active_symbol_universe_events(
+            event_id BIGSERIAL PRIMARY KEY,
+            observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            action TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            source TEXT,
+            reason TEXT
         )
         """)
 
@@ -807,6 +918,7 @@ def init_db() -> None:
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_oi_post_stage_main ON oi_post_stage_analytics(exchange, symbol, triggered_at DESC)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_core_state_v2_stage ON core_state_v2(current_stage)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_transition_history_v2_main ON transition_history_v2(exchange, symbol, created_at DESC)")
+        safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_phase_decision_observations_main ON phase_decision_observations(exchange, symbol, cycle_ts DESC)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_debug_cases_v2_main ON debug_cases_v2(exchange, symbol, created_at DESC)")
         safe_ddl(cur, "CREATE INDEX IF NOT EXISTS idx_post_stage_v2_main ON post_stage_analytics_v2(exchange, symbol, triggered_at DESC)")
         safe_ddl(cur, "CREATE UNIQUE INDEX IF NOT EXISTS ux_telegram_stage3_alert_history_key ON telegram_stage3_alert_history(alert_key)")
@@ -899,30 +1011,349 @@ def upsert_volume(rows: list[tuple], cycle_ts=None, source: str = "collect") -> 
         canonical_rows = [
             (
                 ts_open, ts_close, exchange, symbol,
-                volume, cycle_ts, source,
+                volume, quote_turnover, cycle_ts, source,
             )
-            for ts_open, ts_close, exchange, symbol, volume in rows
+            for ts_open, ts_close, exchange, symbol, volume, quote_turnover in rows
         ]
         _executemany_with_lock_retry(cur, """
         INSERT INTO volume_raw(
             ts_open, ts_close, exchange, symbol,
-            volume, cycle_ts, source, collected_at
+            volume, quote_turnover, cycle_ts, source, collected_at
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
         ON CONFLICT (exchange, symbol, ts_open)
         DO UPDATE SET
             ts_close=EXCLUDED.ts_close,
             volume=EXCLUDED.volume,
+            quote_turnover=EXCLUDED.quote_turnover,
             cycle_ts=EXCLUDED.cycle_ts,
             source=EXCLUDED.source,
             collected_at=NOW()
         """, canonical_rows)
+
+
+def refresh_quote_turnover_state(source_cycle_ts) -> dict:
+    """Persist latest strict 4h+4h native quote-turnover evidence per market."""
+    if not DATABASE_URL or source_cycle_ts is None:
+        return {"states": 0, "ready": 0, "warming_up": 0, "degraded": 0}
+    rows = fetch("""
+        SELECT v.ts_open, v.ts_close, v.exchange, v.symbol, v.quote_turnover
+        FROM volume_raw v
+        JOIN active_symbol_universe u
+          ON u.exchange = v.exchange AND u.symbol = v.symbol
+        WHERE v.ts_close <= %s
+          AND v.ts_close >= %s - INTERVAL '9 hours'
+        ORDER BY v.exchange, v.symbol, v.ts_open
+    """, (source_cycle_ts, source_cycle_ts))
+    states = build_quote_turnover_state_rows(rows, source_cycle_ts=source_cycle_ts)
+    latest_by_pair = {
+        (str(row["exchange"]), str(row["symbol"])): row["ts_close"]
+        for row in rows
+    }
+    canonical_rows = []
+    for (exchange, symbol), state in states.items():
+        canonical_rows.append((
+            exchange, symbol, source_cycle_ts, latest_by_pair.get((exchange, symbol)),
+            state.get("previous_4h_quote"), state.get("current_4h_quote"),
+            state.get("growth_4h_pct"),
+            state.get("previous_1h_quote"), state.get("current_1h_quote"), state.get("growth_1h_pct"),
+            int(state.get("previous_4h_points") or 0),
+            int(state.get("current_4h_points") or 0), state.get("freshness_seconds"),
+            bool(state.get("ready")), str(state.get("reason") or "missing"),
+        ))
+    if canonical_rows:
+        with _conn() as conn, conn.cursor() as cur:
+            _executemany_with_lock_retry(cur, """
+                INSERT INTO quote_turnover_state(
+                    exchange, symbol, source_cycle_ts, latest_ts_close,
+                    previous_4h_quote, current_4h_quote, growth_4h_pct,
+                    previous_1h_quote, current_1h_quote, growth_1h_pct,
+                    previous_4h_points, current_4h_points, freshness_seconds,
+                    ready, quality_reason, updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT(exchange, symbol) DO UPDATE SET
+                    source_cycle_ts=EXCLUDED.source_cycle_ts,
+                    latest_ts_close=EXCLUDED.latest_ts_close,
+                    previous_4h_quote=EXCLUDED.previous_4h_quote,
+                    current_4h_quote=EXCLUDED.current_4h_quote,
+                    growth_4h_pct=EXCLUDED.growth_4h_pct,
+                    previous_1h_quote=EXCLUDED.previous_1h_quote,
+                    current_1h_quote=EXCLUDED.current_1h_quote,
+                    growth_1h_pct=EXCLUDED.growth_1h_pct,
+                    previous_4h_points=EXCLUDED.previous_4h_points,
+                    current_4h_points=EXCLUDED.current_4h_points,
+                    freshness_seconds=EXCLUDED.freshness_seconds,
+                    ready=EXCLUDED.ready,
+                    quality_reason=EXCLUDED.quality_reason,
+                    updated_at=NOW()
+            """, canonical_rows)
+    reason_counts: dict[str, int] = {}
+    for state in states.values():
+        reason = str(state.get("reason") or "missing")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return {
+        "states": len(states),
+        "ready": sum(1 for state in states.values() if state.get("ready")),
+        "warming_up": reason_counts.get("warming_up", 0),
+        "degraded": len(states) - sum(1 for state in states.values() if state.get("ready")),
+        "reasons": reason_counts,
+    }
+
+
+
+
+def quote_turnover_state_summary() -> dict:
+    """Return bounded readiness counters for runtime health and the dashboard."""
+    if not DATABASE_URL:
+        return {"total": 0, "ready": 0, "not_ready": 0, "warming": 0, "stale": 0, "updated_at": None}
+    rows = fetch("""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE ready) AS ready,
+               COUNT(*) FILTER (WHERE NOT ready) AS not_ready,
+               COUNT(*) FILTER (WHERE quality_reason IN ('warming_up', 'warming_up_quote_history')) AS warming,
+               COUNT(*) FILTER (WHERE quality_reason = 'stale') AS stale,
+               MAX(updated_at) AS updated_at
+        FROM quote_turnover_state
+    """)
+    return dict(rows[0]) if rows else {"total": 0, "ready": 0, "not_ready": 0, "warming": 0, "stale": 0, "updated_at": None}
+
+
+def sync_stage3_volume_queue(candidates: list[dict]) -> dict:
+    """Persist at most one current Stage-3 volume candidate per exchange/symbol."""
+    if not DATABASE_URL:
+        return {"candidates": {}, "waiting": 0, "unlocked": 0}
+    candidate_states = {}
+    with _conn() as conn, conn.cursor() as cur:
+        for item in candidates:
+            effective_status = item["status"]
+            oi_cycle_ts = item.get("oi_cycle_ts")
+            transition_ts = item["transition_ts"]
+            volume_unlocked_at = item.get("volume_unlocked_at")
+            if (
+                item.get("oi_1h_class") in {"weak_down", "strong_down"}
+                and oi_cycle_ts is not None
+                and oi_cycle_ts > transition_ts
+                and (volume_unlocked_at is None or oi_cycle_ts <= volume_unlocked_at)
+            ):
+                effective_status = "invalidated_oi1h"
+            cur.execute("""
+                INSERT INTO stage3_volume_queue(
+                    exchange, symbol, stage3_transition_ts, queued_at, status,
+                    volume_unlocked_at, growth_4h_pct, quality_reason, volume_snapshot,
+                    updated_at, oi_1h_class, oi_cycle_ts, terminal_at
+                ) VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s::jsonb,NOW(),%s,%s,
+                          CASE WHEN %s IN ('invalidated_oi1h','invalidated_price') THEN NOW() ELSE NULL END)
+                ON CONFLICT(exchange, symbol) DO UPDATE SET
+                    stage3_transition_ts=EXCLUDED.stage3_transition_ts,
+                    queued_at=CASE
+                        WHEN stage3_volume_queue.stage3_transition_ts IS DISTINCT FROM EXCLUDED.stage3_transition_ts
+                        THEN NOW() ELSE stage3_volume_queue.queued_at END,
+                    status=CASE
+                        WHEN stage3_volume_queue.stage3_transition_ts IS DISTINCT FROM EXCLUDED.stage3_transition_ts
+                        THEN EXCLUDED.status
+                        WHEN stage3_volume_queue.status='sent' THEN 'sent'
+                        WHEN stage3_volume_queue.status='invalidated_oi1h' THEN 'invalidated_oi1h'
+                        WHEN stage3_volume_queue.status='invalidated_price' THEN 'invalidated_price'
+                        WHEN EXCLUDED.oi_1h_class IN ('weak_down','strong_down')
+                          AND EXCLUDED.oi_cycle_ts > EXCLUDED.stage3_transition_ts
+                          AND (
+                            COALESCE(stage3_volume_queue.volume_unlocked_at, EXCLUDED.volume_unlocked_at) IS NULL
+                            OR EXCLUDED.oi_cycle_ts <= COALESCE(stage3_volume_queue.volume_unlocked_at, EXCLUDED.volume_unlocked_at)
+                          )
+                        THEN 'invalidated_oi1h'
+                        WHEN EXCLUDED.status='invalidated_price'
+                          AND (
+                            stage3_volume_queue.volume_unlocked_at IS NULL
+                            OR NULLIF(EXCLUDED.volume_snapshot->>'price_cycle_ts','')::timestamptz
+                               = stage3_volume_queue.volume_unlocked_at
+                          )
+                        THEN 'invalidated_price'
+                        WHEN EXCLUDED.status='blocked_universe' THEN 'blocked_universe'
+                        WHEN stage3_volume_queue.status='blocked_universe' THEN EXCLUDED.status
+                        WHEN stage3_volume_queue.status='unlocked' OR EXCLUDED.status='unlocked' THEN 'unlocked'
+                        ELSE 'waiting_volume' END,
+                    volume_unlocked_at=CASE
+                        WHEN stage3_volume_queue.stage3_transition_ts IS DISTINCT FROM EXCLUDED.stage3_transition_ts
+                        THEN EXCLUDED.volume_unlocked_at
+                        ELSE COALESCE(stage3_volume_queue.volume_unlocked_at, EXCLUDED.volume_unlocked_at) END,
+                    growth_4h_pct=EXCLUDED.growth_4h_pct,
+                    quality_reason=EXCLUDED.quality_reason,
+                    volume_snapshot=CASE
+                        WHEN stage3_volume_queue.stage3_transition_ts IS DISTINCT FROM EXCLUDED.stage3_transition_ts
+                        THEN EXCLUDED.volume_snapshot
+                        ELSE COALESCE(stage3_volume_queue.volume_snapshot, EXCLUDED.volume_snapshot) END,
+                    oi_1h_class=CASE
+                        WHEN stage3_volume_queue.stage3_transition_ts IS DISTINCT FROM EXCLUDED.stage3_transition_ts THEN EXCLUDED.oi_1h_class
+                        WHEN stage3_volume_queue.status='invalidated_oi1h' THEN stage3_volume_queue.oi_1h_class
+                        ELSE EXCLUDED.oi_1h_class END,
+                    oi_cycle_ts=CASE
+                        WHEN stage3_volume_queue.stage3_transition_ts IS DISTINCT FROM EXCLUDED.stage3_transition_ts THEN EXCLUDED.oi_cycle_ts
+                        WHEN stage3_volume_queue.status='invalidated_oi1h' THEN stage3_volume_queue.oi_cycle_ts
+                        ELSE EXCLUDED.oi_cycle_ts END,
+                    updated_at=NOW(),
+                    terminal_at=CASE
+                        WHEN stage3_volume_queue.stage3_transition_ts IS DISTINCT FROM EXCLUDED.stage3_transition_ts THEN NULL
+                        WHEN stage3_volume_queue.status IN ('invalidated_oi1h','invalidated_price') THEN stage3_volume_queue.terminal_at
+                        WHEN EXCLUDED.oi_1h_class IN ('weak_down','strong_down')
+                          AND EXCLUDED.oi_cycle_ts > EXCLUDED.stage3_transition_ts
+                          AND (
+                            COALESCE(stage3_volume_queue.volume_unlocked_at, EXCLUDED.volume_unlocked_at) IS NULL
+                            OR EXCLUDED.oi_cycle_ts <= COALESCE(stage3_volume_queue.volume_unlocked_at, EXCLUDED.volume_unlocked_at)
+                          )
+                        THEN COALESCE(stage3_volume_queue.terminal_at,NOW())
+                        WHEN EXCLUDED.status='invalidated_price'
+                          AND (
+                            stage3_volume_queue.volume_unlocked_at IS NULL
+                            OR NULLIF(EXCLUDED.volume_snapshot->>'price_cycle_ts','')::timestamptz
+                               = stage3_volume_queue.volume_unlocked_at
+                          )
+                        THEN COALESCE(stage3_volume_queue.terminal_at,NOW())
+                        WHEN EXCLUDED.status='blocked_universe' THEN COALESCE(stage3_volume_queue.terminal_at,NOW())
+                        WHEN EXCLUDED.status IN ('waiting_volume','unlocked') THEN NULL
+                        ELSE stage3_volume_queue.terminal_at END,
+                    sent_at=CASE
+                        WHEN stage3_volume_queue.stage3_transition_ts IS DISTINCT FROM EXCLUDED.stage3_transition_ts
+                        THEN NULL ELSE stage3_volume_queue.sent_at END
+                RETURNING exchange, symbol, stage3_transition_ts, status, volume_unlocked_at,
+                          growth_4h_pct, quality_reason, volume_snapshot, oi_1h_class, oi_cycle_ts
+            """, (
+                item["exchange"], item["symbol"], item["transition_ts"], effective_status,
+                item.get("volume_unlocked_at"), item.get("growth_4h_pct"), item.get("quality_reason"),
+                json.dumps(item.get("volume_snapshot")) if item.get("volume_snapshot") is not None else None,
+                item.get("oi_1h_class"), oi_cycle_ts, effective_status,
+            ))
+            saved = dict(cur.fetchone())
+            candidate_states[(saved["exchange"], saved["symbol"])] = saved
+            observation = item.get("observation_snapshot") or {}
+            observed_at = item.get("observed_at") or saved["stage3_transition_ts"]
+            if saved["status"] == "invalidated_oi1h":
+                delivery_block_reason = "blocked:oi_1h_decline_before_volume"
+            elif saved["status"] == "invalidated_price":
+                delivery_block_reason = item.get("delivery_block_reason") or "blocked:price_decline_at_first_volume_unlock"
+            elif saved["status"] == "blocked_universe":
+                delivery_block_reason = item.get("delivery_block_reason")
+            else:
+                delivery_block_reason = None
+            cur.execute("""
+                INSERT INTO stage3_volume_queue_observations(
+                    exchange, symbol, stage3_transition_ts, observed_at,
+                    source_exchange, source_symbol, data_source_cycle_ts,
+                    volume_ready, growth_4h_pct, quality_reason,
+                    gate_status, queue_status, delivery_block_reason, volume_snapshot
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                ON CONFLICT(exchange, symbol, stage3_transition_ts, observed_at) DO NOTHING
+            """, (
+                item["exchange"], item["symbol"], item["transition_ts"], observed_at,
+                item.get("source"), item.get("source_symbol"), observation.get("source_cycle_ts"),
+                bool(item.get("ready")), item.get("growth_4h_pct"), item.get("quality_reason"),
+                item.get("gate_status") or item["status"], saved["status"], delivery_block_reason,
+                json.dumps(observation) if observation else None,
+            ))
+        cur.execute("""
+            UPDATE stage3_volume_queue q
+            SET status='invalidated', terminal_at=NOW(), updated_at=NOW()
+            WHERE q.status IN ('waiting_volume','unlocked')
+              AND NOT EXISTS (
+                SELECT 1
+                FROM core_state_v2 c
+                JOIN active_symbol_universe au
+                  ON au.exchange=c.exchange AND au.symbol=c.symbol
+                JOIN LATERAL (
+                    SELECT th.cycle_ts
+                    FROM transition_history_v2 th
+                    WHERE th.exchange=c.exchange AND th.symbol=c.symbol AND th.to_stage=3
+                    ORDER BY th.cycle_ts DESC, th.created_at DESC LIMIT 1
+                ) th ON TRUE
+                WHERE c.exchange=q.exchange AND c.symbol=q.symbol
+                  AND c.current_stage=3 AND th.cycle_ts=q.stage3_transition_ts
+              )
+        """)
+        cur.execute("""
+            DELETE FROM stage3_volume_queue
+            WHERE status IN ('sent','invalidated','invalidated_oi1h','invalidated_price','blocked_universe')
+              AND terminal_at < NOW() - INTERVAL '72 hours'
+        """)
+        cur.execute("""
+            DELETE FROM stage3_volume_queue_observations
+            WHERE observed_at < NOW() - INTERVAL '72 hours'
+        """)
+        cur.execute("""
+            SELECT status, COUNT(*) AS count
+            FROM stage3_volume_queue
+            WHERE status IN ('waiting_volume','unlocked','invalidated_price')
+            GROUP BY status
+        """)
+        counts = {str(row["status"]): int(row["count"] or 0) for row in cur.fetchall()}
+        cur.execute("SELECT COUNT(*) AS count FROM stage3_volume_queue_observations")
+        observations_72h = int(cur.fetchone()["count"] or 0)
+    return {
+        "candidates": candidate_states,
+        "waiting": counts.get("waiting_volume", 0),
+        "unlocked": counts.get("unlocked", 0),
+        "price_invalidated_72h": counts.get("invalidated_price", 0),
+        "observations_72h": observations_72h,
+    }
+
+
+def mark_stage3_volume_queue_sent(exchange: str, symbol: str, transition_ts) -> None:
+    if not DATABASE_URL:
+        return
+    execute("""
+        UPDATE stage3_volume_queue
+        SET status='sent', sent_at=NOW(), terminal_at=NOW(), updated_at=NOW()
+        WHERE exchange=%s AND symbol=%s AND stage3_transition_ts=%s
+          AND status='unlocked'
+    """, (exchange, symbol, transition_ts))
+
+
+
+def mark_stage3_volume_queue_blocked(exchange: str, symbol: str, transition_ts, reason: str) -> None:
+    if not DATABASE_URL:
+        return
+    execute("""
+        UPDATE stage3_volume_queue
+        SET status='blocked_universe', terminal_at=COALESCE(terminal_at,NOW()), updated_at=NOW()
+        WHERE exchange=%s AND symbol=%s AND stage3_transition_ts=%s
+          AND status IN ('waiting_volume','unlocked','blocked_universe')
+    """, (exchange, symbol, transition_ts))
+    execute("""
+        UPDATE stage3_volume_queue_observations
+        SET queue_status='blocked_universe', delivery_block_reason=%s
+        WHERE exchange=%s AND symbol=%s AND stage3_transition_ts=%s
+          AND observed_at=(
+              SELECT MAX(observed_at) FROM stage3_volume_queue_observations
+              WHERE exchange=%s AND symbol=%s AND stage3_transition_ts=%s
+          )
+    """, (reason, exchange, symbol, transition_ts, exchange, symbol, transition_ts))
+
+
+def select_quote_turnover_backfill_targets(limit: int) -> set[tuple[str, str]]:
+    """Return a bounded set of active markets whose native quote history is not ready."""
+    if not DATABASE_URL:
+        return set()
+    bounded_limit = max(0, int(limit))
+    if bounded_limit == 0:
+        return set()
+    rows = fetch("""
+        SELECT u.exchange, u.symbol
+        FROM active_symbol_universe u
+        LEFT JOIN quote_turnover_state q
+          ON q.exchange = u.exchange AND q.symbol = u.symbol
+        WHERE COALESCE(q.ready, FALSE) = FALSE
+        ORDER BY COALESCE(q.updated_at, u.activated_at) ASC, u.exchange, u.symbol
+        LIMIT %s
+    """, (bounded_limit,))
+    return {
+        (str(row.get("exchange") or ""), str(row.get("symbol") or ""))
+        for row in rows
+        if row.get("exchange") and row.get("symbol")
+    }
 def _derived_retention_hours() -> int:
-    return int(os.getenv("DERIVED_RETENTION_HOURS", "72"))
+    return int(os.getenv("DERIVED_RETENTION_HOURS", "36"))
 
 
 def history_retention_hours() -> int:
-    return int(os.getenv("AGGREGATE_HISTORY_RETENTION_HOURS", "168"))
+    return int(os.getenv("AGGREGATE_HISTORY_RETENTION_HOURS", "72"))
 
 
 def upsert_aggregate_history_rows(rows: list[tuple]) -> int:
@@ -953,6 +1384,22 @@ def upsert_aggregate_history_rows(rows: list[tuple]) -> int:
             trajectory_points=EXCLUDED.trajectory_points,
             source_cycle_ts=EXCLUDED.source_cycle_ts,
             built_at=NOW()
+        WHERE (aggregate_windows_history.ts_close,
+               aggregate_windows_history.open_value,
+               aggregate_windows_history.high_value,
+               aggregate_windows_history.low_value,
+               aggregate_windows_history.close_value,
+               aggregate_windows_history.sum_value,
+               aggregate_windows_history.avg_value,
+               aggregate_windows_history.delta_pct,
+               aggregate_windows_history.unique_candles,
+               aggregate_windows_history.trajectory_points,
+               aggregate_windows_history.source_cycle_ts)
+          IS DISTINCT FROM
+              (EXCLUDED.ts_close, EXCLUDED.open_value, EXCLUDED.high_value,
+               EXCLUDED.low_value, EXCLUDED.close_value, EXCLUDED.sum_value,
+               EXCLUDED.avg_value, EXCLUDED.delta_pct, EXCLUDED.unique_candles,
+               EXCLUDED.trajectory_points, EXCLUDED.source_cycle_ts)
         """
 
         for i in range(0, len(rows), batch_size):
@@ -1263,6 +1710,20 @@ def replace_oi_core_state(rows: list[tuple]) -> None:
             latest_cycle_ts = EXCLUDED.latest_cycle_ts,
             updated_at = NOW()
         """, rows)
+
+
+def insert_phase_decision_observations(rows: list[tuple]) -> None:
+    if not DATABASE_URL or not rows:
+        return
+    with _conn() as conn, conn.cursor() as cur:
+        cur.executemany("""
+        INSERT INTO phase_decision_observations(
+            exchange, symbol, cycle_ts, previous_stage, target_stage,
+            stage_age_minutes, stage_age_before_transition, stage_age_after_transition,
+            trigger_age_minutes, oi_15m, oi_30m, oi_1h, oi_4h,
+            decision_reason, guard_reason, transition_permission_pre
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, rows)
         # Keep a tiny independent checkpoint: core state is phase memory, not
         # a disposable cache. It lets the service reject a silent state loss.
         cur.execute("""
@@ -1273,10 +1734,22 @@ def replace_oi_core_state(rows: list[tuple]) -> None:
         FROM oi_core_state
         ON CONFLICT (exchange, symbol)
         DO UPDATE SET
-            current_stage = EXCLUDED.current_stage,
-            stage_age_minutes = EXCLUDED.stage_age_minutes,
-            latest_cycle_ts = EXCLUDED.latest_cycle_ts,
-            updated_at = NOW()
+            current_stage = CASE
+                WHEN EXCLUDED.current_stage > 0 THEN EXCLUDED.current_stage
+                ELSE core_state_integrity_guard.current_stage
+            END,
+            stage_age_minutes = CASE
+                WHEN EXCLUDED.current_stage > 0 THEN EXCLUDED.stage_age_minutes
+                ELSE core_state_integrity_guard.stage_age_minutes
+            END,
+            latest_cycle_ts = CASE
+                WHEN EXCLUDED.current_stage > 0 THEN EXCLUDED.latest_cycle_ts
+                ELSE core_state_integrity_guard.latest_cycle_ts
+            END,
+            updated_at = CASE
+                WHEN EXCLUDED.current_stage > 0 THEN NOW()
+                ELSE core_state_integrity_guard.updated_at
+            END
         """)
 
 
@@ -1560,6 +2033,10 @@ def replace_active_universe(rows: list[tuple]) -> None:
     with _conn() as conn, conn.cursor() as cur:
         if to_delete:
             cur.executemany("""
+            INSERT INTO active_symbol_universe_events(action, exchange, symbol, reason)
+            VALUES ('removed', %s, %s, 'universe_refresh')
+            """, to_delete)
+            cur.executemany("""
             DELETE FROM active_symbol_universe
             WHERE exchange = %s AND symbol = %s
             """, to_delete)
@@ -1572,6 +2049,10 @@ def replace_active_universe(rows: list[tuple]) -> None:
             """, to_update)
 
         if to_insert:
+            cur.executemany("""
+            INSERT INTO active_symbol_universe_events(action, exchange, symbol, source, reason)
+            VALUES ('added', %s, %s, %s, 'universe_refresh')
+            """, to_insert)
             cur.executemany("""
             INSERT INTO active_symbol_universe(exchange, symbol, source, activated_at)
             VALUES (%s,%s,%s,NOW())
@@ -2079,6 +2560,14 @@ def cleanup_old(days: int) -> None:
         print(f"HISTORY_CLEANUP_TABLE table=aggregate_windows_history rows_deleted={int(rows or 0)} retention_hours={history_hours}")
     except Exception as e:
         print(f"HISTORY_CLEANUP_TABLE_ERROR table=aggregate_windows_history error={type(e).__name__}: {e}")
+    try:
+        rows = execute(
+            "DELETE FROM phase_decision_observations WHERE cycle_ts < NOW() - (%s || ' hours')::interval",
+            (history_hours,),
+        )
+        print(f"HISTORY_CLEANUP_TABLE table=phase_decision_observations rows_deleted={int(rows or 0)} retention_hours={history_hours}")
+    except Exception as e:
+        print(f"HISTORY_CLEANUP_TABLE_ERROR table=phase_decision_observations error={type(e).__name__}: {e}")
 
 def migrate_canonical_ts_close() -> None:
     """

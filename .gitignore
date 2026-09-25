@@ -15,6 +15,14 @@ storage_state.json
 *.bak_*
 *.bak.*
 
+# Local recovery copies and temporary diagnostic scripts (preserve, do not commit)
+*.before_*
+*.after_*
+*.bak-*
+*.orig
+tmp_diagnose_*.py
+tmp_update_memory_*.py
+
 # runtime diagnostics
 runtime/fast_snapshot/
 runtime/*.zip

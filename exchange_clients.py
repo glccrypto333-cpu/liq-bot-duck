@@ -204,7 +204,7 @@ def fetch_bybit_kline_5m(symbol: str, limit: int = 200) -> tuple[list[tuple], li
         if not _closed(ts_close_norm):
             continue
         price_rows.append((ts_open, ts_close_norm, "BYBIT", symbol, float(item[1]), float(item[2]), float(item[3]), float(item[4])))
-        volume_rows.append((ts_open, ts_close_norm, "BYBIT", symbol, float(item[5])))
+        volume_rows.append((ts_open, ts_close_norm, "BYBIT", symbol, float(item[5]), float(item[6])))
     return price_rows, volume_rows
 
 def fetch_binance_kline_5m(symbol: str, limit: int = 200) -> tuple[list[tuple], list[tuple]]:
@@ -221,5 +221,5 @@ def fetch_binance_kline_5m(symbol: str, limit: int = 200) -> tuple[list[tuple], 
         if not _closed(ts_close_norm):
             continue
         price_rows.append((ts_open, ts_close_norm, "BINANCE", symbol, float(item[1]), float(item[2]), float(item[3]), float(item[4])))
-        volume_rows.append((ts_open, ts_close_norm, "BINANCE", symbol, float(item[5])))
+        volume_rows.append((ts_open, ts_close_norm, "BINANCE", symbol, float(item[5]), float(item[7])))
     return price_rows, volume_rows

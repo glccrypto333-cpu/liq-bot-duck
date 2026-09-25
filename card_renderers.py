@@ -61,6 +61,14 @@ def _find_last_transition(history_rows: list[dict[str, Any]], to_stage: int) -> 
     return None
 
 
+def _is_early_transition(row: dict[str, Any] | None, to_stage: int) -> bool:
+    """Return whether a phase entry was produced by an explicit early corridor."""
+    if not row or to_stage not in {2, 3}:
+        return False
+    reason = str(row.get("reason") or row.get("transition_reason") or "").strip().lower()
+    return "ранн" in reason or "early" in reason
+
+
 def _phase_zero_line(history_rows: list[dict[str, Any]], humanize_reason: Callable[[Any], str] | None = None) -> str | None:
     row = _find_first_transition(history_rows, 1)
     if not row:
@@ -76,6 +84,7 @@ def build_phase_history_lines(
     current_stage: int,
     current_age_minutes: Any,
     humanize_reason: Callable[[Any], str] | None = None,
+    volume_unlocked_at: Any = None,
 ) -> list[str]:
     lines = ["<b>История по фазам</b>"]
     phase0 = _phase_zero_line(history_rows, humanize_reason)
@@ -88,13 +97,24 @@ def build_phase_history_lines(
         if not entry_row:
             continue
         age_minutes = exit_row.get("stage_age_before_transition") if exit_row else current_age_minutes
-        line = f"<b>Фаза {stage}</b> - {_fmt_minutes(age_minutes)} - вход: {_format_ts_moscow_short(entry_row.get('cycle_ts'))}"
+        phase_label = f"Фаза {stage}"
+        if _is_early_transition(entry_row, stage):
+            phase_label += " Ранний"
+        line = f"<b>{phase_label}</b> - {_fmt_minutes(age_minutes)} - вход: {_format_ts_moscow_short(entry_row.get('cycle_ts'))}"
         lines.append(line)
 
     current_entry = _find_last_transition(history_rows, current_stage)
     if current_stage > 0:
+        phase_label = f"Фаза {current_stage}"
+        if _is_early_transition(current_entry, current_stage):
+            phase_label += " Ранний"
         lines.append(
-            f"<b>Фаза {current_stage}</b> - {_fmt_minutes(current_age_minutes)} - "
+            f"<b>{phase_label}</b> - {_fmt_minutes(current_age_minutes)} - "
             f"вход: {_format_ts_moscow_short(current_entry.get('cycle_ts') if current_entry else None)}"
+        )
+    if current_stage == 3 and volume_unlocked_at is not None:
+        lines.append(
+            f"<b>Объёмы &gt;100%</b> - подтверждено: "
+            f"{_format_ts_moscow_short(volume_unlocked_at)}"
         )
     return lines

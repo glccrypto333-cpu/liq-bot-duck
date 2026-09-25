@@ -24,7 +24,7 @@ def _build_batch(total_symbols: int, missing_symbols: int) -> tuple[dict, list[s
         oi_rows.append((ts_open, ts_close, "BYBIT", symbol, 1.0, 1.0, 1.0, 1.0))
         if idx >= missing_symbols:
             price_rows.append((ts_open, ts_close, "BYBIT", symbol, 1.0, 1.0, 1.0, 1.0))
-            volume_rows.append((ts_open, ts_close, "BYBIT", symbol, 1.0))
+            volume_rows.append((ts_open, ts_close, "BYBIT", symbol, 1.0, 10.0))
 
     batch = {
         "oi_rows": oi_rows,
@@ -72,6 +72,12 @@ def test_raw_validate_tolerates_two_missing_oi_pairs(monkeypatch) -> None:
     assert result is batch
 
 
+def test_raw_validate_accepts_native_quote_turnover_as_sixth_volume_field(monkeypatch) -> None:
+    batch, bybit, binance = _build_batch(total_symbols=1, missing_symbols=0)
+
+    assert validate_collected_raw(batch, bybit, binance) is batch
+
+
 def test_raw_validate_rejects_three_missing_oi_pairs(monkeypatch) -> None:
     monkeypatch.setenv("RAW_VALIDATE_TOLERATED_OI_MISSING", "2")
     batch, bybit, binance = _build_batch(total_symbols=4, missing_symbols=0)
@@ -81,3 +87,22 @@ def test_raw_validate_rejects_three_missing_oi_pairs(monkeypatch) -> None:
         validate_collected_raw(batch, bybit, binance)
 
     assert "missing_oi_exchange_counts=BYBIT:3" in str(exc.value)
+
+
+def test_raw_validate_tolerates_small_local_oi_gap_in_large_universe(monkeypatch) -> None:
+    monkeypatch.setenv("RAW_VALIDATE_TOLERATED_OI_MISSING", "2")
+    monkeypatch.setenv("RAW_VALIDATE_TOLERATED_OI_MISSING_PCT", "0.01")
+    batch, bybit, binance = _build_batch(total_symbols=1300, missing_symbols=0)
+    _drop_oi_rows(batch, {"SYM0001USDT", "SYM0002USDT", "SYM0003USDT"})
+
+    assert validate_collected_raw(batch, bybit, binance) is batch
+
+
+def test_raw_validate_still_rejects_mass_oi_gap(monkeypatch) -> None:
+    monkeypatch.setenv("RAW_VALIDATE_TOLERATED_OI_MISSING", "2")
+    monkeypatch.setenv("RAW_VALIDATE_TOLERATED_OI_MISSING_PCT", "0.01")
+    batch, bybit, binance = _build_batch(total_symbols=1300, missing_symbols=0)
+    _drop_oi_rows(batch, {f"SYM{i:04d}USDT" for i in range(14)})
+
+    with pytest.raises(RuntimeError, match="missing_oi=14"):
+        validate_collected_raw(batch, bybit, binance)

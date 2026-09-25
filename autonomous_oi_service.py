@@ -13,6 +13,7 @@ from db import (
     execute,
     fetch,
     insert_oi_stage_history,
+    insert_phase_decision_observations,
     insert_transition_history_v2,
     prune_inactive_state_rows,
     replace_core_state_v2,
@@ -84,6 +85,13 @@ def _new_runtime_observability_metrics() -> dict:
             "sample": [],
         },
         "stage2_history_recheck": {
+            "checked_total": 0,
+            "history_loaded_pairs": 0,
+            "produced_core_rows": 0,
+            "produced_transitions": 0,
+            "sample": [],
+        },
+        "stage1_history_recheck": {
             "checked_total": 0,
             "history_loaded_pairs": 0,
             "produced_core_rows": 0,
@@ -259,6 +267,31 @@ def _record_stage2_history_recheck(
         )
 
 
+def _record_stage1_history_recheck(
+    *,
+    checked_pairs: list[tuple[str, str]],
+    history_window_map: dict[tuple[str, str], dict],
+    core_rows: list[tuple],
+    history_rows: list[tuple],
+) -> None:
+    bucket = _RUNTIME_OBSERVABILITY_METRICS["stage1_history_recheck"]
+    checked_total = len(checked_pairs)
+    bucket["checked_total"] += checked_total
+    bucket["history_loaded_pairs"] += sum(
+        1 for exchange, symbol in checked_pairs if (exchange, symbol) in history_window_map
+    )
+    bucket["produced_core_rows"] = len(core_rows)
+    bucket["produced_transitions"] += len(history_rows)
+    for exchange, symbol in checked_pairs[:OBSERVABILITY_SAMPLE_LIMIT]:
+        _append_observability_sample(
+            bucket,
+            {
+                "pair": f"{exchange}:{symbol}",
+                "loaded_from_history": (exchange, symbol) in history_window_map,
+            },
+        )
+
+
 _WINDOW_KIND_KEYS = ("OI", "PRICE", "VOLUME")
 _WINDOW_CODE_TO_PUBLIC_KEY = {
     "15м": "15m",
@@ -309,6 +342,37 @@ def build_window_freshness_by_kind(problem_pairs: list[dict] | None) -> dict:
     return summary
 
 
+def build_quarantine_lifecycle(
+    problem_pairs: list[dict] | None,
+    data_quality_rows: list[dict] | None,
+) -> dict:
+    """Summarise affected pairs once, even when one pair has several problems.
+
+    ``incomplete_pairs`` and ``no_windows_pairs`` are diagnostic categories,
+    not independent quarantines.  Counting their totals together turns one
+    unavailable symbol into two active quarantines in the dashboard.
+    """
+    active_pairs = {
+        (str(row.get("exchange") or ""), str(row.get("symbol") or ""))
+        for row in (problem_pairs or [])
+        # Warm-up/info rows remain visible in the background context but are
+        # deliberately not quarantines.
+        if row.get("exchange")
+        and row.get("symbol")
+        and bool(row.get("blocking", True))
+    }
+    quality_pairs = {
+        (str(row.get("exchange") or ""), str(row.get("symbol") or ""))
+        for row in (data_quality_rows or [])
+        if row.get("exchange") and row.get("symbol")
+    }
+    return {
+        "active_total": len(active_pairs),
+        "data_quality_active_total": len(quality_pairs),
+        "sample": list(data_quality_rows or [])[:OBSERVABILITY_SAMPLE_LIMIT],
+    }
+
+
 def build_stage_chain_continuity_report(
     discontinuity_rows: list[dict] | None,
     *,
@@ -320,6 +384,11 @@ def build_stage_chain_continuity_report(
         row for row in list(discontinuity_rows or [])
         if row.get("prev_to") is not None
         and int(row.get("prev_to") or 0) != int(row.get("from_stage") or 0)
+        and not (
+            int(row.get("prev_to") or 0) == 1
+            and int(row.get("from_stage") or 0) == 0
+            and int(row.get("to_stage") or 0) == 1
+        )
     ]
     sample = []
     for row in rows[:OBSERVABILITY_SAMPLE_LIMIT]:
@@ -546,6 +615,58 @@ def _active_stage2_pairs(previous_state_map: dict[tuple[str, str], dict]) -> lis
     return pairs
 
 
+def _active_stage1_recheck_pairs(
+    previous_state_map: dict[tuple[str, str], dict],
+    *,
+    limit: int = 64,
+) -> list[tuple[str, str]]:
+    """Return only bounded near-maturity stage-1 pairs for history continuity."""
+    ranked: list[tuple[float, float, str, str]] = []
+    for key, state in previous_state_map.items():
+        if not isinstance(key, tuple) or len(key) != 2 or not isinstance(state, dict):
+            continue
+        if int(state.get("current_stage") or 0) != 1:
+            continue
+
+        transition_permission = str(state.get("oi_transition_permission") or "")
+        oi_15m = str(state.get("oi_slope_class_15m") or "flat")
+        oi_30m = str(state.get("oi_slope_class_30m") or "flat")
+        stage_age_minutes = float(state.get("oi_stage_age_minutes") or 0.0)
+        latest_cycle_ts = _parse_state_ts(state.get("latest_cycle_ts"))
+        growth_trigger_ts = _parse_state_ts(state.get("growth_trigger_ts"))
+        trigger_age_minutes = 0.0
+        if latest_cycle_ts is not None and growth_trigger_ts is not None:
+            trigger_age_minutes = max(
+                0.0,
+                (latest_cycle_ts - growth_trigger_ts).total_seconds() / 60.0,
+            )
+
+        near_maturity = transition_permission in {
+            "ждем_30_минут_от_триггера",
+            "ждем_30_минут_в_1",
+        }
+        if not near_maturity:
+            near_maturity = (
+                stage_age_minutes >= 25.0
+                and oi_15m in {"weak_up", "good_up", "strong_up"}
+                and oi_30m in {"good_up", "strong_up"}
+            )
+        if not near_maturity:
+            continue
+
+        ranked.append(
+            (
+                trigger_age_minutes,
+                stage_age_minutes,
+                str(key[0]),
+                str(key[1]),
+            )
+        )
+
+    ranked.sort(reverse=True)
+    return [(exchange, symbol) for _, _, exchange, symbol in ranked[:limit]]
+
+
 def collect_stage1_near_maturity_diagnostics(limit: int = 10) -> dict:
     """Expose stage-1 pairs that are close to 1 -> 2 without changing stages."""
     try:
@@ -724,26 +845,40 @@ def save_autonomous_oi_progress(last_source_cycle_ts: datetime | None) -> None:
 def reconcile_core_state_integrity(
     state_map: dict[tuple[str, str], dict],
     guard_rows: list[dict],
+    legal_zero_transitions: set[tuple[str, str, int]] | None = None,
 ) -> list[tuple[str, str]]:
-    """Restore an unresolved stage 3 if the mutable core row silently vanished."""
+    """Restore a non-zero stage if its mutable core row silently vanished."""
     recovered: list[tuple[str, str]] = []
+    legal_zero_transitions = legal_zero_transitions or set()
     for guard in guard_rows:
-        if int(guard.get("current_stage") or 0) != 3:
+        guarded_stage = int(guard.get("current_stage") or 0)
+        if guarded_stage <= 0:
             continue
         key = (guard["exchange"], guard["symbol"])
         current = state_map.get(key)
-        if current and int(current.get("current_stage") or 0) >= 3:
-            continue
+        if guarded_stage == 3:
+            if current:
+                current_stage = int(current.get("current_stage") or 0)
+                if current_stage >= 3:
+                    continue
+                if current_stage == 0:
+                    if (key[0], key[1], guarded_stage) in legal_zero_transitions:
+                        continue
+        elif current:
+            if int(current.get("current_stage") or 0) != 0:
+                continue
+            if (key[0], key[1], guarded_stage) in legal_zero_transitions:
+                continue
         restored = dict(current or {})
         restored.update(
             {
                 "exchange": key[0],
                 "symbol": key[1],
-                "current_stage": 3,
+                "current_stage": guarded_stage,
                 "oi_stage_age_minutes": float(guard.get("stage_age_minutes") or 0.0),
                 "latest_cycle_ts": guard.get("latest_cycle_ts"),
-                "oi_transition_permission": "удержание_3:восстановлено_инвариантом",
-                "decision_reason": "восстановление_3_после_тихой_потери_core_state",
+                "oi_transition_permission": f"удержание_{guarded_stage}:восстановлено_инвариантом",
+                "decision_reason": f"восстановление_{guarded_stage}_после_тихой_потери_core_state",
             }
         )
         state_map[key] = restored
@@ -758,10 +893,26 @@ def load_previous_core_state_map() -> dict[tuple[str, str], dict]:
         """
         SELECT exchange, symbol, current_stage, stage_age_minutes, latest_cycle_ts
         FROM core_state_integrity_guard
-        WHERE current_stage = 3
+        WHERE current_stage > 0
         """
     )
-    recovered = reconcile_core_state_integrity(state_map, guard_rows)
+    legal_zero_rows = fetch(
+        """
+        SELECT DISTINCT h.exchange, h.symbol, h.from_stage
+        FROM oi_stage_history h
+        JOIN core_state_integrity_guard guard
+          ON guard.exchange = h.exchange
+         AND guard.symbol = h.symbol
+         AND guard.current_stage = h.from_stage
+        WHERE h.to_stage = 0
+          AND h.cycle_ts >= guard.latest_cycle_ts
+        """
+    )
+    legal_zero_transitions = {
+        (row["exchange"], row["symbol"], int(row["from_stage"]))
+        for row in legal_zero_rows
+    }
+    recovered = reconcile_core_state_integrity(state_map, guard_rows, legal_zero_transitions)
     if recovered:
         execute(
             """
@@ -770,7 +921,7 @@ def load_previous_core_state_map() -> dict[tuple[str, str], dict]:
             )
             SELECT guard.exchange, guard.symbol, guard.current_stage, guard.latest_cycle_ts
             FROM core_state_integrity_guard guard
-            WHERE guard.current_stage = 3
+            WHERE guard.current_stage > 0
               AND (guard.exchange, guard.symbol) IN (
                   SELECT * FROM UNNEST(%s::TEXT[], %s::TEXT[])
               )
@@ -781,7 +932,7 @@ def load_previous_core_state_map() -> dict[tuple[str, str], dict]:
             ),
         )
         log(
-            "core_state_integrity restored unresolved stage3: "
+            "core_state_integrity restored unresolved stages: "
             + ", ".join(f"{exchange}:{symbol}" for exchange, symbol in recovered)
         )
     return state_map
@@ -1145,6 +1296,41 @@ def build_transition_history_record_v2(
     )
 
 
+def build_phase_decision_observation_row(
+    exchange: str,
+    symbol: str,
+    cycle_ts: datetime,
+    previous_stage: int,
+    target_stage: int,
+    stage_age_before_transition: float,
+    stage_age_after_transition: float,
+    trigger_age_minutes: float,
+    oi_summary: dict,
+    decision_reason: str,
+    guard_reason: str,
+    transition_permission_pre: str,
+) -> tuple:
+    """Create an observation with explicit pre/post transition semantics."""
+    return (
+        exchange,
+        symbol,
+        cycle_ts,
+        previous_stage,
+        target_stage,
+        round(stage_age_after_transition, 2),  # legacy field: post-transition age
+        round(stage_age_before_transition, 2),
+        round(stage_age_after_transition, 2),
+        round(trigger_age_minutes, 2),
+        oi_summary["oi_slope_class_15m"],
+        oi_summary["oi_slope_class_30m"],
+        oi_summary["oi_slope_class_1h"],
+        oi_summary["oi_slope_class_4h"],
+        decision_reason,
+        guard_reason,
+        transition_permission_pre,
+    )
+
+
 def compute_autonomous_oi_snapshot_from_latest_window_map(
     latest_window_map: dict[tuple[str, str], dict[str, dict[str, dict]]],
     cycle_ts: datetime | None = None,
@@ -1160,6 +1346,7 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
     core_rows_v2: list[tuple] = []
     window_rows_v2: list[tuple] = []
     history_rows_v2: list[tuple] = []
+    decision_observation_rows: list[tuple] = []
     next_state_map: dict[tuple[str, str], dict] = {}
 
     for (exchange, symbol), window_map in latest_window_map.items():
@@ -1222,6 +1409,15 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
                 f"stale_windows lag={round(stale_lag_minutes, 1)}m "
                 f"latest_window_ts={latest_symbol_ts.isoformat() if latest_symbol_ts else 'none'}"
             )
+        stage_age_before_transition = previous_stage_age_minutes
+        transition_permission_pre = compute_transition_permission(
+            previous_state,
+            target_stage,
+            stage_age_before_transition,
+            oi_summary,
+            price_summary,
+            trigger_age_minutes,
+        )
         stage_age_minutes = compute_stage_age(previous_state, target_stage, cycle_ts)
         transition_permission = compute_transition_permission(
             previous_state,
@@ -1233,9 +1429,25 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
         )
         if stale_windows:
             transition_permission = "skip:stale_windows"
+            transition_permission_pre = "skip:stale_windows"
         elif missing_senior_background_reason and target_stage <= 1:
             transition_permission = "нет_старшего_фона_4ч"
+            transition_permission_pre = "нет_старшего_фона_4ч"
         decision_reason = f"{decision_reason}; guard={guard_reason}"
+        decision_observation_rows.append(build_phase_decision_observation_row(
+            exchange=exchange,
+            symbol=symbol,
+            cycle_ts=cycle_ts,
+            previous_stage=previous_stage,
+            target_stage=target_stage,
+            stage_age_before_transition=stage_age_before_transition,
+            stage_age_after_transition=stage_age_minutes,
+            trigger_age_minutes=trigger_age_minutes,
+            oi_summary=oi_summary,
+            decision_reason=decision_reason,
+            guard_reason=str(guard_reason or ""),
+            transition_permission_pre=transition_permission_pre,
+        ))
         _record_transition_observation(
             previous_stage=previous_stage,
             target_stage=target_stage,
@@ -1348,6 +1560,7 @@ def compute_autonomous_oi_snapshot_from_latest_window_map(
         "core_rows_v2": core_rows_v2,
         "window_rows_v2": window_rows_v2,
         "history_rows_v2": history_rows_v2,
+        "decision_observation_rows": decision_observation_rows,
     }
     return core_rows, window_rows, history_rows, next_state_map
 
@@ -1622,6 +1835,7 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
     final_core_rows_v2: list[tuple] = []
     final_window_rows_v2: list[tuple] = []
     all_history_rows_v2: list[tuple] = []
+    all_decision_observation_rows: list[tuple] = []
     state_map = previous_state_map
 
     for source_cycle in source_cycles:
@@ -1631,20 +1845,27 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
             latest_window_map[key].setdefault(row["window_code"], {})
             latest_window_map[key][row["window_code"]][row["metric"]] = row
 
-        # A pair can remain in stage 2 while its next raw OI point arrives late.
-        # Re-evaluate only those pairs from history as of this global cycle so
-        # the live path matches the replay's age-based early-release decision.
+        # A pair can remain in stage 1/2 while its next symbol-level window is
+        # built after the global cycle already advanced progress. Re-evaluate
+        # only bounded near-maturity candidates from history as of this cycle so
+        # the live path stays aligned with replay without reopening the whole universe.
+        stage1_pairs = (
+            _active_stage1_recheck_pairs(state_map)
+            if os.getenv("ENABLE_STAGE1_HISTORY_RECHECK", "0") == "1"
+            else []
+        )
         stage2_pairs = _active_stage2_pairs(state_map)
-        stage2_history_window_map: dict[tuple[str, str], dict] = {}
-        if stage2_pairs:
-            stage2_history_window_map = load_latest_window_map(
+        history_recheck_pairs = list(dict.fromkeys(stage1_pairs + stage2_pairs))
+        history_recheck_window_map: dict[tuple[str, str], dict] = {}
+        if history_recheck_pairs:
+            history_recheck_window_map = load_latest_window_map(
                 source_cycle,
                 window_source="history",
-                tracked_pairs=stage2_pairs,
+                tracked_pairs=history_recheck_pairs,
             )
             _merge_window_maps(
                 latest_window_map,
-                stage2_history_window_map,
+                history_recheck_window_map,
             )
 
         final_core_rows, final_window_rows, history_rows, state_map = compute_autonomous_oi_snapshot_from_latest_window_map(
@@ -1652,10 +1873,17 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
             cycle_ts=source_cycle,
             previous_state_map=state_map,
         )
+        if stage1_pairs:
+            _record_stage1_history_recheck(
+                checked_pairs=stage1_pairs,
+                history_window_map=history_recheck_window_map,
+                core_rows=final_core_rows,
+                history_rows=history_rows,
+            )
         if stage2_pairs:
             _record_stage2_history_recheck(
                 checked_pairs=stage2_pairs,
-                history_window_map=stage2_history_window_map,
+                history_window_map=history_recheck_window_map,
                 core_rows=final_core_rows,
                 history_rows=history_rows,
             )
@@ -1664,12 +1892,14 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
         final_core_rows_v2 = list(v2_rows.get("core_rows_v2", []))
         final_window_rows_v2 = list(v2_rows.get("window_rows_v2", []))
         all_history_rows_v2.extend(v2_rows.get("history_rows_v2", []))
+        all_decision_observation_rows.extend(v2_rows.get("decision_observation_rows", []))
 
     if isinstance(state_map, dict):
         state_map["__v2_rows__"] = {
             "core_rows_v2": final_core_rows_v2,
             "window_rows_v2": final_window_rows_v2,
             "history_rows_v2": all_history_rows_v2,
+            "decision_observation_rows": all_decision_observation_rows,
         }
 
     return final_core_rows, final_window_rows, all_history_rows, state_map, source_cycles[-1]
@@ -1709,6 +1939,7 @@ def run_autonomous_oi_service(
     replace_core_state_v2(v2_rows.get("core_rows_v2", []))
     replace_window_state_v2(v2_rows.get("window_rows_v2", []))
     insert_transition_history_v2(v2_rows.get("history_rows_v2", []))
+    insert_phase_decision_observations(v2_rows.get("decision_observation_rows", []))
     if prune_counts:
         log(
             "prune_inactive_state_rows ok: "

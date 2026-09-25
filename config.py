@@ -28,7 +28,7 @@ def _load_fallback_env_file() -> None:
 _load_fallback_env_file()
 
 ИНТЕРВАЛ_ЦИКЛА_СЕК = int(os.getenv("COLLECT_INTERVAL_SECONDS", "300"))
-ДНЕЙ_ХРАНЕНИЯ = int(os.getenv("RETENTION_DAYS", "30"))
+ДНЕЙ_ХРАНЕНИЯ = int(os.getenv("RETENTION_DAYS", os.getenv("RAW_RETENTION_DAYS", "3")))
 
 ЛИМИТ_СИМВОЛОВ_BYBIT = int(os.getenv("LIMIT_SYMBOLS_BYBIT", "0"))
 ЛИМИТ_СИМВОЛОВ_BINANCE = int(os.getenv("LIMIT_SYMBOLS_BINANCE", "0"))
@@ -79,7 +79,7 @@ BINANCE_BASE = "https://fapi.binance.com"
     "Хранение истории: {retention} дней"
 )
 
-RAW_RETENTION_DAYS = int(os.getenv("RAW_RETENTION_DAYS", "7"))
+RAW_RETENTION_DAYS = int(os.getenv("RAW_RETENTION_DAYS", "3"))
 
 AGGREGATES_EVERY_CYCLES = int(os.getenv("AGGREGATES_EVERY_CYCLES", "1"))
 

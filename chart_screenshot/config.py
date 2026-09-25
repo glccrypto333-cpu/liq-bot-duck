@@ -6,6 +6,12 @@
 
 import os
 
+PLAYWRIGHT_BROWSERS_PATH = os.getenv(
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "/home/alexey/openclaw/runtime/playwright-browsers",
+)
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH)
+
 ENABLE_CHART_SCREENSHOT = os.getenv("ENABLE_CHART_SCREENSHOT", "true").lower() == "true"
 CHART_PROVIDER = os.getenv("CHART_PROVIDER", "coinglass")
 CHART_SCREENSHOT_DIR = os.getenv("CHART_SCREENSHOT_DIR", "/tmp/duck_chart_screenshots")

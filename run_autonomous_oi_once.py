@@ -4,7 +4,7 @@ from autonomous_oi_service import run_autonomous_oi_service
 
 
 def main() -> None:
-    rows = run_autonomous_oi_service()
+    rows = run_autonomous_oi_service(run_post_stage_analytics=False)
     print(rows)
 
 
