@@ -1,11 +1,38 @@
 from __future__ import annotations
 
-from phase_common import classify_oi_slope, value_slope_ratio
+from phase_common import value_slope_ratio
 
 PRICE_30M_STAGE3_BLOCK_CLASSES = {"weak_down", "strong_down"}
 PRICE_1H_STAGE3_BLOCK_CLASSES = {"weak_down", "strong_down"}
 PRICE_4H_HARD_BLOCK_CLASS = "strong_down"
 PRICE_4H_STAGE3_BLOCK_CLASS = "weak_down"
+
+# Price is directional: any close below the window open is down for the
+# 30m/1h Stage-3 entry gates. Keep the existing strong-down and all other
+# classification boundaries, including the 4h hard/soft split.
+PRICE_SLOPE_THRESHOLDS = {
+    "15м": {"strong_down": 0.97, "weak_down": 0.995, "flat_high": 1.0027, "weak_up": 1.012, "good_up": 1.035},
+    "30м": {"strong_down": 0.96, "weak_down": 1.0, "flat_high": 1.0044, "weak_up": 1.012, "good_up": 1.05},
+    "1ч": {"strong_down": 0.95, "weak_down": 1.0, "flat_high": 1.0040, "weak_up": 1.015, "good_up": 1.05},
+    "4ч": {"strong_down": 0.94, "weak_down": 0.996, "flat_high": 1.01, "weak_up": 1.035, "good_up": 1.095},
+    "12ч": {"strong_down": 0.94, "weak_down": 0.99, "flat_high": 1.018, "weak_up": 1.05, "good_up": 1.13},
+    "24ч": {"strong_down": 0.94, "weak_down": 0.99, "flat_high": 1.018, "weak_up": 1.05, "good_up": 1.13},
+}
+
+
+def classify_price_slope(window_code: str, slope_ratio: float) -> str:
+    thresholds = PRICE_SLOPE_THRESHOLDS.get(window_code, PRICE_SLOPE_THRESHOLDS["4ч"])
+    if slope_ratio < thresholds["strong_down"]:
+        return "strong_down"
+    if slope_ratio < thresholds["weak_down"]:
+        return "weak_down"
+    if slope_ratio <= thresholds["flat_high"]:
+        return "flat"
+    if slope_ratio <= thresholds["weak_up"]:
+        return "weak_up"
+    if slope_ratio <= thresholds["good_up"]:
+        return "good_up"
+    return "strong_up"
 
 
 def compute_price_window_state(window_payload: dict[str, dict[str, dict] | None], oi_state: dict, window_code: str) -> dict:
@@ -13,7 +40,7 @@ def compute_price_window_state(window_payload: dict[str, dict[str, dict] | None]
 
     row = window_payload[window_code]["PRICE"]
     slope_ratio = value_slope_ratio(row)
-    slope_class = classify_oi_slope(window_code, slope_ratio)
+    slope_class = classify_price_slope(window_code, slope_ratio)
 
     if window_code == "4ч" and slope_class == PRICE_4H_HARD_BLOCK_CLASS:
         state = "цена_4ч_сильно_вниз"
