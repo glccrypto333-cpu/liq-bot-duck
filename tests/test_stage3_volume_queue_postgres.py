@@ -83,10 +83,10 @@ def _stage3_candidate(symbol, transition_at, observed_at, *, status="waiting_vol
     return {
         "exchange": "BINANCE", "symbol": symbol, "source": "BINANCE", "source_symbol": symbol,
         "transition_ts": transition_at, "observed_at": observed_at,
-        "status": status, "gate_status": "pass" if status == "unlocked" else "below_100pct",
-        "ready": True, "volume_unlocked_at": observed_at if status == "unlocked" else None,
+        "status": status, "gate_status": "pass" if status in {"unlocked", "invalidated_price"} else "below_100pct",
+        "ready": True, "volume_unlocked_at": observed_at if status in {"unlocked", "invalidated_price"} else None,
         "growth_4h_pct": growth, "quality_reason": "ready",
-        "observation_snapshot": snapshot, "volume_snapshot": snapshot if status == "unlocked" else None,
+        "observation_snapshot": snapshot, "volume_snapshot": snapshot if status in {"unlocked", "invalidated_price"} else None,
     }
 
 
