@@ -166,3 +166,74 @@ def test_non_finite_or_negative_quote_turnover_is_not_a_ready_volume_window():
         assert snapshot["ready"] is False
         assert snapshot["reason"] == "invalid_quote_turnover"
         assert snapshot["growth_4h_pct"] is None
+
+
+def test_readiness_summary_counts_only_universe_eligible_pairs():
+    from quote_turnover_snapshot import summarize_quote_turnover_readiness
+
+    now_ms = 1790515200000
+    rows = [
+        {"exchange": "BINANCE", "symbol": "READYUSDT", "ready": True, "quality_reason": "ready"},
+        {"exchange": "BYBIT", "symbol": "WARMUSDT", "ready": False, "quality_reason": "warming_up"},
+        {"exchange": "BYBIT", "symbol": "BLOCKEDUSDT", "ready": False, "quality_reason": "invalid_previous_window"},
+    ]
+    universe = {
+        "generated_at_ms": now_ms,
+        "refresh_seconds": 300,
+        "rows": [
+            {"exchange": "BINANCE", "symbol": "READYUSDT", "eligible": True},
+            {"exchange": "BYBIT", "symbol": "WARMUSDT", "eligible": True},
+            {"exchange": "BYBIT", "symbol": "BLOCKEDUSDT", "eligible": False},
+        ],
+    }
+
+    summary = summarize_quote_turnover_readiness(rows, universe, now_ms=now_ms)
+
+    assert summary == {
+        "total": 2,
+        "ready": 1,
+        "not_ready": 1,
+        "warming": 1,
+        "stale": 0,
+        "excluded_by_universe": 1,
+        "universe_unknown": 0,
+        "universe_status": "ok",
+        "updated_at": None,
+    }
+
+
+def test_readiness_summary_does_not_claim_eligible_when_universe_is_stale():
+    from quote_turnover_snapshot import summarize_quote_turnover_readiness
+
+    rows = [{"exchange": "BYBIT", "symbol": "XUSDT", "ready": True, "quality_reason": "ready"}]
+    universe = {
+        "generated_at_ms": 1000,
+        "refresh_seconds": 300,
+        "rows": [{"exchange": "BYBIT", "symbol": "XUSDT", "eligible": True}],
+    }
+
+    summary = summarize_quote_turnover_readiness(rows, universe, now_ms=999999)
+
+    assert summary["total"] == 0
+    assert summary["ready"] == 0
+    assert summary["excluded_by_universe"] == 0
+    assert summary["universe_unknown"] == 1
+    assert summary["universe_status"] == "stale"
+
+
+def test_readiness_summary_treats_malformed_eligibility_as_unknown():
+    from quote_turnover_snapshot import summarize_quote_turnover_readiness
+
+    now_ms = 1790515200000
+    rows = [{"exchange": "BYBIT", "symbol": "XUSDT", "ready": True, "quality_reason": "ready"}]
+    universe = {
+        "generated_at_ms": now_ms,
+        "refresh_seconds": 300,
+        "rows": [{"exchange": "BYBIT", "symbol": "XUSDT", "eligible": "false"}],
+    }
+
+    summary = summarize_quote_turnover_readiness(rows, universe, now_ms=now_ms)
+
+    assert summary["total"] == 0
+    assert summary["excluded_by_universe"] == 0
+    assert summary["universe_unknown"] == 1

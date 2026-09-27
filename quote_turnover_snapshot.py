@@ -5,12 +5,90 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Any, Iterable
+import os
+import time
 
 
 POINTS_PER_4H = 48
 POINTS_REQUIRED = POINTS_PER_4H * 2
 FIVE_MINUTES = timedelta(minutes=5)
 MAX_FRESHNESS = timedelta(minutes=10)
+
+
+def summarize_quote_turnover_readiness(
+    rows: Iterable[dict[str, Any]],
+    universe_payload: dict[str, Any] | None,
+    *,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    # Missing/stale universe evidence is uncertainty, not eligibility.
+    active_rows = list(rows)
+    summary = {
+        "total": 0,
+        "ready": 0,
+        "not_ready": 0,
+        "warming": 0,
+        "stale": 0,
+        "excluded_by_universe": 0,
+        "universe_unknown": 0,
+        "universe_status": "unavailable",
+        "updated_at": None,
+    }
+    if not isinstance(universe_payload, dict) or not isinstance(universe_payload.get("rows"), list):
+        summary["universe_unknown"] = len(active_rows)
+        return summary
+
+    try:
+        generated_at_ms = int(universe_payload.get("generated_at_ms"))
+        refresh_seconds = float(universe_payload.get("refresh_seconds") or 300.0)
+    except (TypeError, ValueError):
+        summary["universe_unknown"] = len(active_rows)
+        summary["universe_status"] = "invalid"
+        return summary
+    configured_max_age = os.getenv("ASSET_UNIVERSE_MAX_AGE_SECONDS", "").strip()
+    try:
+        max_age_seconds = max(30.0, float(configured_max_age)) if configured_max_age else max(60.0, refresh_seconds * 2.0 + 60.0)
+    except ValueError:
+        max_age_seconds = max(60.0, refresh_seconds * 2.0 + 60.0)
+    age_seconds = max(0.0, ((now_ms if now_ms is not None else int(time.time() * 1000)) - generated_at_ms) / 1000.0)
+    if age_seconds > max_age_seconds:
+        summary["universe_unknown"] = len(active_rows)
+        summary["universe_status"] = "stale"
+        return summary
+
+    universe_by_pair = {
+        (str(item.get("exchange") or "").strip().upper(), str(item.get("symbol") or "").strip().upper()): item
+        for item in universe_payload["rows"]
+        if isinstance(item, dict)
+    }
+    summary["universe_status"] = "ok"
+    updated_at = []
+    for row in active_rows:
+        key = (
+            str(row.get("exchange") or "").strip().upper(),
+            str(row.get("symbol") or "").strip().upper(),
+        )
+        universe_row = universe_by_pair.get(key)
+        if universe_row is None or universe_row.get("eligible") not in (True, False):
+            summary["universe_unknown"] += 1
+            continue
+        if universe_row["eligible"] is False:
+            summary["excluded_by_universe"] += 1
+            continue
+        summary["total"] += 1
+        if bool(row.get("ready")):
+            summary["ready"] += 1
+        else:
+            summary["not_ready"] += 1
+        reason = str(row.get("quality_reason") or "").strip().lower()
+        if reason in {"warming_up", "warming_up_quote_history"}:
+            summary["warming"] += 1
+        if reason == "stale":
+            summary["stale"] += 1
+        if row.get("updated_at") is not None:
+            updated_at.append(row["updated_at"])
+    summary["updated_at"] = max(updated_at) if updated_at else None
+    return summary
 
 
 def stage3_price_veto_reason(

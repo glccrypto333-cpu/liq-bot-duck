@@ -73,3 +73,38 @@ def test_backfill_targets_are_bounded_and_only_for_non_ready_pairs(monkeypatch):
     assert db.select_quote_turnover_backfill_targets(24) == {("BYBIT", "NEWUSDT")}
     assert captured["params"] == (24,)
     assert "quote_turnover_state" in captured["sql"]
+
+
+def test_readiness_health_summary_uses_active_pairs_and_separates_universe_exclusions(monkeypatch):
+    captured = {}
+    rows = [
+        {"exchange": "BINANCE", "symbol": "READYUSDT", "ready": True, "quality_reason": "ready", "updated_at": None},
+        {"exchange": "BYBIT", "symbol": "WARMUSDT", "ready": False, "quality_reason": "warming_up", "updated_at": None},
+        {"exchange": "BYBIT", "symbol": "BLOCKEDUSDT", "ready": False, "quality_reason": "invalid_previous_window", "updated_at": None},
+    ]
+    universe = {
+        "generated_at_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
+        "refresh_seconds": 300,
+        "rows": [
+            {"exchange": "BINANCE", "symbol": "READYUSDT", "eligible": True},
+            {"exchange": "BYBIT", "symbol": "WARMUSDT", "eligible": True},
+            {"exchange": "BYBIT", "symbol": "BLOCKEDUSDT", "eligible": False},
+        ],
+    }
+
+    def fake_fetch(sql):
+        captured["sql"] = sql
+        return rows
+
+    monkeypatch.setattr(db, "DATABASE_URL", "postgres://test")
+    monkeypatch.setattr(db, "fetch", fake_fetch)
+    monkeypatch.setattr(db, "_read_asset_universe_snapshot", lambda: universe)
+
+    summary = db.quote_turnover_state_summary()
+
+    assert "FROM active_symbol_universe u" in captured["sql"]
+    assert "LEFT JOIN quote_turnover_state q" in captured["sql"]
+    assert summary["total"] == 2
+    assert summary["ready"] == 1
+    assert summary["not_ready"] == 1
+    assert summary["excluded_by_universe"] == 1

@@ -5,7 +5,8 @@ from psycopg.rows import dict_row
 from config import DATABASE_URL, RAW_RETENTION_DAYS
 import os
 import time
-from quote_turnover_snapshot import build_quote_turnover_state_rows
+from pathlib import Path
+from quote_turnover_snapshot import build_quote_turnover_state_rows, summarize_quote_turnover_readiness
 
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "60000"))
 from logger import log
@@ -1102,20 +1103,29 @@ def refresh_quote_turnover_state(source_cycle_ts) -> dict:
 
 
 
+def _read_asset_universe_snapshot() -> dict | None:
+    path = os.getenv("ASSET_UNIVERSE_SNAPSHOT_PATH", "/home/alexey/openclaw/runtime/asset_universe.json")
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def quote_turnover_state_summary() -> dict:
-    """Return bounded readiness counters for runtime health and the dashboard."""
+    """Summarize volume readiness for active pairs, separating universe exclusions."""
     if not DATABASE_URL:
-        return {"total": 0, "ready": 0, "not_ready": 0, "warming": 0, "stale": 0, "updated_at": None}
+        return summarize_quote_turnover_readiness([], None)
     rows = fetch("""
-        SELECT COUNT(*) AS total,
-               COUNT(*) FILTER (WHERE ready) AS ready,
-               COUNT(*) FILTER (WHERE NOT ready) AS not_ready,
-               COUNT(*) FILTER (WHERE quality_reason IN ('warming_up', 'warming_up_quote_history')) AS warming,
-               COUNT(*) FILTER (WHERE quality_reason = 'stale') AS stale,
-               MAX(updated_at) AS updated_at
-        FROM quote_turnover_state
+        SELECT u.exchange, u.symbol,
+               COALESCE(q.ready, FALSE) AS ready,
+               q.quality_reason, q.updated_at
+        FROM active_symbol_universe u
+        LEFT JOIN quote_turnover_state q
+          ON q.exchange = u.exchange AND q.symbol = u.symbol
+        ORDER BY u.exchange, u.symbol
     """)
-    return dict(rows[0]) if rows else {"total": 0, "ready": 0, "not_ready": 0, "warming": 0, "stale": 0, "updated_at": None}
+    return summarize_quote_turnover_readiness(rows or [], _read_asset_universe_snapshot())
 
 
 def sync_stage3_volume_queue(candidates: list[dict]) -> dict:

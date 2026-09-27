@@ -1687,7 +1687,7 @@ def _write_runtime_health_snapshot(
     try:
         quote_turnover_summary = quote_turnover_state_summary()
     except Exception as exc:
-        quote_turnover_summary = {"total": 0, "ready": 0, "warming": 0, "stale": 0, "error": type(exc).__name__}
+        quote_turnover_summary = {"total": 0, "ready": 0, "not_ready": 0, "warming": 0, "stale": 0, "excluded_by_universe": 0, "universe_unknown": 0, "universe_status": "unavailable", "error": type(exc).__name__}
     runtime_health = {
         "updated_at_utc": iso_мск(),
         "app_version": APP_VERSION,
