@@ -128,6 +128,14 @@ def stage3_price_veto_reason(
     return None
 
 
+def should_validate_stage3_price_gate(*, universe_allowed: bool, candidate_status: str, previous_queue_status: str | None) -> bool:
+    """Only check PRICE for a live unlocked Telegram candidate, never a terminal one."""
+    terminal_statuses = {"sent", "invalidated", "invalidated_oi1h", "invalidated_price"}
+    if not universe_allowed or str(candidate_status or "") != "unlocked":
+        return False
+    return str(previous_queue_status or "") not in terminal_statuses
+
+
 def build_stage3_price_snapshot(
     rows: Iterable[dict[str, Any]],
     *,

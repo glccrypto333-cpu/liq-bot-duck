@@ -1,6 +1,23 @@
 from datetime import datetime, timedelta, timezone
 
 
+def test_stage3_price_gate_skips_sent_and_terminal_queue_candidates():
+    from quote_turnover_snapshot import should_validate_stage3_price_gate
+
+    for terminal_status in ("sent", "invalidated", "invalidated_oi1h", "invalidated_price"):
+        assert not should_validate_stage3_price_gate(
+            universe_allowed=True,
+            candidate_status="unlocked",
+            previous_queue_status=terminal_status,
+        )
+
+    assert should_validate_stage3_price_gate(
+        universe_allowed=True,
+        candidate_status="unlocked",
+        previous_queue_status="waiting_volume",
+    )
+
+
 def test_stage3_price_veto_accepts_exact_or_previous_fresh_closed_window():
     from quote_turnover_snapshot import stage3_price_veto_reason
 

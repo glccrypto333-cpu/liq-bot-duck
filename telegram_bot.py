@@ -32,6 +32,7 @@ from quote_turnover_snapshot import (
     build_current_4h_distribution,
     evaluate_stage3_volume_candidate,
     build_stage3_price_snapshot,
+    should_validate_stage3_price_gate,
     stage3_price_veto_reason,
 )
 
@@ -4119,9 +4120,14 @@ def check_stage3_alerts() -> dict:
         observation_snapshot["oi_1h_class"] = oi_1h_class
         observation_snapshot["oi_cycle_ts"] = oi_cycle_ts.isoformat() if oi_cycle_ts else None
         price_snapshot = {}
+        validate_price_gate = should_validate_stage3_price_gate(
+            universe_allowed=universe_decision.allowed,
+            candidate_status=decision["status"],
+            previous_queue_status=state.get("existing_queue_status"),
+        )
         # Pairs excluded by the asset universe never become Telegram candidates;
         # do not run candidate-only price validation or raise data incidents for them.
-        if universe_decision.allowed and decision["volume_unlocked_at"] is not None:
+        if validate_price_gate and decision["volume_unlocked_at"] is not None:
             if volume_unlock_cycle_ts is None:
                 price_snapshot = {
                     "price_30m_cycle_ts": None,
@@ -4179,7 +4185,7 @@ def check_stage3_alerts() -> dict:
                 volume_unlocked_at=decision["volume_unlocked_at"],
                 volume_unlock_cycle_ts=volume_unlock_cycle_ts,
             )
-            if universe_decision.allowed
+            if validate_price_gate
             else None
         )
         # Freeze the first qualifying evidence for delivery; keep each cycle separately below.
