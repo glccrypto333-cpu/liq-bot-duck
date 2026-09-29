@@ -440,6 +440,7 @@ def test_stage3_universe_block_is_terminal_not_an_unlocked_queue_item(monkeypatc
     assert blocked[0][0:2] == ("BYBIT", "STOCKUSDT")
     assert blocked[0][3] == "blocked:asset_class_stock"
     assert result["signals_filtered_by_universe"] == 1
+    assert result["stage3_price_data_incident_count"] == 0
     assert result["stage3_volume_queue"]["unlocked"] == 0
 
 def test_db_quote_turnover_state_builds_distribution_from_persisted_raw_window(monkeypatch):

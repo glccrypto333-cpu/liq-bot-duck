@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 
-def test_stage3_price_veto_requires_same_cycle_as_first_volume_unlock():
+def test_stage3_price_veto_accepts_exact_or_previous_fresh_closed_window():
     from quote_turnover_snapshot import stage3_price_veto_reason
 
     transition = datetime(2026, 9, 24, 6, 0, tzinfo=timezone.utc)
@@ -11,7 +11,8 @@ def test_stage3_price_veto_requires_same_cycle_as_first_volume_unlock():
         assert stage3_price_veto_reason(
             price_30m_class=down_class,
             price_1h_class="good_up",
-            price_cycle_ts=unlock,
+            price_30m_cycle_ts=unlock,
+            price_1h_cycle_ts=unlock - timedelta(minutes=5),
             transition_ts=transition,
             volume_unlocked_at=unlock,
             volume_unlock_cycle_ts=unlock,
@@ -19,36 +20,85 @@ def test_stage3_price_veto_requires_same_cycle_as_first_volume_unlock():
         assert stage3_price_veto_reason(
             price_30m_class="flat",
             price_1h_class=down_class,
-            price_cycle_ts=unlock,
+            price_30m_cycle_ts=unlock - timedelta(minutes=5),
+            price_1h_cycle_ts=unlock,
             transition_ts=transition,
             volume_unlocked_at=unlock,
             volume_unlock_cycle_ts=unlock,
         ) == "blocked:price_1h_down_at_volume_unlock"
 
     assert stage3_price_veto_reason(
-        price_30m_class="strong_down",
+        price_30m_class="good_up",
         price_1h_class="flat",
-        price_cycle_ts=unlock + timedelta(minutes=5),
+        price_30m_cycle_ts=unlock,
+        price_1h_cycle_ts=unlock - timedelta(minutes=5),
         transition_ts=transition,
         volume_unlocked_at=unlock,
-            volume_unlock_cycle_ts=unlock,
+        volume_unlock_cycle_ts=unlock,
     ) is None
+
+    for stale_or_future in (unlock - timedelta(minutes=10), unlock + timedelta(minutes=5), None):
+        assert stage3_price_veto_reason(
+            price_30m_class="strong_down",
+            price_1h_class="flat",
+            price_30m_cycle_ts=unlock,
+            price_1h_cycle_ts=stale_or_future,
+            transition_ts=transition,
+            volume_unlocked_at=unlock,
+            volume_unlock_cycle_ts=unlock,
+        ) == "blocked:missing_fresh_price_at_volume_unlock"
+
+
+
+def test_stage3_price_veto_fails_closed_when_unlock_anchor_is_missing():
+    from quote_turnover_snapshot import stage3_price_veto_reason
+
+    transition = datetime(2026, 9, 24, 6, 0, tzinfo=timezone.utc)
+    unlocked_at = datetime(2026, 9, 24, 7, 0, tzinfo=timezone.utc)
     assert stage3_price_veto_reason(
-        price_30m_class="weak_down",
-        price_1h_class="flat",
-        price_cycle_ts=unlock - timedelta(minutes=5),
+        price_30m_class="good_up",
+        price_1h_class="good_up",
+        price_30m_cycle_ts=unlocked_at,
+        price_1h_cycle_ts=unlocked_at,
         transition_ts=transition,
-        volume_unlocked_at=unlock,
-            volume_unlock_cycle_ts=unlock,
-    ) is None
-    assert stage3_price_veto_reason(
-        price_30m_class="strong_down",
-        price_1h_class="flat",
-        price_cycle_ts=unlock,
-        transition_ts=unlock,
-        volume_unlocked_at=unlock,
-            volume_unlock_cycle_ts=unlock,
-    ) is None
+        volume_unlocked_at=unlocked_at,
+        volume_unlock_cycle_ts=None,
+    ) == "blocked:missing_fresh_price_at_volume_unlock"
+
+def test_stage3_price_snapshot_uses_latest_closed_cycle_not_future_data():
+    from quote_turnover_snapshot import build_stage3_price_snapshot
+
+    transition = datetime(2026, 9, 24, 6, 0, tzinfo=timezone.utc)
+    unlock = datetime(2026, 9, 24, 7, 0, tzinfo=timezone.utc)
+    rows = [
+        {"window_code": "30м", "ts_close": unlock - timedelta(minutes=5), "open_value": 100, "close_value": 99},
+        {"window_code": "30м", "ts_close": unlock, "open_value": 100, "close_value": 101},
+        {"window_code": "30м", "ts_close": unlock + timedelta(minutes=5), "open_value": 100, "close_value": 80},
+        {"window_code": "1ч", "ts_close": unlock - timedelta(minutes=5), "open_value": 100, "close_value": 99},
+    ]
+
+    snapshot = build_stage3_price_snapshot(
+        rows, transition_ts=transition, volume_unlock_cycle_ts=unlock,
+    )
+    assert snapshot["price_30m_cycle_ts"] == unlock
+    assert snapshot["price_30m_class"] in {"weak_up", "good_up", "strong_up"}
+    assert snapshot["price_1h_cycle_ts"] == unlock - timedelta(minutes=5)
+    assert snapshot["price_1h_class"] == "weak_down"
+    assert snapshot["price_data_error"] is None
+
+
+def test_stage3_price_snapshot_reports_missing_fresh_window_as_data_error():
+    from quote_turnover_snapshot import build_stage3_price_snapshot
+
+    transition = datetime(2026, 9, 24, 6, 0, tzinfo=timezone.utc)
+    unlock = datetime(2026, 9, 24, 7, 0, tzinfo=timezone.utc)
+    snapshot = build_stage3_price_snapshot(
+        [{"window_code": "30м", "ts_close": unlock, "open_value": 100, "close_value": 99}],
+        transition_ts=transition,
+        volume_unlock_cycle_ts=unlock,
+    )
+    assert snapshot["price_data_error"] == "missing_fresh_closed_window:1ч"
+    assert snapshot["price_1h_cycle_ts"] is None
 
 
 def test_stage3_candidate_waits_below_threshold_without_expiry():
@@ -200,7 +250,8 @@ def test_stage3_price_veto_uses_volume_cycle_not_collection_timestamp():
     assert stage3_price_veto_reason(
         price_30m_class="strong_down",
         price_1h_class="weak_down",
-        price_cycle_ts=volume_cycle,
+        price_30m_cycle_ts=volume_cycle,
+        price_1h_cycle_ts=volume_cycle,
         transition_ts=transition,
         volume_unlocked_at=collection_time,
         volume_unlock_cycle_ts=volume_cycle,
@@ -209,19 +260,22 @@ def test_stage3_price_veto_uses_volume_cycle_not_collection_timestamp():
     assert stage3_price_veto_reason(
         price_30m_class="strong_down",
         price_1h_class="weak_down",
-        price_cycle_ts=volume_cycle - timedelta(minutes=5),
+        price_30m_cycle_ts=volume_cycle - timedelta(minutes=5),
+        price_1h_cycle_ts=volume_cycle - timedelta(minutes=5),
         transition_ts=transition,
         volume_unlocked_at=collection_time,
         volume_unlock_cycle_ts=volume_cycle,
-    ) is None
+    ) == "blocked:price_30m_down_at_volume_unlock"
 
-    # A later price decline must not veto a candidate after its first volume unlock.
+    # A future cycle cannot replace the frozen unlock snapshot; if the historical
+    # unlock-cycle window is absent, fail closed as a data error.
     later_cycle = volume_cycle + timedelta(minutes=5)
     assert stage3_price_veto_reason(
         price_30m_class="strong_down",
         price_1h_class="weak_down",
-        price_cycle_ts=later_cycle,
+        price_30m_cycle_ts=later_cycle,
+        price_1h_cycle_ts=later_cycle,
         transition_ts=transition,
         volume_unlocked_at=collection_time,
         volume_unlock_cycle_ts=volume_cycle,
-    ) is None
+    ) == "blocked:missing_fresh_price_at_volume_unlock"

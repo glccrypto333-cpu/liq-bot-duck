@@ -1648,6 +1648,14 @@ def _write_runtime_health_snapshot(
     runtime_alerts.extend(universe_state.get("listing_alerts", []))
 
     signal_info = stage3_alert_info or {}
+    price_data_incidents = list(signal_info.get("stage3_price_data_incidents") or [])
+    if price_data_incidents:
+        examples = ",".join(
+            f"{item.get('exchange')}:{item.get('symbol')}" for item in price_data_incidents[:5]
+        )
+        runtime_alerts.append(
+            f"CRITICAL_stage3_price_data_missing count={int(signal_info.get('stage3_price_data_incident_count', len(price_data_incidents)) or 0)} pairs={examples}"
+        )
     universe_summary = universe_health.get("summary", {}) or {}
     symbols_total = int(universe_state.get("active_total", 0) or 0)
     symbols_by_exchange = {
@@ -1707,6 +1715,7 @@ def _write_runtime_health_snapshot(
         "runtime_alert_count": len(runtime_alerts),
         "quote_turnover": quote_turnover_summary,
         "stage3_volume_queue": dict((stage3_alert_info or {}).get("stage3_volume_queue") or {}),
+        "stage3_price_data_incident_count": int(signal_info.get("stage3_price_data_incident_count", 0) or 0),
         "cycle_health": cycle_health,
         "bybit_symbols": len(bybit_symbols),
         "binance_symbols": len(binance_symbols),

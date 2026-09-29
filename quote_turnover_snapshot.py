@@ -8,6 +8,8 @@ from typing import Any, Iterable
 import os
 import time
 
+from price_service import classify_price_slope
+
 
 POINTS_PER_4H = 48
 POINTS_REQUIRED = POINTS_PER_4H * 2
@@ -95,27 +97,82 @@ def stage3_price_veto_reason(
     *,
     price_30m_class: str | None,
     price_1h_class: str | None,
-    price_cycle_ts: datetime | None,
+    price_30m_cycle_ts: datetime | None,
+    price_1h_cycle_ts: datetime | None,
     transition_ts: datetime | None,
     volume_unlocked_at: datetime | None,
     volume_unlock_cycle_ts: datetime | None,
 ) -> str | None:
-    """Veto only on falling price in the frozen first volume-unlock cycle."""
-    if (
-        transition_ts is None
-        or volume_unlocked_at is None
-        or volume_unlock_cycle_ts is None
-        or price_cycle_ts is None
-        or price_cycle_ts != volume_unlock_cycle_ts
-        or price_cycle_ts <= transition_ts
-    ):
+    """Gate the first volume-unlocked card with fresh closed PRICE windows."""
+    if transition_ts is None or volume_unlocked_at is None:
         return None
+    if volume_unlock_cycle_ts is None:
+        return "blocked:missing_fresh_price_at_volume_unlock"
+
+    oldest_accepted = volume_unlock_cycle_ts - FIVE_MINUTES
+    if not price_30m_class or not price_1h_class:
+        return "blocked:missing_fresh_price_at_volume_unlock"
+    for cycle_ts in (price_30m_cycle_ts, price_1h_cycle_ts):
+        if (
+            cycle_ts is None
+            or cycle_ts > volume_unlock_cycle_ts
+            or cycle_ts < oldest_accepted
+            or cycle_ts <= transition_ts
+        ):
+            return "blocked:missing_fresh_price_at_volume_unlock"
 
     if str(price_30m_class or "").lower() in {"weak_down", "strong_down"}:
         return "blocked:price_30m_down_at_volume_unlock"
     if str(price_1h_class or "").lower() in {"weak_down", "strong_down"}:
         return "blocked:price_1h_down_at_volume_unlock"
     return None
+
+
+def build_stage3_price_snapshot(
+    rows: Iterable[dict[str, Any]],
+    *,
+    transition_ts: datetime,
+    volume_unlock_cycle_ts: datetime,
+) -> dict[str, Any]:
+    """Select each latest closed 30m/1h PRICE window at unlock (same or prior <=5m)."""
+    oldest_accepted = volume_unlock_cycle_ts - FIVE_MINUTES
+    selected: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = str(row.get("window_code") or "")
+        cycle_ts = row.get("ts_close")
+        if code not in {"30м", "1ч"} or cycle_ts is None:
+            continue
+        if cycle_ts > volume_unlock_cycle_ts or cycle_ts < oldest_accepted or cycle_ts <= transition_ts:
+            continue
+        current = selected.get(code)
+        if current is None or cycle_ts > current["ts_close"]:
+            selected[code] = row
+
+    snapshot: dict[str, Any] = {
+        "price_30m_cycle_ts": None,
+        "price_1h_cycle_ts": None,
+        "price_30m_class": None,
+        "price_1h_class": None,
+        "price_veto_anchor_ts": volume_unlock_cycle_ts,
+        "price_data_error": None,
+    }
+    missing = []
+    for code, key in (("30м", "30m"), ("1ч", "1h")):
+        row = selected.get(code)
+        open_value = row.get("open_value") if row else None
+        close_value = row.get("close_value") if row else None
+        try:
+            ratio = float(close_value) / float(open_value)
+            if not (ratio > 0):
+                raise ValueError("non-positive price ratio")
+        except (TypeError, ValueError, ZeroDivisionError):
+            missing.append(code)
+            continue
+        snapshot[f"price_{key}_cycle_ts"] = row["ts_close"]
+        snapshot[f"price_{key}_class"] = classify_price_slope(code, ratio)
+    if missing:
+        snapshot["price_data_error"] = "missing_fresh_closed_window:" + ",".join(missing)
+    return snapshot
 
 def build_current_4h_distribution(
     quote_values: Iterable[Any],

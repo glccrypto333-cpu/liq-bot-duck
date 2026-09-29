@@ -1174,8 +1174,9 @@ def sync_stage3_volume_queue(candidates: list[dict]) -> dict:
                         WHEN EXCLUDED.status='invalidated_price'
                           AND (
                             stage3_volume_queue.volume_unlocked_at IS NULL
-                            OR NULLIF(EXCLUDED.volume_snapshot->>'price_cycle_ts','')::timestamptz
+                            OR NULLIF(EXCLUDED.volume_snapshot->>'price_veto_anchor_ts','')::timestamptz
                                = stage3_volume_queue.volume_unlocked_at
+                            OR NULLIF(EXCLUDED.volume_snapshot->>'price_data_error','') IS NOT NULL
                           )
                         THEN 'invalidated_price'
                         WHEN EXCLUDED.status='blocked_universe' THEN 'blocked_universe'
@@ -1214,8 +1215,9 @@ def sync_stage3_volume_queue(candidates: list[dict]) -> dict:
                         WHEN EXCLUDED.status='invalidated_price'
                           AND (
                             stage3_volume_queue.volume_unlocked_at IS NULL
-                            OR NULLIF(EXCLUDED.volume_snapshot->>'price_cycle_ts','')::timestamptz
+                            OR NULLIF(EXCLUDED.volume_snapshot->>'price_veto_anchor_ts','')::timestamptz
                                = stage3_volume_queue.volume_unlocked_at
+                            OR NULLIF(EXCLUDED.volume_snapshot->>'price_data_error','') IS NOT NULL
                           )
                         THEN COALESCE(stage3_volume_queue.terminal_at,NOW())
                         WHEN EXCLUDED.status='blocked_universe' THEN COALESCE(stage3_volume_queue.terminal_at,NOW())

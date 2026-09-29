@@ -31,6 +31,7 @@ from quote_turnover_snapshot import (
     POINTS_PER_4H,
     build_current_4h_distribution,
     evaluate_stage3_volume_candidate,
+    build_stage3_price_snapshot,
     stage3_price_veto_reason,
 )
 
@@ -3991,6 +3992,27 @@ def _build_stage3_alert_text(r: dict) -> str:
         transition_ts=transition_ts,
         transition_reason=transition_reason,
     )
+def _stage3_price_snapshot_at_unlock(exchange: str, symbol: str, transition_ts, unlock_cycle_ts) -> dict:
+    """Read latest source-native closed PRICE windows available at the frozen volume anchor."""
+    rows = _safe_rows("""
+        SELECT window_code, ts_close, open_value, close_value
+        FROM aggregate_windows_history
+        WHERE metric='PRICE'
+          AND exchange=%s AND symbol=%s
+          AND window_code IN ('30м','1ч')
+          AND ts_close <= %s
+          AND ts_close >= %s - INTERVAL '5 minutes'
+          AND ts_close > %s
+        ORDER BY window_code, ts_close DESC
+    """, (exchange, symbol, unlock_cycle_ts, unlock_cycle_ts, transition_ts))
+    snapshot = build_stage3_price_snapshot(
+        rows or [],
+        transition_ts=transition_ts,
+        volume_unlock_cycle_ts=unlock_cycle_ts,
+    )
+    return snapshot
+
+
 def check_stage3_alerts() -> dict:
     alerted = _read_stage3_alerted_keys()
     try:
@@ -4061,6 +4083,7 @@ def check_stage3_alerts() -> dict:
     # One current transition per pair stays queued until the canonical phase exits 3.
     queue_candidates = []
     universe_decisions = {}
+    price_data_incidents = []
     for row in rows:
         transition_ts = row.get("stage3_transition_ts")
         exchange = str(row.get("exchange") or "").upper()
@@ -4091,16 +4114,50 @@ def check_stage3_alerts() -> dict:
         observation_snapshot = _stage3_volume_observation_snapshot(state)
         oi_1h_class = str(row.get("stage3_oi_1h_class") or "").lower() or None
         oi_cycle_ts = row.get("stage3_oi_1h_cycle_ts")
-        price_30m_class = str(row.get("stage3_price_30m_class") or "").lower() or None
-        price_1h_class = str(row.get("stage3_price_1h_class") or "").lower() or None
-        price_cycle_ts = row.get("stage3_price_cycle_ts")
         if observation_snapshot is None:
             observation_snapshot = {}
         observation_snapshot["oi_1h_class"] = oi_1h_class
         observation_snapshot["oi_cycle_ts"] = oi_cycle_ts.isoformat() if oi_cycle_ts else None
+        price_snapshot = {}
+        # Pairs excluded by the asset universe never become Telegram candidates;
+        # do not run candidate-only price validation or raise data incidents for them.
+        if universe_decision.allowed and decision["volume_unlocked_at"] is not None:
+            if volume_unlock_cycle_ts is None:
+                price_snapshot = {
+                    "price_30m_cycle_ts": None,
+                    "price_1h_cycle_ts": None,
+                    "price_30m_class": None,
+                    "price_1h_class": None,
+                    "price_veto_anchor_ts": None,
+                    "price_data_error": "missing_volume_unlock_anchor",
+                }
+            else:
+                price_snapshot = _stage3_price_snapshot_at_unlock(
+                    exchange, symbol, transition_ts, volume_unlock_cycle_ts
+                )
+        price_30m_class = str(price_snapshot.get("price_30m_class") or "").lower() or None
+        price_1h_class = str(price_snapshot.get("price_1h_class") or "").lower() or None
+        price_30m_cycle_ts = price_snapshot.get("price_30m_cycle_ts")
+        price_1h_cycle_ts = price_snapshot.get("price_1h_cycle_ts")
+        if not price_snapshot:
+            price_30m_class = str(row.get("stage3_price_30m_class") or "").lower() or None
+            price_1h_class = str(row.get("stage3_price_1h_class") or "").lower() or None
+            price_30m_cycle_ts = row.get("stage3_price_cycle_ts")
+            price_1h_cycle_ts = price_30m_cycle_ts
+        snapshot_for_observation = dict(price_snapshot)
+        for key in ("price_30m_cycle_ts", "price_1h_cycle_ts", "price_veto_anchor_ts"):
+            value = snapshot_for_observation.get(key)
+            snapshot_for_observation[key] = value.isoformat() if hasattr(value, "isoformat") else value
+        observation_snapshot.update(snapshot_for_observation)
         observation_snapshot["price_30m_class"] = price_30m_class
         observation_snapshot["price_1h_class"] = price_1h_class
-        observation_snapshot["price_cycle_ts"] = price_cycle_ts.isoformat() if price_cycle_ts else None
+        observation_snapshot["price_30m_cycle_ts"] = (
+            price_30m_cycle_ts.isoformat() if hasattr(price_30m_cycle_ts, "isoformat") else price_30m_cycle_ts
+        )
+        observation_snapshot["price_1h_cycle_ts"] = (
+            price_1h_cycle_ts.isoformat() if hasattr(price_1h_cycle_ts, "isoformat") else price_1h_cycle_ts
+        )
+        observation_snapshot["price_cycle_ts"] = observation_snapshot["price_30m_cycle_ts"]
         # OI veto is a Telegram-queue gate only: a fresh phase observation must
         # post-date this Stage-3 transition and be no later than first volume unlock.
         oi_decline_before_unlock = (
@@ -4112,18 +4169,36 @@ def check_stage3_alerts() -> dict:
                 or oi_cycle_ts <= decision["volume_unlocked_at"]
             )
         )
-        price_veto_reason = stage3_price_veto_reason(
-            price_30m_class=price_30m_class,
-            price_1h_class=price_1h_class,
-            price_cycle_ts=price_cycle_ts,
-            transition_ts=transition_ts,
-            volume_unlocked_at=decision["volume_unlocked_at"],
-            volume_unlock_cycle_ts=volume_unlock_cycle_ts,
+        price_veto_reason = (
+            stage3_price_veto_reason(
+                price_30m_class=price_30m_class,
+                price_1h_class=price_1h_class,
+                price_30m_cycle_ts=price_30m_cycle_ts,
+                price_1h_cycle_ts=price_1h_cycle_ts,
+                transition_ts=transition_ts,
+                volume_unlocked_at=decision["volume_unlocked_at"],
+                volume_unlock_cycle_ts=volume_unlock_cycle_ts,
+            )
+            if universe_decision.allowed
+            else None
         )
         # Freeze the first qualifying evidence for delivery; keep each cycle separately below.
         volume_snapshot = observation_snapshot if decision["volume_unlocked_at"] is not None else None
         queue_status = decision["status"] if universe_decision.allowed else "blocked_universe"
         block_reason = None if universe_decision.allowed else str(universe_decision.reason)
+        if price_snapshot.get("price_data_error"):
+            incident = {
+                "exchange": exchange,
+                "symbol": symbol,
+                "reason": price_snapshot["price_data_error"],
+                "volume_unlock_cycle_ts": str(volume_unlock_cycle_ts),
+            }
+            price_data_incidents.append(incident)
+            log(
+                "CRITICAL stage3 price data missing at volume unlock: "
+                f"{exchange}:{symbol} missing={incident['reason']} "
+                f"anchor={incident['volume_unlock_cycle_ts']}"
+            )
         if oi_decline_before_unlock:
             queue_status = "invalidated_oi1h"
             block_reason = "blocked:oi_1h_decline_before_volume"
@@ -4284,6 +4359,8 @@ def check_stage3_alerts() -> dict:
         "signals_filtered_by_volume": volume_waiting,
         "signals_filtered_by_oi_1h": oi_filtered,
         "signals_filtered_by_price_at_volume_unlock": price_filtered,
+        "stage3_price_data_incident_count": len(price_data_incidents),
+        "stage3_price_data_incidents": price_data_incidents[:20],
         "stage3_volume_queue": {
             "waiting": int(queue_state.get("waiting", 0) or 0),
             "unlocked": int(queue_state.get("unlocked", 0) or 0),
