@@ -118,6 +118,33 @@ def test_stage3_price_snapshot_reports_missing_fresh_window_as_data_error():
     assert snapshot["price_1h_cycle_ts"] is None
 
 
+def test_stage3_price_snapshot_accepts_windows_closing_on_transition_and_unlock_cycle():
+    from quote_turnover_snapshot import build_stage3_price_snapshot, stage3_price_veto_reason
+
+    transition = datetime(2026, 9, 29, 1, 10, tzinfo=timezone.utc)
+    rows = [
+        {"window_code": "30м", "ts_close": transition, "open_value": 100, "close_value": 101},
+        {"window_code": "1ч", "ts_close": transition, "open_value": 100, "close_value": 102},
+    ]
+
+    snapshot = build_stage3_price_snapshot(
+        rows, transition_ts=transition, volume_unlock_cycle_ts=transition,
+    )
+
+    assert snapshot["price_30m_cycle_ts"] == transition
+    assert snapshot["price_1h_cycle_ts"] == transition
+    assert snapshot["price_data_error"] is None
+    assert stage3_price_veto_reason(
+        price_30m_class=snapshot["price_30m_class"],
+        price_1h_class=snapshot["price_1h_class"],
+        price_30m_cycle_ts=snapshot["price_30m_cycle_ts"],
+        price_1h_cycle_ts=snapshot["price_1h_cycle_ts"],
+        transition_ts=transition,
+        volume_unlocked_at=transition,
+        volume_unlock_cycle_ts=transition,
+    ) is None
+
+
 def test_stage3_candidate_waits_below_threshold_without_expiry():
     from quote_turnover_snapshot import evaluate_stage3_volume_candidate
 

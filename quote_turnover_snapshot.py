@@ -117,7 +117,7 @@ def stage3_price_veto_reason(
             cycle_ts is None
             or cycle_ts > volume_unlock_cycle_ts
             or cycle_ts < oldest_accepted
-            or cycle_ts <= transition_ts
+            or cycle_ts < transition_ts
         ):
             return "blocked:missing_fresh_price_at_volume_unlock"
 
@@ -150,7 +150,7 @@ def build_stage3_price_snapshot(
         cycle_ts = row.get("ts_close")
         if code not in {"30м", "1ч"} or cycle_ts is None:
             continue
-        if cycle_ts > volume_unlock_cycle_ts or cycle_ts < oldest_accepted or cycle_ts <= transition_ts:
+        if cycle_ts > volume_unlock_cycle_ts or cycle_ts < oldest_accepted or cycle_ts < transition_ts:
             continue
         current = selected.get(code)
         if current is None or cycle_ts > current["ts_close"]:

@@ -148,6 +148,30 @@ def test_stage3_charts_media_error_does_not_lose_signal(monkeypatch, tmp_path):
     assert "график_не_доставлен:RuntimeError" in result.media_alerts
 
 
+def test_stage3_price_snapshot_query_includes_transition_cycle(monkeypatch):
+    transition = datetime(2026, 9, 29, 1, 10, tzinfo=timezone.utc)
+    captured = {}
+
+    def fake_rows(query, params):
+        captured["query"] = query
+        captured["params"] = params
+        return [
+            {"window_code": "30м", "ts_close": transition, "open_value": 100, "close_value": 101},
+            {"window_code": "1ч", "ts_close": transition, "open_value": 100, "close_value": 102},
+        ]
+
+    monkeypatch.setattr(telegram_bot, "_safe_rows", fake_rows)
+    snapshot = telegram_bot._stage3_price_snapshot_at_unlock(
+        "BYBIT", "TESTUSDT", transition, transition
+    )
+
+    assert snapshot["price_30m_cycle_ts"] == transition
+    assert snapshot["price_1h_cycle_ts"] == transition
+    assert snapshot["price_data_error"] is None
+    assert "AND ts_close >= %s" in captured["query"]
+    assert captured["params"][-1] == transition
+
+
 def test_stage3_alerts_limit_new_sends_per_cycle(monkeypatch):
     rows = [
         {

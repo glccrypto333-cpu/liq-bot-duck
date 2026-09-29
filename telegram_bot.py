@@ -4003,7 +4003,7 @@ def _stage3_price_snapshot_at_unlock(exchange: str, symbol: str, transition_ts, 
           AND window_code IN ('30м','1ч')
           AND ts_close <= %s
           AND ts_close >= %s - INTERVAL '5 minutes'
-          AND ts_close > %s
+          AND ts_close >= %s
         ORDER BY window_code, ts_close DESC
     """, (exchange, symbol, unlock_cycle_ts, unlock_cycle_ts, transition_ts))
     snapshot = build_stage3_price_snapshot(
