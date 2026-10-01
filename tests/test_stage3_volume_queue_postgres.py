@@ -365,3 +365,48 @@ def test_postgres_price_decline_at_first_unlock_is_terminal_but_later_decline_is
     with isolated_queue_schema() as conn:
         saved = conn.execute("SELECT status,volume_unlocked_at FROM stage3_volume_queue WHERE symbol='LATEPRICEUSDT'").fetchone()
     assert saved == {"status": "unlocked", "volume_unlocked_at": unlock_at}
+
+
+def test_postgres_price_decline_while_waiting_is_terminal_without_unlocking_volume(isolated_queue_schema):
+    import db
+
+    transition_at = datetime(2026, 9, 23, 8, 0, tzinfo=timezone.utc)
+    down_cycle = transition_at + timedelta(minutes=5)
+    later_unlock = transition_at + timedelta(minutes=30)
+    with isolated_queue_schema() as conn:
+        conn.execute("INSERT INTO core_state_v2 VALUES ('BINANCE','WAITDOWNUSDT',3)")
+        conn.execute("INSERT INTO active_symbol_universe VALUES ('BINANCE','WAITDOWNUSDT')")
+        conn.execute("INSERT INTO transition_history_v2(exchange,symbol,to_stage,cycle_ts) VALUES ('BINANCE','WAITDOWNUSDT',3,%s)", (transition_at,))
+
+    decline = _stage3_candidate("WAITDOWNUSDT", transition_at, down_cycle)
+    decline.update(
+        status="invalidated_price",
+        gate_status="below_100pct",
+        volume_unlocked_at=None,
+        volume_snapshot=None,
+        delivery_block_reason="blocked:price_30m_down_while_waiting_volume",
+    )
+    decline["observation_snapshot"].update({
+        "price_30m_class": "weak_down",
+        "price_1h_class": "good_up",
+        "price_cycle_ts": down_cycle.isoformat(),
+    })
+    db.sync_stage3_volume_queue([decline])
+    with isolated_queue_schema() as conn:
+        saved = conn.execute("SELECT status,volume_unlocked_at,terminal_at FROM stage3_volume_queue WHERE symbol='WAITDOWNUSDT'").fetchone()
+        observation = conn.execute("SELECT queue_status,delivery_block_reason FROM stage3_volume_queue_observations WHERE symbol='WAITDOWNUSDT'").fetchone()
+        phase = conn.execute("SELECT current_stage FROM core_state_v2 WHERE symbol='WAITDOWNUSDT'").fetchone()
+    assert saved["status"] == "invalidated_price"
+    assert saved["volume_unlocked_at"] is None
+    assert saved["terminal_at"] is not None
+    assert observation == {
+        "queue_status": "invalidated_price",
+        "delivery_block_reason": "blocked:price_30m_down_while_waiting_volume",
+    }
+    assert phase == {"current_stage": 3}
+
+    rebound = _stage3_candidate("WAITDOWNUSDT", transition_at, later_unlock, status="unlocked", growth=120.0)
+    db.sync_stage3_volume_queue([rebound])
+    with isolated_queue_schema() as conn:
+        saved = conn.execute("SELECT status,volume_unlocked_at FROM stage3_volume_queue WHERE symbol='WAITDOWNUSDT'").fetchone()
+    assert saved == {"status": "invalidated_price", "volume_unlocked_at": None}

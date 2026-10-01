@@ -128,10 +128,27 @@ def stage3_price_veto_reason(
     return None
 
 
+def stage3_price_wait_veto_reason(
+    *,
+    price_30m_class: str | None,
+    price_1h_class: str | None,
+    price_cycle_ts: datetime | None,
+    transition_ts: datetime | None,
+) -> str | None:
+    """Terminally veto only the Telegram candidate on a new down PRICE cycle while waiting for volume."""
+    if transition_ts is None or price_cycle_ts is None or price_cycle_ts <= transition_ts:
+        return None
+    if str(price_30m_class or "").lower() in {"weak_down", "strong_down"}:
+        return "blocked:price_30m_down_while_waiting_volume"
+    if str(price_1h_class or "").lower() in {"weak_down", "strong_down"}:
+        return "blocked:price_1h_down_while_waiting_volume"
+    return None
+
+
 def should_validate_stage3_price_gate(*, universe_allowed: bool, candidate_status: str, previous_queue_status: str | None) -> bool:
-    """Only check PRICE for a live unlocked Telegram candidate, never a terminal one."""
+    """Check PRICE only for a live waiting/unlocked Telegram candidate, never a terminal one."""
     terminal_statuses = {"sent", "invalidated", "invalidated_oi1h", "invalidated_price"}
-    if not universe_allowed or str(candidate_status or "") != "unlocked":
+    if not universe_allowed or str(candidate_status or "") not in {"waiting_volume", "unlocked"}:
         return False
     return str(previous_queue_status or "") not in terminal_statuses
 

@@ -34,6 +34,7 @@ from quote_turnover_snapshot import (
     build_stage3_price_snapshot,
     should_validate_stage3_price_gate,
     stage3_price_veto_reason,
+    stage3_price_wait_veto_reason,
 )
 
 _UNIVERSE_RUNTIME = Path("/home/alexey/openclaw/runtime")
@@ -4083,6 +4084,7 @@ def check_stage3_alerts() -> dict:
 
     # One current transition per pair stays queued until the canonical phase exits 3.
     queue_candidates = []
+    queue_block_reasons = {}
     universe_decisions = {}
     price_data_incidents = []
     for row in rows:
@@ -4188,6 +4190,16 @@ def check_stage3_alerts() -> dict:
             if validate_price_gate
             else None
         )
+        price_wait_veto_reason = (
+            stage3_price_wait_veto_reason(
+                price_30m_class=price_30m_class,
+                price_1h_class=price_1h_class,
+                price_cycle_ts=row.get("stage3_price_cycle_ts"),
+                transition_ts=transition_ts,
+            )
+            if validate_price_gate and decision["volume_unlocked_at"] is None
+            else None
+        )
         # Freeze the first qualifying evidence for delivery; keep each cycle separately below.
         volume_snapshot = observation_snapshot if decision["volume_unlocked_at"] is not None else None
         queue_status = decision["status"] if universe_decision.allowed else "blocked_universe"
@@ -4208,9 +4220,13 @@ def check_stage3_alerts() -> dict:
         if oi_decline_before_unlock:
             queue_status = "invalidated_oi1h"
             block_reason = "blocked:oi_1h_decline_before_volume"
+        elif price_wait_veto_reason:
+            queue_status = "invalidated_price"
+            block_reason = price_wait_veto_reason
         elif price_veto_reason:
             queue_status = "invalidated_price"
             block_reason = price_veto_reason
+        queue_block_reasons[(exchange, symbol)] = block_reason
         queue_candidates.append({
             "exchange": exchange,
             "symbol": symbol,
@@ -4281,12 +4297,12 @@ def check_stage3_alerts() -> dict:
             continue
         if queue_status == "invalidated_price":
             price_filtered += 1
-            snapshot = queue_record.get("volume_snapshot") or {}
             log(
-                "stage3 alert candidate invalidated by price at first volume unlock: "
-                f"{key} price30m={snapshot.get('price_30m_class')} "
-                f"price1h={snapshot.get('price_1h_class')} "
-                f"cycle={snapshot.get('price_cycle_ts')}"
+                "stage3 alert candidate invalidated by price before Telegram delivery: "
+                f"{key} reason={queue_block_reasons.get((exchange, symbol)) or 'price_decline'} "
+                f"price30m={row.get('stage3_price_30m_class')} "
+                f"price1h={row.get('stage3_price_1h_class')} "
+                f"cycle={row.get('stage3_price_cycle_ts')}"
             )
             continue
         if not universe_decision.allowed:

@@ -82,6 +82,36 @@ def test_stage3_price_veto_fails_closed_when_unlock_anchor_is_missing():
         volume_unlock_cycle_ts=None,
     ) == "blocked:missing_fresh_price_at_volume_unlock"
 
+
+def test_stage3_price_decline_while_waiting_volume_invalidates_candidate():
+    from quote_turnover_snapshot import stage3_price_wait_veto_reason
+
+    transition = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
+    cycle = transition + timedelta(minutes=5)
+    assert stage3_price_wait_veto_reason(
+        price_30m_class="weak_down", price_1h_class="good_up",
+        price_cycle_ts=cycle, transition_ts=transition,
+    ) == "blocked:price_30m_down_while_waiting_volume"
+    assert stage3_price_wait_veto_reason(
+        price_30m_class="flat", price_1h_class="strong_down",
+        price_cycle_ts=cycle, transition_ts=transition,
+    ) == "blocked:price_1h_down_while_waiting_volume"
+
+
+def test_stage3_price_wait_veto_ignores_missing_non_decline_and_old_windows():
+    from quote_turnover_snapshot import stage3_price_wait_veto_reason
+
+    transition = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
+    assert stage3_price_wait_veto_reason(
+        price_30m_class="flat", price_1h_class="weak_up",
+        price_cycle_ts=transition + timedelta(minutes=5), transition_ts=transition,
+    ) is None
+    for cycle in (None, transition, transition - timedelta(minutes=5)):
+        assert stage3_price_wait_veto_reason(
+            price_30m_class="strong_down", price_1h_class="good_up",
+            price_cycle_ts=cycle, transition_ts=transition,
+        ) is None
+
 def test_stage3_price_snapshot_uses_latest_closed_cycle_not_future_data():
     from quote_turnover_snapshot import build_stage3_price_snapshot
 
