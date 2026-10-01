@@ -2,14 +2,21 @@ from datetime import datetime, timedelta, timezone
 
 
 def test_stage3_price_gate_skips_sent_and_terminal_queue_candidates():
-    from quote_turnover_snapshot import should_validate_stage3_price_gate
+    from quote_turnover_snapshot import (
+        should_reprocess_stage3_queue_candidate,
+        should_validate_stage3_price_gate,
+    )
 
     for terminal_status in ("sent", "invalidated", "invalidated_oi1h", "invalidated_price"):
+        assert not should_reprocess_stage3_queue_candidate(terminal_status)
         assert not should_validate_stage3_price_gate(
             universe_allowed=True,
             candidate_status="unlocked",
             previous_queue_status=terminal_status,
         )
+
+    for live_status in (None, "waiting_volume", "unlocked", "blocked_universe"):
+        assert should_reprocess_stage3_queue_candidate(live_status)
 
     assert should_validate_stage3_price_gate(
         universe_allowed=True,

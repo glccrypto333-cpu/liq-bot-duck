@@ -147,9 +147,14 @@ def stage3_price_wait_veto_reason(
 
 def should_validate_stage3_price_gate(*, universe_allowed: bool, candidate_status: str, previous_queue_status: str | None) -> bool:
     """Check PRICE only for a live waiting/unlocked Telegram candidate, never a terminal one."""
-    terminal_statuses = {"sent", "invalidated", "invalidated_oi1h", "invalidated_price"}
     if not universe_allowed or str(candidate_status or "") not in {"waiting_volume", "unlocked"}:
         return False
+    return should_reprocess_stage3_queue_candidate(previous_queue_status)
+
+
+def should_reprocess_stage3_queue_candidate(previous_queue_status: str | None) -> bool:
+    """Skip repeat persistence for terminal candidates; keep universe blocks re-checkable."""
+    terminal_statuses = {"sent", "invalidated", "invalidated_oi1h", "invalidated_price"}
     return str(previous_queue_status or "") not in terminal_statuses
 
 

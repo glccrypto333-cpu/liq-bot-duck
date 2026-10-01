@@ -33,6 +33,7 @@ from quote_turnover_snapshot import (
     evaluate_stage3_volume_candidate,
     build_stage3_price_snapshot,
     should_validate_stage3_price_gate,
+    should_reprocess_stage3_queue_candidate,
     stage3_price_veto_reason,
     stage3_price_wait_veto_reason,
 )
@@ -4086,6 +4087,7 @@ def check_stage3_alerts() -> dict:
     queue_candidates = []
     queue_block_reasons = {}
     universe_decisions = {}
+    terminal_queue_statuses = {}
     price_data_incidents = []
     for row in rows:
         transition_ts = row.get("stage3_transition_ts")
@@ -4096,6 +4098,13 @@ def check_stage3_alerts() -> dict:
         universe_decision = _asset_universe_decide(exchange, symbol)
         universe_decisions[(exchange, symbol)] = universe_decision
         state = _db_quote_turnover_state(symbol, transition_ts, exchange)
+        previous_queue_status = state.get("existing_queue_status")
+        if not should_reprocess_stage3_queue_candidate(previous_queue_status):
+            # This lookup is keyed by the exact current 2->3 transition. Terminal
+            # candidates need no more snapshots, upserts, observations, or logs;
+            # a later legal 2->3 transition has no matching prior queue row.
+            terminal_queue_statuses[(exchange, symbol)] = str(previous_queue_status)
+            continue
         allowed_by_volume, _ = _db_quote_turnover_gate(state)
         decision = evaluate_stage3_volume_candidate(
             current_stage=3,
@@ -4277,11 +4286,19 @@ def check_stage3_alerts() -> dict:
         symbol = str(row.get("symbol") or "").upper()
         key = "|".join([exchange, symbol, str(transition_ts)])
         queue_record = queued.get((exchange, symbol)) or {}
-        queue_status = str(queue_record.get("status") or "")
+        queue_status = str(
+            queue_record.get("status")
+            or terminal_queue_statuses.get((exchange, symbol))
+            or ""
+        )
         if key in alerted or queue_status == "sent":
             already_active += 1
             if key in alerted and queue_status != "sent":
                 mark_stage3_volume_queue_sent(exchange, symbol, transition_ts)
+            continue
+        if (exchange, symbol) in terminal_queue_statuses:
+            # Already terminal before this cycle: suppress repeated filter logs
+            # and per-cycle counts; lifetime/72h totals remain in the DB summary.
             continue
 
         universe_decision = universe_decisions.get((exchange, symbol))
