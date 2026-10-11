@@ -268,7 +268,7 @@ def apply_stage_guardrails(
         if _price_stage3_block(price_state):
             return 2, f"удержание_2:цена={price_state}"
         if target_stage <= 1:
-            return 1, "снижение_2_1:target_stage<=1"
+            return 2, "удержание_2:нет_подтвержденного_дегрейда"
         if (
             target_stage >= 2
             and oi_1h == "strong_up"
@@ -350,7 +350,7 @@ def compute_transition_permission(
     if previous_stage == 2 and blocked_by_price:
         return "снижение_2_1_по_цене_4ч"
     if previous_stage == 2 and target_stage <= 1:
-        return "снижение_2_1_по_target_stage"
+        return "удержание_2_до_подтвержденного_дегрейда"
 
     if blocked_by_price:
         return "блок_цены_4ч"

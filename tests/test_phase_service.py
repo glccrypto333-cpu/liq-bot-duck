@@ -176,14 +176,14 @@ def test_strong_1h_decline_also_drops_stage_2_to_1() -> None:
     assert reason == "снижение_2_1:oi_1ч=strong_down"
 
 
-def test_target_stage_below_2_drops_stage_2_to_1_per_canonical_matrix() -> None:
+def test_target_stage_below_2_holds_stage_2_without_explicit_decline() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_15m="flat", oi_30m="flat", oi_1h="good_up", oi_4h="good_up")
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
     stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 480.0, 480.0)
     assert target_stage == 1
-    assert stage == 1
-    assert reason == "снижение_2_1:target_stage<=1"
+    assert stage == 2
+    assert reason == "удержание_2:нет_подтвержденного_дегрейда"
 
 
 def test_4h_hard_decline_drops_stage_2_to_1_per_canonical_matrix() -> None:
@@ -242,7 +242,7 @@ def test_transition_permission_matches_canonical_stage2_downgrade_matrix() -> No
     assert compute_transition_permission(
         previous_state, 1, 45.0,
         make_oi_summary(oi_30m="flat", oi_1h="good_up", oi_4h="good_up"), PRICE_OK, 60.0
-    ) == "снижение_2_1_по_target_stage"
+    ) == "удержание_2_до_подтвержденного_дегрейда"
     assert compute_transition_permission(
         previous_state, 0, 45.0,
         make_oi_summary(oi_30m="strong_down", oi_1h="good_up", oi_4h="good_up"), PRICE_OK, 60.0
@@ -253,15 +253,15 @@ def test_transition_permission_matches_canonical_stage2_downgrade_matrix() -> No
     ) == "снижение_2_1_по_oi_4ч"
 
 
-def test_2_to_1_guardrail_downgrade_is_reported_consistently() -> None:
+def test_flat_30m_with_live_1h_and_4h_build_does_not_downgrade_stage_2() -> None:
     previous_state = {"current_stage": 2}
     summary = make_oi_summary(oi_15m="flat", oi_30m="flat", oi_1h="good_up", oi_4h="good_up")
     target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
     stage, guard_reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 480.0, 480.0)
     permission = compute_transition_permission(previous_state, target_stage, 480.0, summary, PRICE_OK, 480.0)
-    assert stage == 1
-    assert guard_reason == "снижение_2_1:target_stage<=1"
-    assert permission == "снижение_2_1_по_target_stage"
+    assert stage == 2
+    assert guard_reason == "удержание_2:нет_подтвержденного_дегрейда"
+    assert permission == "удержание_2_до_подтвержденного_дегрейда"
 
 
 def test_4h_strong_down_resets_stage_1_to_0() -> None:
@@ -391,3 +391,15 @@ def test_2_to_3_allows_strong_1h_even_when_growth_below_old_7pct() -> None:
 
     assert target_stage == 3
     assert reason == "30м_зрелое_1ч_подтверждает_силу"
+
+
+def test_stage_2_with_flat_30m_does_not_promote_or_downgrade_on_mature_timers() -> None:
+    previous_state = {"current_stage": 2}
+    summary = make_oi_summary(oi_15m="weak_down", oi_30m="flat", oi_1h="good_up", oi_4h="good_up")
+    target_stage, _ = determine_target_stage(summary, PRICE_OK, VOLUME_DUMMY)
+
+    stage, reason = apply_stage_guardrails(previous_state, target_stage, summary, PRICE_OK, VOLUME_DUMMY, 120.0, 180.0)
+
+    assert target_stage == 1
+    assert stage == 2
+    assert reason == "удержание_2:нет_подтвержденного_дегрейда"
