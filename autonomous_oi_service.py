@@ -534,6 +534,7 @@ def load_source_cycle_timestamps(
     start_exclusive: datetime | None = None,
     window_source: str = "hot",
     tracked_pairs: list[tuple[str, str]] | None = None,
+    max_cycles: int | None = None,
 ) -> list[datetime]:
     symbol_filter_sql, symbol_filter_params = _symbol_filter_sql(tracked_pairs)
     table_name = _window_source_table(window_source)
@@ -543,6 +544,8 @@ def load_source_cycle_timestamps(
         lower_filter = "AND source_cycle_ts > %s"
         params.append(start_exclusive)
     params.append(end_ts)
+    cycle_limit = max(1, int(max_cycles or os.getenv("AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN", "10")))
+    params.append(cycle_limit)
     rows = fetch(
         f"""
         SELECT source_cycle_ts
@@ -553,6 +556,7 @@ def load_source_cycle_timestamps(
           AND source_cycle_ts <= %s
         GROUP BY source_cycle_ts
         ORDER BY source_cycle_ts ASC
+        LIMIT %s
         """,
         tuple(params),
     )
@@ -1802,6 +1806,7 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
     last_source_cycle_ts: datetime | None = None,
     tracked_pairs: list[tuple[str, str]] | None = None,
     window_source: str = "hot",
+    max_source_cycles: int | None = None,
 ) -> tuple[list[tuple], list[tuple], list[tuple], dict[tuple[str, str], dict], datetime | None]:
     cycle_ts = cycle_ts or datetime.now(timezone.utc)
     if previous_state_map is None:
@@ -1812,6 +1817,7 @@ def compute_autonomous_oi_snapshot_incremental_to_cycle(
         start_exclusive=last_source_cycle_ts,
         window_source=window_source,
         tracked_pairs=tracked_pairs,
+        max_cycles=max_source_cycles,
     )
     if not source_cycles:
         return [], [], [], previous_state_map, last_source_cycle_ts
@@ -1926,6 +1932,7 @@ def run_autonomous_oi_service(
     core_rows, window_rows, history_rows, next_state_map, last_source_cycle_ts = compute_autonomous_oi_snapshot_incremental_to_cycle(
         cycle_ts=cycle_ts,
         last_source_cycle_ts=last_source_cycle_ts,
+        max_source_cycles=int(os.getenv("AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN", "10")),
     )
     if not core_rows:
         log("autonomous_oi_service ok: no_new_source_cycles")
@@ -1953,6 +1960,8 @@ def run_autonomous_oi_service(
         log(f"post_stage_analytics_seconds={post_stage_seconds:.2f}")
     log(
         f"autonomous_oi_service ok: symbols={len(core_rows)} "
-        f"windows={len(window_rows)} history={len(history_rows)}"
+        f"windows={len(window_rows)} history={len(history_rows)} "
+        f"checkpoint={last_source_cycle_ts.isoformat() if last_source_cycle_ts else 'none'} "
+        f"source_cycle_chunk_limit={os.getenv('AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN', '10')}"
     )
     return len(core_rows)

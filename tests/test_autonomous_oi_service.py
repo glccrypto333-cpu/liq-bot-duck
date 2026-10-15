@@ -17,6 +17,7 @@ from autonomous_oi_service import (
     build_window_freshness_by_kind,
     collect_stage1_near_maturity_diagnostics,
     get_runtime_observability_metrics,
+    load_source_cycle_timestamps,
     _resolve_growth_trigger_ts,
     build_core_record,
     compute_autonomous_oi_snapshot_incremental_to_cycle,
@@ -597,6 +598,24 @@ def test_price_freshness_guard_allows_stage2_promotion_with_current_price() -> N
 
     assert target_stage == 3
     assert reason is None
+
+
+def test_source_cycle_loader_limits_each_replay_chunk(monkeypatch) -> None:
+    end_ts = datetime(2026, 7, 16, 9, 30, tzinfo=timezone.utc)
+    captured = {}
+
+    def fake_fetch(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return [{"source_cycle_ts": end_ts}]
+
+    monkeypatch.setattr("autonomous_oi_service.fetch", fake_fetch)
+
+    cycles = load_source_cycle_timestamps(end_ts, max_cycles=3)
+
+    assert cycles == [end_ts]
+    assert "LIMIT %s" in captured["sql"]
+    assert captured["params"][-2:] == (end_ts, 3)
 
 
 def test_save_autonomous_oi_progress_writes_through_temp_file(monkeypatch, tmp_path) -> None:
