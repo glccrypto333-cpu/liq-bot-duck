@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 
 from db import (
-    active_universe_sql,
     execute,
     fetch,
     insert_oi_stage_history,
@@ -440,50 +439,69 @@ def load_latest_window_map(
     window_source: str = "hot",
     tracked_pairs: list[tuple[str, str]] | None = None,
 ) -> dict[tuple[str, str], dict[str, dict[str, dict]]]:
-    params: tuple = ()
+    params: list = []
     cycle_filter = ""
     if cycle_ts is not None:
-        cycle_filter = "AND (source_cycle_ts <= %s OR source_cycle_ts IS NULL)"
-        params = (cycle_ts,)
+        cycle_filter = "AND (aw.source_cycle_ts <= %s OR aw.source_cycle_ts IS NULL)"
+        params.append(cycle_ts)
     symbol_filter_sql, symbol_filter_params = _symbol_filter_sql(tracked_pairs)
     table_name = _window_source_table(window_source)
+    params = [*symbol_filter_params, WINDOWS, *params]
 
     rows = fetch(
         f"""
-        WITH ranked AS (
-            SELECT
-                metric,
-                window_code,
-                ts_open,
-                ts_close,
-                exchange,
-                symbol,
-                open_value,
-                high_value,
-                low_value,
-                close_value,
-                sum_value,
-                avg_value,
-                delta_pct,
-                unique_candles,
-                source_cycle_ts,
-                built_at,
-                ROW_NUMBER() OVER (
-                    PARTITION BY metric, window_code, exchange, symbol
-                    ORDER BY ts_close DESC
-                ) AS rn
-            FROM {table_name}
-            WHERE metric IN ('OI', 'PRICE', 'VOLUME')
-              AND window_code = ANY(%s)
-              AND {active_universe_sql()}
-              {symbol_filter_sql}
-              {cycle_filter}
+        WITH active_pairs AS (
+            SELECT au.exchange, au.symbol
+            FROM active_symbol_universe au
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM data_quality_quarantine dq
+                WHERE dq.exchange = au.exchange
+                  AND dq.symbol = au.symbol
+                  AND dq.status = 'active'
+            )
+            {symbol_filter_sql}
+        ), requested AS (
+            SELECT m.metric, w.window_code
+            FROM unnest(ARRAY['OI', 'PRICE', 'VOLUME']::text[]) AS m(metric)
+            CROSS JOIN unnest(%s::text[]) AS w(window_code)
         )
-        SELECT *
-        FROM ranked
-        WHERE rn = 1
+        SELECT latest.*
+        FROM active_pairs ap
+        CROSS JOIN requested r
+        CROSS JOIN LATERAL (
+            SELECT
+                aw.metric,
+                aw.window_code,
+                aw.ts_open,
+                aw.ts_close,
+                aw.exchange,
+                aw.symbol,
+                aw.open_value,
+                aw.high_value,
+                aw.low_value,
+                aw.close_value,
+                aw.sum_value,
+                aw.avg_value,
+                aw.delta_pct,
+                aw.unique_candles,
+                aw.source_cycle_ts,
+                aw.built_at
+            FROM {table_name} aw
+            WHERE aw.exchange = ap.exchange
+              AND aw.symbol = ap.symbol
+              AND aw.metric = r.metric
+              AND aw.window_code = r.window_code
+              {cycle_filter}
+            ORDER BY
+                aw.ts_close DESC,
+                aw.unique_candles DESC NULLS LAST,
+                aw.ts_open ASC,
+                aw.built_at DESC
+            LIMIT 1
+        ) latest
         """,
-        (WINDOWS, *symbol_filter_params, *params),
+        tuple(params),
     )
 
     window_map: dict[tuple[str, str], dict[str, dict[str, dict]]] = defaultdict(lambda: defaultdict(dict))
