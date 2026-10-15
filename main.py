@@ -2433,9 +2433,22 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
         script_path = Path(__file__).with_name("run_autonomous_oi_once.py")
         batch_env_key = "AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN"
         configured_batch_limit = max(1, int(os.getenv(batch_env_key, "10")))
+        initial_batch_limit = max(
+            1,
+            int(os.getenv("AUTONOMOUS_OI_INITIAL_SOURCE_CYCLES_PER_RUN", "3")),
+        )
         batch_limit = min(
             configured_batch_limit,
-            max(1, int(getattr(_timed_watchdog_step, "_oi_replay_batch_limit", configured_batch_limit))),
+            max(
+                1,
+                int(
+                    getattr(
+                        _timed_watchdog_step,
+                        "_oi_replay_batch_limit",
+                        initial_batch_limit,
+                    )
+                ),
+            ),
         )
         _timed_watchdog_step._oi_replay_batch_limit = batch_limit
         child_env = os.environ.copy()
@@ -2464,7 +2477,19 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
             elapsed = time.time() - started
             timings.append((name, elapsed))
             _timed_watchdog_step._timeout_streaks[name] = 0
-            replay_successes = int(getattr(_timed_watchdog_step, "_oi_replay_successes", 0)) + 1
+            upshift_max_seconds = min(
+                max(1.0, float(os.getenv("AUTONOMOUS_OI_REPLAY_UPSHIFT_MAX_SECONDS", "75"))),
+                timeout_seconds * 0.65,
+            )
+            if elapsed <= upshift_max_seconds:
+                replay_successes = int(getattr(_timed_watchdog_step, "_oi_replay_successes", 0)) + 1
+            else:
+                replay_successes = 0
+                log(
+                    f"OI_REPLAY_BATCH_HELD batch={batch_limit} "
+                    f"elapsed={elapsed:.2f}s upshift_max={upshift_max_seconds:.2f}s "
+                    f"reason=slow_success"
+                )
             if replay_successes >= 3 and batch_limit < configured_batch_limit:
                 batch_limit = min(configured_batch_limit, batch_limit + 1)
                 _timed_watchdog_step._oi_replay_batch_limit = batch_limit

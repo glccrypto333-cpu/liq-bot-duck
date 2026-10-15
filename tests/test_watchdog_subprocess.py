@@ -71,6 +71,32 @@ def test_autonomous_watchdog_timeout_halves_replay_batch_for_retry(monkeypatch) 
     assert any("OI_REPLAY_BATCH_REDUCED" in line and "next=5" in line for line in logs)
 
 
+def test_autonomous_watchdog_starts_with_conservative_replay_batch(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setenv("AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN", "10")
+    monkeypatch.setenv("AUTONOMOUS_OI_INITIAL_SOURCE_CYCLES_PER_RUN", "3")
+    monkeypatch.setattr(
+        main.subprocess,
+        "run",
+        lambda *args, **kwargs: captured.update(kwargs) or type(
+            "Completed", (), {"returncode": 0, "stdout": "1\n", "stderr": ""}
+        )(),
+    )
+    monkeypatch.setattr(main, "log", lambda _line: None)
+    monkeypatch.setattr(main._timed_watchdog_step, "_timeout_streaks", {}, raising=False)
+    monkeypatch.setattr(main._timed_watchdog_step, "_inflight", set(), raising=False)
+    monkeypatch.delattr(main._timed_watchdog_step, "_oi_replay_batch_limit", raising=False)
+    monkeypatch.setattr(main._timed_watchdog_step, "_oi_replay_successes", 0, raising=False)
+
+    result = main._timed_watchdog_step(
+        [], "autonomous_oi_service", lambda: 0, "TEST_WATCHDOG_TIMEOUT", 120
+    )
+
+    assert result == 1
+    assert captured["env"]["AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN"] == "3"
+    assert main._timed_watchdog_step._oi_replay_batch_limit == 3
+
+
 def test_autonomous_watchdog_recovers_batch_after_three_successes(monkeypatch) -> None:
     captured = {}
     monkeypatch.setenv("AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN", "10")
@@ -100,6 +126,41 @@ def test_autonomous_watchdog_recovers_batch_after_three_successes(monkeypatch) -
     assert captured["env"]["AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN"] == "5"
     assert main._timed_watchdog_step._oi_replay_batch_limit == 6
     assert any("OI_REPLAY_BATCH_RECOVERED next=6" in line for line in logs)
+
+
+def test_autonomous_watchdog_does_not_raise_batch_after_slow_success(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setenv("AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN", "10")
+    monkeypatch.setenv("AUTONOMOUS_OI_REPLAY_UPSHIFT_MAX_SECONDS", "75")
+    monkeypatch.setattr(
+        main.subprocess,
+        "run",
+        lambda *args, **kwargs: captured.update(kwargs) or type(
+            "Completed", (), {"returncode": 0, "stdout": "1\n", "stderr": ""}
+        )(),
+    )
+    clock = iter([10.0, 95.0])
+    monkeypatch.setattr(main.time, "time", lambda: next(clock, 95.0))
+    logs: list[str] = []
+    monkeypatch.setattr(main, "log", logs.append)
+    monkeypatch.setattr(main._timed_watchdog_step, "_timeout_streaks", {}, raising=False)
+    monkeypatch.setattr(main._timed_watchdog_step, "_inflight", set(), raising=False)
+    monkeypatch.setattr(main._timed_watchdog_step, "_oi_replay_batch_limit", 5, raising=False)
+    monkeypatch.setattr(main._timed_watchdog_step, "_oi_replay_successes", 2, raising=False)
+
+    result = main._timed_watchdog_step(
+        [],
+        "autonomous_oi_service",
+        lambda: 0,
+        "TEST_WATCHDOG_TIMEOUT",
+        120,
+    )
+
+    assert result == 1
+    assert captured["env"]["AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN"] == "5"
+    assert main._timed_watchdog_step._oi_replay_batch_limit == 5
+    assert main._timed_watchdog_step._oi_replay_successes == 0
+    assert any("OI_REPLAY_BATCH_HELD" in line and "elapsed=85.00s" in line for line in logs)
 
 
 def test_subprocess_runner_disables_duplicate_post_stage_analytics(monkeypatch, capsys) -> None:
