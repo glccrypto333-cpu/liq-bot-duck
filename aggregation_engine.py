@@ -18,11 +18,32 @@ from db import (
 )
 from metrics import изменение_в_процентах
 from logger import log
+from oi_windows import binance_oi_bucket_close
 
 WINDOWS = {"15м": 3, "30м": 6, "1ч": 12, "4ч": 48, "12ч": 144, "24ч": 288}
 WINDOW_MINUTES = {"15м": 15, "30м": 30, "1ч": 60, "4ч": 240, "12ч": 720, "24ч": 1440}
 HISTORY_WINDOWS = ("15м", "30м", "1ч", "4ч")
 FIVE_MINUTES = timedelta(minutes=5)
+
+
+def _canonicalize_binance_oi_rows(rows: list[dict]) -> list[dict]:
+    """Normalize legacy snapshot timestamps and keep the latest point per 5m slot."""
+    latest_by_key = {}
+    other_rows = []
+    for row in rows:
+        if row.get("exchange") != "BINANCE":
+            other_rows.append(row)
+            continue
+        raw_close = row["ts_close"]
+        bucket_close = binance_oi_bucket_close(raw_close)
+        key = (row["symbol"], bucket_close)
+        current = latest_by_key.get(key)
+        if current is None or raw_close > current[0]:
+            normalized = dict(row)
+            normalized["ts_close"] = bucket_close
+            normalized["ts_open"] = bucket_close - FIVE_MINUTES
+            latest_by_key[key] = (raw_close, normalized)
+    return other_rows + [row for _, row in latest_by_key.values()]
 
 
 def _groups(rows):
@@ -219,6 +240,11 @@ def _resolve_symbol_anchor_map_from_db(
         for metric, (table, alias) in metric_tables.items()
         if metric in metric_set
     }
+    oi_latest = latest_by_metric.get("OI")
+    if oi_latest is not None:
+        for key, latest_ts in tuple(oi_latest.items()):
+            if key[0] == "BINANCE":
+                oi_latest[key] = binance_oi_bucket_close(latest_ts)
     if not latest_by_metric:
         return {}
 
@@ -283,6 +309,7 @@ def build_aggregate_rows(
             end_ts=end_ts,
             tracked_pairs=tracked_pairs,
         )
+        oi_rows = _canonicalize_binance_oi_rows(oi_rows)
 
         for (exchange, symbol), items in _groups(oi_rows).items():
             for timeframe, need in window_items:
@@ -426,6 +453,7 @@ def build_latest_aggregate_rows(
             source_cycle_ts,
         )
         raw_oi_count = len(oi_rows)
+        oi_rows = _canonicalize_binance_oi_rows(oi_rows)
         for (exchange, symbol), items in _groups(oi_rows).items():
             anchor_ts = symbol_anchor_map.get((exchange, symbol))
             if anchor_ts is None:

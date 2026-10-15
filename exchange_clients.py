@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 import requests
+from oi_windows import binance_oi_bucket_close
 from config import BYBIT_BASE, BINANCE_BASE
 
 UA = {"User-Agent": "Mozilla/5.0 MightyDuck/1.0"}
@@ -181,16 +182,30 @@ def fetch_binance_oi_5m(symbol: str, limit: int = 200) -> list[tuple]:
         f"{BINANCE_BASE}/futures/data/openInterestHist",
         {"symbol": symbol, "period": "5m", "limit": limit},
     )
-    out = []
+    latest_by_bucket = {}
     for item in data if isinstance(data, list) else []:
         ts_close_raw = _dt_from_ms(item["timestamp"])
-        ts_open = ts_close_raw - timedelta(minutes=5)
-        ts_close_norm = _norm_5m_close(ts_open)
+        ts_close_norm = binance_oi_bucket_close(ts_close_raw)
         if not _closed(ts_close_norm):
             continue
         oi = float(item["sumOpenInterest"])
-        out.append((ts_open, ts_close_norm, "BINANCE", symbol, oi, oi, oi, oi))
-    return out
+        row = (
+            ts_close_norm - timedelta(minutes=5),
+            ts_close_norm,
+            "BINANCE",
+            symbol,
+            oi,
+            oi,
+            oi,
+            oi,
+        )
+        current = latest_by_bucket.get(ts_close_norm)
+        if current is None or ts_close_raw > current[0]:
+            latest_by_bucket[ts_close_norm] = (ts_close_raw, row)
+    return [
+        latest_by_bucket[bucket_close][1]
+        for bucket_close in sorted(latest_by_bucket)
+    ]
 
 def fetch_bybit_kline_5m(symbol: str, limit: int = 200) -> tuple[list[tuple], list[tuple]]:
     data = _get(
