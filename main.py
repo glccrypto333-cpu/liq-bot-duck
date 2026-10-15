@@ -2431,6 +2431,15 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
 
     if name == "autonomous_oi_service":
         script_path = Path(__file__).with_name("run_autonomous_oi_once.py")
+        batch_env_key = "AUTONOMOUS_OI_MAX_SOURCE_CYCLES_PER_RUN"
+        configured_batch_limit = max(1, int(os.getenv(batch_env_key, "10")))
+        batch_limit = min(
+            configured_batch_limit,
+            max(1, int(getattr(_timed_watchdog_step, "_oi_replay_batch_limit", configured_batch_limit))),
+        )
+        _timed_watchdog_step._oi_replay_batch_limit = batch_limit
+        child_env = os.environ.copy()
+        child_env[batch_env_key] = str(batch_limit)
         try:
             completed = subprocess.run(
                 [sys.executable, str(script_path)],
@@ -2439,6 +2448,7 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
                 text=True,
                 timeout=timeout_seconds,
                 check=False,
+                env=child_env,
             )
             _timed_watchdog_step._inflight.discard(name)
             if completed.returncode != 0:
@@ -2454,6 +2464,13 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
             elapsed = time.time() - started
             timings.append((name, elapsed))
             _timed_watchdog_step._timeout_streaks[name] = 0
+            replay_successes = int(getattr(_timed_watchdog_step, "_oi_replay_successes", 0)) + 1
+            if replay_successes >= 3 and batch_limit < configured_batch_limit:
+                batch_limit = min(configured_batch_limit, batch_limit + 1)
+                _timed_watchdog_step._oi_replay_batch_limit = batch_limit
+                replay_successes = 0
+                log(f"OI_REPLAY_BATCH_RECOVERED next={batch_limit}")
+            _timed_watchdog_step._oi_replay_successes = replay_successes
             log(
                 f"step resource: {name}={elapsed:.2f}s "
                 f"watchdog=ok timeout={timeout_seconds}s "
@@ -2467,6 +2484,13 @@ def _timed_watchdog_step(timings, name: str, func, timeout_env: str, default_tim
             timings.append((name, elapsed))
             streak = _timed_watchdog_step._timeout_streaks.get(name, 0) + 1
             _timed_watchdog_step._timeout_streaks[name] = streak
+            next_batch_limit = max(1, batch_limit // 2)
+            _timed_watchdog_step._oi_replay_batch_limit = next_batch_limit
+            _timed_watchdog_step._oi_replay_successes = 0
+            log(
+                f"OI_REPLAY_BATCH_REDUCED previous={batch_limit} "
+                f"next={next_batch_limit} timeout_streak={streak}"
+            )
             stdout_text = (
                 exc.stdout.decode("utf-8", errors="replace")
                 if isinstance(exc.stdout, bytes)
