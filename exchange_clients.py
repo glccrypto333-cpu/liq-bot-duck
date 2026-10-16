@@ -10,6 +10,26 @@ from config import BYBIT_BASE, BINANCE_BASE
 
 UA = {"User-Agent": "Mozilla/5.0 MightyDuck/1.0"}
 
+class ExchangeAPIError(RuntimeError):
+    def __init__(self, endpoint: str, ret_code: int | str, ret_msg: str, payload: dict):
+        self.endpoint = endpoint
+        self.ret_code = ret_code
+        self.ret_msg = ret_msg
+        self.payload = payload
+        super().__init__(
+            f"exchange API error endpoint={endpoint} retCode={ret_code} retMsg={ret_msg}"
+        )
+
+    @property
+    def is_symbol_unavailable(self) -> bool:
+        message = str(self.ret_msg).strip().lower()
+        return (
+            self.endpoint.startswith("bybit.com/")
+            and str(self.ret_code) == "10001"
+            and ("symbol invalid" in message or "symbol not found" in message)
+        )
+
+
 _REQUEST_STATS = defaultdict(lambda: {
     "count": 0,
     "errors": 0,
@@ -68,7 +88,26 @@ def _get(url: str, params: dict | None = None, retries: int = 3):
                 stats["slow"] += 1
 
             r.raise_for_status()
-            return r.json()
+            payload = r.json()
+            if isinstance(payload, dict) and "retCode" in payload:
+                ret_code = payload.get("retCode")
+                if str(ret_code) != "0":
+                    raise ExchangeAPIError(
+                        endpoint=endpoint,
+                        ret_code=ret_code,
+                        ret_msg=str(payload.get("retMsg") or ""),
+                        payload=payload,
+                    )
+            return payload
+        except ExchangeAPIError as exc:
+            stats = _REQUEST_STATS[endpoint]
+            stats["errors"] += 1
+            if i > 0:
+                stats["retries"] += 1
+            last_exc = exc
+            if exc.is_symbol_unavailable:
+                raise
+            time.sleep(1 + i)
         except Exception as exc:
             elapsed = time.time() - started
             stats = _REQUEST_STATS[endpoint]

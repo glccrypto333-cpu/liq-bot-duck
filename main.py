@@ -48,6 +48,7 @@ from db import (
     prune_inactive_state_rows,
 )
 from exchange_clients import (
+    ExchangeAPIError,
     fetch_bybit_symbols,
     fetch_binance_symbols,
     fetch_bybit_oi_5m,
@@ -1998,6 +1999,7 @@ def collect(symbols_bybit, symbols_binance, quote_turnover_backfill_targets=None
     reset_request_stats()
     oi_rows, price_rows, volume_rows = [], [], []
     failures = []
+    symbol_unavailable = []
     now = datetime.now(timezone.utc)
     quote_turnover_backfill_targets = set(quote_turnover_backfill_targets or set())
 
@@ -2013,6 +2015,10 @@ def collect(symbols_bybit, symbols_binance, quote_turnover_backfill_targets=None
         local_oi, local_price, local_volume = [], [], []
         try:
             local_oi.extend(fetch_bybit_oi_5m(s, 24))
+        except ExchangeAPIError as exc:
+            if exc.is_symbol_unavailable:
+                return [], [], [], ("BYBIT", s, exc.ret_code, str(exc.ret_msg)[:200])
+            record_failure("BYBIT", s, "OI", exc)
         except Exception as exc:
             record_failure("BYBIT", s, "OI", exc)
 
@@ -2020,10 +2026,14 @@ def collect(symbols_bybit, symbols_binance, quote_turnover_backfill_targets=None
             p, v = fetch_bybit_kline_5m(s, kline_limit_for("BYBIT", s))
             local_price.extend(p)
             local_volume.extend(v)
+        except ExchangeAPIError as exc:
+            if exc.is_symbol_unavailable:
+                return [], [], [], ("BYBIT", s, exc.ret_code, str(exc.ret_msg)[:200])
+            record_failure("BYBIT", s, "PRICE_VOLUME", exc)
         except Exception as exc:
             record_failure("BYBIT", s, "PRICE_VOLUME", exc)
 
-        return local_oi, local_price, local_volume
+        return local_oi, local_price, local_volume, None
 
     bybit_workers = max(1, BYBIT_COLLECT_WORKERS)
     bybit_started = time.time()
@@ -2035,10 +2045,12 @@ def collect(symbols_bybit, symbols_binance, quote_turnover_backfill_targets=None
         ]
 
         for future in as_completed(futures):
-            local_oi, local_price, local_volume = future.result()
+            local_oi, local_price, local_volume, unavailable = future.result()
             oi_rows.extend(local_oi)
             price_rows.extend(local_price)
             volume_rows.extend(local_volume)
+            if unavailable:
+                symbol_unavailable.append(unavailable)
 
     bybit_seconds = time.time() - bybit_started
 
@@ -2118,6 +2130,12 @@ def collect(symbols_bybit, symbols_binance, quote_turnover_backfill_targets=None
     elif len(failures) >= 10:
         failure_health = "warning"
 
+    if symbol_unavailable:
+        log(
+            f"SYMBOL_UNAVAILABLE count={len(symbol_unavailable)} "
+            f"samples={symbol_unavailable[:8]}"
+        )
+
     if failures:
         top_failures = sorted(
             failure_types.items(),
@@ -2166,7 +2184,7 @@ def collect(symbols_bybit, symbols_binance, quote_turnover_backfill_targets=None
             f"target={collect_target_seconds:.2f}s"
         )
 
-    if slow_request_total or timeout_total or retry_total:
+    if slow_request_total or timeout_total or retry_total or request_error_total:
         log(
             f"REQUEST_LATENCY "
             f"slow_requests={slow_request_total} "
@@ -2210,6 +2228,7 @@ def collect(symbols_bybit, symbols_binance, quote_turnover_backfill_targets=None
         "price_rows": price_rows,
         "volume_rows": volume_rows,
         "failures": failures,
+        "symbol_unavailable": symbol_unavailable,
         "cycle_ts": now,
         "collect_seconds": collect_seconds,
         "collect_health": collect_health,
@@ -2226,6 +2245,7 @@ def insert_collected_raw(batch: dict) -> int:
     price_rows = batch.get("price_rows") or []
     volume_rows = batch.get("volume_rows") or []
     failures = batch.get("failures") or []
+    symbol_unavailable = batch.get("symbol_unavailable") or []
     cycle_ts = batch.get("cycle_ts")
 
     upsert_oi(oi_rows, cycle_ts=cycle_ts, source="collect")
@@ -2240,6 +2260,7 @@ def insert_collected_raw(batch: dict) -> int:
         f"price={len(price_rows)} "
         f"volume={len(volume_rows)} "
         f"request_failures={len(failures)} "
+        f"symbol_unavailable={len(symbol_unavailable)} "
         f"total_rows={total_rows}"
     )
 

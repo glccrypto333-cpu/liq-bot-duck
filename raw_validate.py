@@ -64,6 +64,7 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
     price_rows = batch.get("price_rows") or []
     volume_rows = batch.get("volume_rows") or []
     failures = batch.get("failures") or []
+    symbol_unavailable = batch.get("symbol_unavailable") or []
 
     if failures:
         raise RuntimeError(f"raw_validate failed: request failures count={len(failures)}")
@@ -74,9 +75,43 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
 
     expected = {("BYBIT", s) for s in symbols_bybit} | {("BINANCE", s) for s in symbols_binance}
 
+    unavailable_keys = set()
+    for item in symbol_unavailable:
+        if not isinstance(item, (tuple, list)) or len(item) < 4:
+            raise RuntimeError("raw_validate failed: malformed symbol_unavailable marker")
+        exchange, symbol, ret_code, ret_msg = item[:4]
+        is_invalid_symbol = (
+            str(exchange).upper() == "BYBIT"
+            and str(ret_code) == "10001"
+            and ("symbol invalid" in str(ret_msg).lower() or "symbol not found" in str(ret_msg).lower())
+        )
+        if not is_invalid_symbol:
+            raise RuntimeError("raw_validate failed: unsupported symbol_unavailable marker")
+        unavailable_keys.add(("BYBIT", str(symbol)))
+
+    unavailable_limit = int(os.getenv("RAW_VALIDATE_TOLERATED_SYMBOL_UNAVAILABLE", "2"))
+    if len(unavailable_keys) > unavailable_limit:
+        raise RuntimeError(
+            "raw_validate failed: too many unavailable symbols "
+            f"count={len(unavailable_keys)} limit={unavailable_limit}"
+        )
+    unknown_unavailable = unavailable_keys - expected
+    if unknown_unavailable:
+        raise RuntimeError(
+            "raw_validate failed: unavailable symbols outside active universe "
+            f"sample={sorted(unknown_unavailable)[:8]}"
+        )
+    expected -= unavailable_keys
+
     oi_keys = {(r[2], r[3]) for r in oi_rows}
     price_keys = {(r[2], r[3]) for r in price_rows}
     volume_keys = {(r[2], r[3]) for r in volume_rows}
+    reported_unavailable_with_data = unavailable_keys & (oi_keys | price_keys | volume_keys)
+    if reported_unavailable_with_data:
+        raise RuntimeError(
+            "raw_validate failed: unavailable symbols also returned raw data "
+            f"sample={sorted(reported_unavailable_with_data)[:8]}"
+        )
 
     missing_oi = expected - oi_keys
     missing_price = expected - price_keys
@@ -141,7 +176,8 @@ def validate_collected_raw(batch: dict, symbols_bybit: list[str], symbols_binanc
         f"raw_validate ok: oi={len(oi_rows)} "
         f"price={len(price_rows)} "
         f"volume={len(volume_rows)} "
-        f"symbols={len(expected)}"
+        f"symbols={len(expected)} "
+        f"symbol_unavailable={len(unavailable_keys)}"
     )
 
     return batch
